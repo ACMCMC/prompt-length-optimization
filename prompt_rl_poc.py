@@ -236,14 +236,14 @@ class LengthPolicyOptimizer:
                 
                 reward = base_reward + discovery_bonus
                 
-                # Store for policy update
-                episode_rewards.append(reward)
+                # Store for policy update (convert to float to avoid tensor issues)
+                episode_rewards.append(float(reward))
                 episode_log_probs.append(log_prob)
                 episode_actions.append(action_val)
                 
                 # Track best
                 if reward > best_overall_reward:
-                    best_overall_reward = reward
+                    best_overall_reward = float(reward)  # Convert to Python float
                     best_prompt = self._embeddings_to_tokens(self.prompt_embeddings.detach())
                 
                 # Logging with momentum info
@@ -251,7 +251,8 @@ class LengthPolicyOptimizer:
                 self.length_history.append(current_length)
                 self.action_history.append(action_val)
                 
-                if episode % log_every == 0 and step % 10 == 0:
+                # Logging
+                if log_every > 0 and episode % log_every == 0 and step % 10 == 0:
                     print(f"Ep {episode:3d} Step {step:2d}: action={action_val} length={current_length} "
                           f"likelihood={current_likelihood:.3f} improv_rate={improvement_rate:.4f} "
                           f"since_improv={steps_since_improvement} reward={reward:.3f}")
@@ -276,12 +277,12 @@ class LengthPolicyOptimizer:
             policy_loss.backward()
             self.policy_optimizer.step()
             
-            if episode % log_every == 0:
+            if log_every > 0 and episode % log_every == 0:
                 avg_length = sum(self.length_history[-steps_per_episode:]) / steps_per_episode
                 print(f"Episode {episode}: return={episode_return:.2f} avg_length={avg_length:.1f} "
                       f"best_reward={best_overall_reward:.3f}")
         
-        return best_prompt, best_overall_reward, self.loss_history
+        return best_prompt, float(best_overall_reward), self.loss_history
     
     def _get_likelihood_from_embeddings(self, prompt_embeds: torch.Tensor, completion_tokens: List[int]) -> torch.Tensor:
         """Calculate log P(completion | continuous prompt embeddings)"""

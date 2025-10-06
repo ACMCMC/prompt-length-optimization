@@ -71,3 +71,7 @@ temp/
 
 # Papers & Literature
 papers/*.pdf
+
+# Others
+results/
+models/

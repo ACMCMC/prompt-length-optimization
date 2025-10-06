@@ -1,29 +1,48 @@
-# Unified configuration for training and evaluation
+# Configuration for toxic-chat dataset training and evaluation
 model: EleutherAI/pythia-70m
 seed: 2262
 
 train:
-  target: "Santiago de Compostela is the capital of northwest Spain’s Galicia region. It’s known as the culmination of the Camino de Santiago pilgrimage route, and the alleged burial site of the Biblical apostle St. James. His remains reputedly lie within the Catedral de Santiago de Compostela, consecrated in 1211, whose elaborately carved stone facades open onto grand plazas within the medieval walls of the old town."
-  episodes: 25
-  steps_per_episode: 100
-  init_len: 32
+  # Dataset parameters
+  max_prompts: 50                    # Number of prompts to train on
+  min_prompt_length: 30              # Minimum prompt length (characters)
+  max_prompt_length: 150             # Maximum prompt length (characters)
+  
+  # Training parameters per prompt
+  episodes_per_prompt: 3             # Episodes to train on each prompt
+  steps_per_episode: 100             # Steps per episode (increased for better RL learning)
+  init_len: 32                       # Initial prompt length in tokens
+  
+  # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
-  alpha: 1.0
-  beta: 0.1
-  log_every: 1
-  save_path: models/trained_policy.yaml_run.pt
+  alpha: 1.0                         # Likelihood weight
+  beta: 0.2                          # Length penalty (higher = more compression)
+  
+  # Parallel processing parameters
+  batch_size: 8                      # Prompts per batch for parallel processing
+  num_workers: 4                     # Number of parallel worker processes
+  
+  # Output
+  save_path: models/trained_policy.pt
   plots_prefix: training
   no_plots: false
 
 eval:
-# test_prompt: "Santiago de Compostela is the capital of northwest Spain’s Galicia region. It’s known as the culmination of the Camino de Santiago pilgrimage route, and the alleged burial site of the Biblical apostle St. James. His remains reputedly lie within the Catedral de Santiago de Compostela, consecrated in 1211, whose elaborately carved stone facades open onto grand plazas within the medieval walls of the old town."
-  test_prompt: "Madrid, Spain's central capital, is a city of elegant boulevards and expansive, manicured parks such as the Buen Retiro. It’s renowned for its rich repositories of European art, including the Prado Museum’s works by Goya, Velázquez and other Spanish masters. The heart of old Hapsburg Madrid is the portico-lined Plaza Mayor, and nearby is the baroque Royal Palace and Armory, displaying historic weaponry."
-  init_len: 32
-  max_policy_steps: 100
-  opt_steps: 100
-  log_every_opt: 1
-  save_trace: true
-  trace_path: results/eval_trace.yaml_run.csv
-  no_plots: false
+  # Test dataset parameters
+  max_test_prompts: 20               # Number of test prompts
+  min_prompt_length: 30              # Min test prompt length
+  max_prompt_length: 150             # Max test prompt length
+  
+  # Evaluation parameters
+  init_len: 32                       # Initial prompt length
+  max_policy_steps: 30               # Max policy steps per prompt
+  opt_steps: 15                      # Optimization steps (fewer for dataset eval)
+  log_every_opt: 999                 # Reduce logging
+  
+  # Output
+  results_file: results/eval_results.csv
+  save_trace: false                  # Don't save individual traces
+  trace_path: results/eval_trace.csv
+  no_plots: true                     # Don't create individual plots
   plots_prefix: eval

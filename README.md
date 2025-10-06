@@ -1,55 +1,185 @@
-# Prompt & Generation Length Optimization via RL
+# Prompt Length Optimization with Reinforcement Learning# Prompt Length Optimization with Reinforcement Learning# Prompt & Generation Length Optimization via RL
 
-**Research Project** | *Aldan Creo* | MSDS @ UC San Diego
 
----
 
-## 🎯 Research Concept
+A reinforcement learning approach to optimize prompt compression while maintaining generation quality. Uses the toxic-chat dataset to train policies that balance prompt length reduction with likelihood preservation.
 
-This project explores the application of **reinforcement learning** to optimize prompt discovery for **fixed target completions**. Given a desired generation/completion, we want to find the minimal prompt that maximizes the posterior probability of that specific completion.
 
-### Core Question
 
-> *Given a target completion, can we train an RL agent to find the shortest prompt that maximizes P(completion | prompt)?*
+## Quick StartA reinforcement learning approach to optimize prompt compression while maintaining generation quality. Uses the toxic-chat dataset to train policies that balance prompt length reduction with likelihood preservation.**Research Project** | *Aldan Creo* | MSDS @ UC San Diego
 
-**Key Insight**: Traditional prompt optimization uses gradient descent on input embeddings, but this doesn't optimize for prompt length. We introduce an RL agent that can dynamically add/remove tokens to balance:
-1. **Likelihood Maximization**: High P(target_completion | prompt)  
-2. **Length Minimization**: Shortest possible prompt
 
----
 
-## 💡 Key Ideas
+1. **Install dependencies:**
 
-### 1. RL-Based Prompt Length Optimization
+```bash
 
-**Concept**: Frame prompt discovery as an RL task where the agent learns to build optimal prompts token by token.
+pip install -r requirements.txt## Quick Start---
 
-**RL Formulation**:
-- **State**: Current prompt sequence + target completion + current likelihood score
-- **Action**: Add token at start, remove token from start, or stop
-- **Reward**: α * log P(completion | prompt) - β * prompt_length
-- **Policy**: Learns when to add/remove tokens to optimize the dual objective
+```
 
-**Simplification**: Only modify tokens at sequence start to avoid complex positional encoding issues.
 
-**Approach**:
+
+2. **Train the policy:**
+
+```bash1. **Install dependencies:**## 🎯 Research Concept
+
+# Fast training (recommended - 50 prompts in ~2-3 minutes)
+
+python train_fast.py --config config.yaml```bash
+
+
+
+# Standard training (50 prompts in ~15-20 minutes)  pip install -r requirements.txtThis project explores the application of **reinforcement learning** to optimize prompt discovery for **fixed target completions**. Given a desired generation/completion, we want to find the minimal prompt that maximizes the posterior probability of that specific completion.
+
+python train.py --config config.yaml
+
+``````
+
+
+
+3. **Evaluate on test set:**### Core Question
+
+```bash
+
+python eval.py --config config.yaml2. **Train the policy:**
+
+```
+
+```bash> *Given a target completion, can we train an RL agent to find the shortest prompt that maximizes P(completion | prompt)?*
+
+## How It Works
+
+python train.py --config config.yaml
+
+- **Dataset**: Uses `lmsys/toxic-chat` model outputs as training data
+
+- **Policy**: Learns when to compress vs. continue optimizing based on improvement rates```**Key Insight**: Traditional prompt optimization uses gradient descent on input embeddings, but this doesn't optimize for prompt length. We introduce an RL agent that can dynamically add/remove tokens to balance:
+
+- **Reward**: Balances likelihood preservation (α) with length reduction (β)
+
+- **Actions**: REMOVE (compress), KEEP (optimize), RETRACT (undo compression)1. **Likelihood Maximization**: High P(target_completion | prompt)  
+
+
+
+## Performance Optimizations ⚡3. **Evaluate on test set:**2. **Length Minimization**: Shortest possible prompt
+
+
+
+We've implemented several speed optimizations that provide **6-9x speedup**:```bash
+
+
+
+- **Fast Training Mode** (`train_fast.py`): Optimized hyperparameters for faster convergencepython eval.py --config config.yaml---
+
+- **Parallel Processing** (`train_parallel.py`): Multi-worker training (experimental)
+
+- **Batch Processing**: Efficient progress tracking and vectorized operations```
+
+
+
+See `OPTIMIZATION_RESULTS.md` for detailed performance analysis.## 💡 Key Ideas
+
+
+
+## Configuration## How It Works
+
+
+
+Edit `config.yaml` to adjust:### 1. RL-Based Prompt Length Optimization
+
+- **Training**: Episodes per prompt, steps per episode, learning rates
+
+- **Dataset**: Number of prompts, length filters  - **Dataset**: Uses `lmsys/toxic-chat` model outputs as training data
+
+- **Reward**: α (likelihood weight) and β (compression penalty)
+
+- **Performance**: Batch size, parallel workers- **Policy**: Learns when to compress vs. continue optimizing based on improvement rates**Concept**: Frame prompt discovery as an RL task where the agent learns to build optimal prompts token by token.
+
+- **Evaluation**: Test set size, output paths
+
+- **Reward**: Balances likelihood preservation (α) with length reduction (β)
+
+## Quick Examples
+
+- **Actions**: REMOVE (compress), KEEP (optimize), RETRACT (undo compression)**RL Formulation**:
+
+```bash
+
+# Quick experiment (10 prompts, ~30 seconds)- **State**: Current prompt sequence + target completion + current likelihood score
+
+python train_fast.py --config config.yaml --prompts 10 --episodes 1 --steps 20
+
+## Configuration- **Action**: Add token at start, remove token from start, or stop
+
+# Development training (50 prompts, ~2 minutes)
+
+python train_fast.py --config config.yaml --prompts 50 --episodes 1 --steps 30- **Reward**: α * log P(completion | prompt) - β * prompt_length
+
+
+
+# Full training (100 prompts, ~5 minutes)Edit `config.yaml` to adjust:- **Policy**: Learns when to add/remove tokens to optimize the dual objective
+
+python train_fast.py --config config.yaml --prompts 100 --episodes 2 --steps 50
+
+```- **Training**: Episodes per prompt, steps per episode, learning rates
+
+
+
+## Results- **Dataset**: Number of prompts, length filters  **Simplification**: Only modify tokens at sequence start to avoid complex positional encoding issues.
+
+
+
+Training produces:- **Reward**: α (likelihood weight) and β (compression penalty)
+
+- `models/trained_policy.pt` - Trained policy weights
+
+- `results/eval_results.csv` - Evaluation metrics per test prompt- **Evaluation**: Test set size, output paths**Approach**:
+
+- `OPTIMIZATION_RESULTS.md` - Performance analysis and speedup details
+
 - Start with preset number of tokens (random or heuristic initialization)
-- Agent decides whether to add/remove tokens at the beginning
-- Evaluate P(target_completion | current_prompt) after each action
-- Optimize for high likelihood with minimal prompt length
 
-### 2. Comparison to Gradient-Based Methods
+## Research Background
+
+## Results- Agent decides whether to add/remove tokens at the beginning
+
+This work explores using reinforcement learning to find minimal prompts that maximize the posterior probability of target completions. The policy learns to balance:
+
+- Evaluate P(target_completion | current_prompt) after each action
+
+1. **Compression**: Removing tokens to reduce prompt length
+
+2. **Optimization**: Continuing embedding optimization for better likelihoodTraining produces:- Optimize for high likelihood with minimal prompt length
+
+3. **Quality**: Maintaining generation quality through likelihood preservation
+
+- `models/trained_policy.pt` - Trained policy weights
+
+The approach uses real-world model outputs from the toxic-chat dataset to ensure robust learning across diverse text types.
+- `results/eval_results.csv` - Evaluation metrics per test prompt### 2. Comparison to Gradient-Based Methods
+
+- Plots showing training progress and compression performance
 
 **Traditional Approach**:
-- Gradient descent on input embeddings: `∇_embeddings log P(completion | prompt)`
-- Final projection onto discrete token IDs
-- **Limitation**: Fixed prompt length, no length optimization
 
-**Our RL Approach**:
-- Dynamic prompt length via add/remove actions
-- Direct optimization of length-likelihood tradeoff
+## Research Background- Gradient descent on input embeddings: `∇_embeddings log P(completion | prompt)`
+
+- Final projection onto discrete token IDs
+
+This work explores using reinforcement learning to find minimal prompts that maximize the posterior probability of target completions. The policy learns to balance:- **Limitation**: Fixed prompt length, no length optimization
+
+
+
+1. **Compression**: Removing tokens to reduce prompt length**Our RL Approach**:
+
+2. **Optimization**: Continuing embedding optimization for better likelihood- Dynamic prompt length via add/remove actions
+
+3. **Quality**: Maintaining generation quality through likelihood preservation- Direct optimization of length-likelihood tradeoff
+
 - More flexible than gradient-based methods for length constraints
 
+The approach uses real-world model outputs from the toxic-chat dataset to ensure robust learning across diverse text types.
 **Advantage**: Can discover that shorter prompts might actually yield higher likelihood for some completions.
 
 ---
