@@ -82,12 +82,14 @@ class LengthPolicyOptimizer:
         self.emb_dim = self.agent.model.get_input_embeddings().weight.shape[1]
         
         # Policy network that decides length changes based on current state
+        # Actions: 0=REMOVE, 1=KEEP, 2=RETRACT (restore last removed)
+        # State: [current_length, likelihood, step_ratio, improvement_rate, steps_since_improvement] (NO embeddings)
         self.policy_net = nn.Sequential(
-            nn.Linear(self.emb_dim + 3, 128),  # +3 for current_length, likelihood, step_ratio
+            nn.Linear(5, 128),  # 5 state features (no embedding dimension)
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, 2)  # 2 actions: REMOVE_TOKEN, KEEP_LENGTH
+            nn.Linear(64, 3)
         ).to(self.agent.device)
         
         # Optimizers
@@ -131,31 +133,57 @@ class LengthPolicyOptimizer:
                 torch.randn(current_length, self.emb_dim, device=self.agent.device) * 0.1
             )
             self.prompt_optimizer = optim.Adam([self.prompt_embeddings], lr=lr_embeddings)
+            # stack for retract functionality
+            retract_stack = []  # store removed embeddings (in order of removal)
             
             episode_rewards = []
             episode_log_probs = []
             episode_actions = []
             
+            # Enhanced tracking for optimization momentum
+            likelihood_history = deque(maxlen=10)  # Track recent likelihoods for momentum calculation
+            
             for step in range(steps_per_episode):
-                # Optimize embeddings for a few steps
-                for _ in range(3):  # Quick embedding optimization
+                # Optimize embeddings for a few steps to get optimization momentum
+                recent_likelihoods = []
+                for emb_step in range(5):  # Track 5 embedding optimization steps
                     self.prompt_optimizer.zero_grad()
                     likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
+                    recent_likelihoods.append(float(likelihood))
                     emb_loss = -likelihood
                     emb_loss.backward()
                     self.prompt_optimizer.step()
                 
-                # Get current state for policy
+                # Calculate optimization momentum features
+                current_likelihood = recent_likelihoods[-1]
+                likelihood_history.append(current_likelihood)
+                
+                # Calculate improvement rate (recent trend)
+                if len(recent_likelihoods) >= 3:
+                    improvement_rate = recent_likelihoods[-1] - recent_likelihoods[0]  # Change over 5 steps
+                    # Detect diminishing returns
+                    recent_improvements = [recent_likelihoods[i] - recent_likelihoods[i-1] 
+                                         for i in range(1, len(recent_likelihoods))]
+                    improvement_trend = np.mean(recent_improvements[-3:]) if len(recent_improvements) >= 3 else 0
+                else:
+                    improvement_rate = 0
+                    improvement_trend = 0
+                
+                # Steps since significant improvement (threshold-based)
+                steps_since_improvement = 0
+                improvement_threshold = 0.1
+                for i, past_likelihood in enumerate(reversed(list(likelihood_history))):
+                    if current_likelihood - past_likelihood > improvement_threshold:
+                        break
+                    steps_since_improvement = i + 1
+                
+                # Get current state for policy with enhanced features (NO direct embedding access)
                 with torch.no_grad():
-                    likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
-                    prompt_summary = self.prompt_embeddings.mean(dim=0)  # Average embedding
-                    
-                    # State: [prompt_summary, current_length, likelihood, step_ratio]
-                    state_features = torch.cat([
-                        prompt_summary,
-                        torch.tensor([current_length, likelihood, step/steps_per_episode], 
-                                   device=self.agent.device, dtype=torch.float32)
-                    ])
+                    # State only includes observable metrics, not raw embeddings
+                    # Enhanced state: [current_length, likelihood, step_ratio, improvement_rate, steps_since_improvement]
+                    state_features = torch.tensor([current_length, current_likelihood, step/steps_per_episode, 
+                                                 improvement_rate, steps_since_improvement], 
+                                                device=self.agent.device, dtype=torch.float32)
                 
                 # Policy decision
                 policy_logits = self.policy_net(state_features)
@@ -164,25 +192,49 @@ class LengthPolicyOptimizer:
                 action = policy_dist.sample()
                 log_prob = policy_dist.log_prob(action)
                 
-                # Execute action: 0=REMOVE, 1=KEEP
+                # Execute action: 0=REMOVE, 1=KEEP, 2=RETRACT
                 action_val = int(action.item())
                 new_length = current_length
-                
+
                 if action_val == 0 and current_length > 1:  # REMOVE
+                    # Save last embedding to stack then remove
+                    last_emb = self.prompt_embeddings[-1].clone().detach()
+                    retract_stack.append(last_emb)
                     new_length = current_length - 1
-                    # Remove last token embedding
                     self.prompt_embeddings = nn.Parameter(
                         self.prompt_embeddings[:-1].clone().detach().requires_grad_(True)
                     )
                     self.prompt_optimizer = optim.Adam([self.prompt_embeddings], lr=lr_embeddings)
-                # action_val == 1: KEEP (no change)
-                
+                elif action_val == 2 and retract_stack:  # RETRACT
+                    # Restore last removed embedding
+                    restored = retract_stack.pop()
+                    restored = restored.unsqueeze(0)
+                    self.prompt_embeddings = nn.Parameter(
+                        torch.cat([self.prompt_embeddings.detach(), restored], dim=0).requires_grad_(True)
+                    )
+                    new_length = current_length + 1
+                    self.prompt_optimizer = optim.Adam([self.prompt_embeddings], lr=lr_embeddings)
+                # action_val == 1 KEEP or invalid RETRACT (no stack) -> no change
+
                 current_length = new_length
                 
-                # Calculate reward
+                # Calculate base reward
                 with torch.no_grad():
-                    likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
-                    reward = alpha * likelihood - beta * current_length
+                    final_likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
+                    base_reward = alpha * final_likelihood - beta * current_length
+                
+                # Natural learning rewards (no artificial exploration penalties)
+                discovery_bonus = 0
+                if action_val == 0:  # REMOVE action
+                    # Small bonus for compression attempts (encourages exploration)
+                    discovery_bonus += 0.1
+                
+                # Efficiency bonus: reward good likelihood with fewer tokens
+                if current_length < initial_prompt_length and final_likelihood > -1.0:
+                    efficiency_bonus = (initial_prompt_length - current_length) * 0.05
+                    discovery_bonus += efficiency_bonus
+                
+                reward = base_reward + discovery_bonus
                 
                 # Store for policy update
                 episode_rewards.append(reward)
@@ -194,14 +246,15 @@ class LengthPolicyOptimizer:
                     best_overall_reward = reward
                     best_prompt = self._embeddings_to_tokens(self.prompt_embeddings.detach())
                 
-                # Logging
-                self.likelihood_history.append(float(likelihood))
+                # Logging with momentum info
+                self.likelihood_history.append(float(current_likelihood))
                 self.length_history.append(current_length)
                 self.action_history.append(action_val)
                 
                 if episode % log_every == 0 and step % 10 == 0:
                     print(f"Ep {episode:3d} Step {step:2d}: action={action_val} length={current_length} "
-                          f"likelihood={likelihood:.3f} reward={reward:.3f}")
+                          f"likelihood={current_likelihood:.3f} improv_rate={improvement_rate:.4f} "
+                          f"since_improv={steps_since_improvement} reward={reward:.3f}")
             
             # Policy update at end of episode (REINFORCE)
             episode_return = sum(episode_rewards)

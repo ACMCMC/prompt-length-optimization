@@ -15,7 +15,7 @@ echo "=== TRAINING PHASE ==="
 python train.py \
     --model EleutherAI/pythia-410m \
     --episodes 100 \
-    --steps_per_episode 50 \
+    --steps_per_episode 100 \
     --init_len 32 \
     --save_path models/trained_policy.pt
 

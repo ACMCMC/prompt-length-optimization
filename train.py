@@ -5,19 +5,37 @@ Train the length policy optimizer and save the complete model.
 import torch
 import argparse
 import os
+import yaml
 from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
+from plot_utils import plot_training_progress
 
-def train_and_save(model_name="EleutherAI/pythia-410m", 
-                   target="The quick brown fox jumps over the lazy dog.",
-                   episodes=100, steps_per_episode=50, init_len=32,
-                   save_path="models/trained_policy.pt"):
+def train_and_save(cfg):
+    model_name = cfg['model']
+    train_cfg = cfg['train']
+    target = train_cfg['target']
+    episodes = train_cfg['episodes']
+    steps_per_episode = train_cfg['steps_per_episode']
+    init_len = train_cfg['init_len']
+    lr_embeddings = train_cfg.get('lr_embeddings', 0.01)
+    lr_policy = train_cfg.get('lr_policy', 3e-4)
+    alpha = train_cfg.get('alpha', 1.0)
+    beta = train_cfg.get('beta', 0.1)
+    log_every = train_cfg.get('log_every', 10)
+    save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
+    no_plots = train_cfg.get('no_plots', False)
+    plots_prefix = train_cfg.get('plots_prefix', 'training')
+    seed = cfg.get('seed', 2262)
     
-    print(f"Training policy optimizer...")
+    print(f"Training policy optimizer (YAML config)...")
     print(f"Model: {model_name}")
     print(f"Episodes: {episodes}, Steps per episode: {steps_per_episode}")
-    print(f"Initial length: {init_len}")
+    print(f"Initial length: {init_len}  alpha={alpha} beta={beta}")
     
     # Initialize
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     agent = PromptRLAgent(model_name=model_name)
     optimizer = LengthPolicyOptimizer(agent)
     
@@ -27,7 +45,11 @@ def train_and_save(model_name="EleutherAI/pythia-410m",
         episodes=episodes,
         steps_per_episode=steps_per_episode,
         initial_prompt_length=init_len,
-        log_every=10
+        lr_embeddings=lr_embeddings,
+        lr_policy=lr_policy,
+        alpha=alpha,
+        beta=beta,
+        log_every=log_every
     )
     
     # Save complete model
@@ -48,24 +70,24 @@ def train_and_save(model_name="EleutherAI/pythia-410m",
     print(f"\nTraining complete!")
     print(f"Best reward: {best_reward:.3f}")
     print(f"Model saved to: {save_path}")
+
+    # Plot training progress
+    if not no_plots:
+        pdf_path = plot_training_progress(
+            optimizer.likelihood_history,
+            optimizer.length_history,
+            optimizer.action_history,
+            out_dir=os.path.dirname(save_path) if os.path.dirname(save_path) else 'results',
+            prefix=plots_prefix
+        )
+        print(f"Saved training plot to: {pdf_path}")
     
     return save_path
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="EleutherAI/pythia-410m")
-    parser.add_argument("--target", type=str, default="The quick brown fox jumps over the lazy dog.")
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--steps_per_episode", type=int, default=50)
-    parser.add_argument("--init_len", type=int, default=32)
-    parser.add_argument("--save_path", type=str, default="models/trained_policy.pt")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config")
     args = parser.parse_args()
-    
-    train_and_save(
-        model_name=args.model,
-        target=args.target,
-        episodes=args.episodes,
-        steps_per_episode=args.steps_per_episode,
-        init_len=args.init_len,
-        save_path=args.save_path
-    )
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+    train_and_save(cfg)
