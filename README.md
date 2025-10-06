@@ -6,62 +6,51 @@
 
 ## 🎯 Research Concept
 
-This project explores the application of **reinforcement learning** to optimize language model generation for both **quality** (generation likelihood) and **efficiency** (minimal token length). The core idea is to develop policies that can produce high-quality outputs while minimizing computational cost.
+This project explores the application of **reinforcement learning** to optimize prompt discovery for **fixed target completions**. Given a desired generation/completion, we want to find the minimal prompt that maximizes the posterior probability of that specific completion.
 
 ### Core Question
 
-> *Can we train a policy to maximize generation likelihood while incurring minimal token length cost?*
+> *Given a target completion, can we train an RL agent to find the shortest prompt that maximizes P(completion | prompt)?*
 
-This spans two complementary directions:
-1. **Prompt Compression**: Minimize input token count while maintaining output quality
-2. **Generation Compression**: Minimize output token count while maintaining semantic fidelity
+**Key Insight**: Traditional prompt optimization uses gradient descent on input embeddings, but this doesn't optimize for prompt length. We introduce an RL agent that can dynamically add/remove tokens to balance:
+1. **Likelihood Maximization**: High P(target_completion | prompt)  
+2. **Length Minimization**: Shortest possible prompt
 
 ---
 
 ## 💡 Key Ideas
 
-### 1. Attention-Based Prompt Compression
+### 1. RL-Based Prompt Length Optimization
 
-**Concept**: Modify the optimization objective to encourage attention sparsity in the prompt.
+**Concept**: Frame prompt discovery as an RL task where the agent learns to build optimal prompts token by token.
+
+**RL Formulation**:
+- **State**: Current prompt sequence + target completion + current likelihood score
+- **Action**: Add token at start, remove token from start, or stop
+- **Reward**: α * log P(completion | prompt) - β * prompt_length
+- **Policy**: Learns when to add/remove tokens to optimize the dual objective
+
+**Simplification**: Only modify tokens at sequence start to avoid complex positional encoding issues.
 
 **Approach**:
-- Use L1 regularization on attention weights to push certain prompt token attentions → 0
-- When a token's attention contribution becomes negligible, it can be "masked out"
-- Progressively reduce prompt length while maintaining generation quality
+- Start with preset number of tokens (random or heuristic initialization)
+- Agent decides whether to add/remove tokens at the beginning
+- Evaluate P(target_completion | current_prompt) after each action
+- Optimize for high likelihood with minimal prompt length
 
-**Challenges**:
-- Must selectively mask tokens (not all)
-- Positional encoding complications when tokens are removed
-- Risk of optimization instability (too many competing objectives)
+### 2. Comparison to Gradient-Based Methods
 
-**Potential Loss Function**:
-```
-L = L_generation + λ * L_sparsity
-```
-Where `L_sparsity` encourages specific attention weights to approach zero.
+**Traditional Approach**:
+- Gradient descent on input embeddings: `∇_embeddings log P(completion | prompt)`
+- Final projection onto discrete token IDs
+- **Limitation**: Fixed prompt length, no length optimization
 
-### 2. RL Policy for Length-Quality Tradeoff
+**Our RL Approach**:
+- Dynamic prompt length via add/remove actions
+- Direct optimization of length-likelihood tradeoff
+- More flexible than gradient-based methods for length constraints
 
-**Concept**: Frame the problem as an RL task where the agent learns to balance generation quality against token budget.
-
-**Formulation**:
-- **State**: Current generation context (prompt + tokens generated so far)
-- **Action**: Next token to generate (or decision to stop)
-- **Reward**: Combination of likelihood score and length penalty
-
-**Reward Function**:
-```
-R = α * log P(generation | prompt) - β * token_count
-```
-
-### 3. Generation Compression (Future Direction)
-
-**Concept**: Compress generated tokens rather than prompt tokens, as generation dominates inference cost.
-
-**Motivation**:
-- Inference cost is dominated by generation length, not prompt length
-- More impactful for scalability
-- Different technical challenges than prompt compression
+**Advantage**: Can discover that shorter prompts might actually yield higher likelihood for some completions.
 
 ---
 
@@ -85,46 +74,55 @@ R = α * log P(generation | prompt) - β * token_count
 
 ---
 
-## 🔬 Potential Research Directions
+## 🔬 Research Approach
 
-### Direction A: Attention Sparsity for Prompt Compression
-**Goal**: Learn to identify and remove unnecessary prompt tokens
+### RL Agent Design
 
-**Approach**:
-1. Fine-tune model with sparsity-inducing loss on attention weights
-2. Threshold attention contributions to identify removable tokens
-3. Iteratively compress prompts while monitoring generation quality
+**State Representation**:
+```python
+state = {
+    'current_prompt': [token_ids],
+    'target_completion': [token_ids], 
+    'current_likelihood': float,
+    'prompt_length': int
+}
+```
+
+**Action Space**:
+- `ADD_TOKEN_START`: Prepend a token to the prompt
+- `REMOVE_TOKEN_START`: Remove first token from prompt  
+- `STOP`: Finish prompt construction
+
+**Reward Function**:
+```python
+R = α * log P(completion | prompt) - β * len(prompt) + γ * stop_bonus
+```
+
+**Policy Training**:
+1. Start with random/heuristic prompt initialization
+2. Agent takes actions to modify prompt
+3. Evaluate likelihood after each modification
+4. Update policy using PPO/DPO based on reward signal
+
+### Experimental Setup
+
+**Baseline Comparisons**:
+- Gradient descent on embeddings (fixed length)
+- Random prompt search
+- Greedy token removal/addition
+- Human-written prompts
+
+**Datasets**:
+- Common sense reasoning completions
+- Code generation targets
+- Creative writing samples
+- Factual question-answer pairs
 
 **Metrics**:
-- Compression ratio (original length / compressed length)
-- Generation quality (perplexity, task performance)
-- Attention distribution entropy
-
-### Direction B: RL-Based Token Budget Optimization
-**Goal**: Train a policy to generate high-quality outputs within token budgets
-
-**Approach**:
-1. Define reward as likelihood - length_penalty
-2. Use PPO/DPO to train policy
-3. Experiment with different penalty schedules
-
-**Metrics**:
-- Pareto frontier of quality vs. length
-- Inference cost reduction
-- Quality degradation at various compression levels
-
-### Direction C: Generation Compression
-**Goal**: Compress generated outputs while maintaining semantic content
-
-**Approach**:
-1. Train model to generate more information-dense tokens
-2. Post-generation compression via paraphrasing
-3. Multi-stage generation with refinement
-
-**Metrics**:
-- Semantic similarity (embedding distance)
-- Information retention (task-specific metrics)
-- Compression ratio
+- Final likelihood P(completion | discovered_prompt)
+- Prompt length efficiency (likelihood per token)
+- Convergence speed and stability
+- Generalization across completion types
 
 ---
 
