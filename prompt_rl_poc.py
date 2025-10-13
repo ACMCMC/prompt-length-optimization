@@ -22,8 +22,13 @@ class PromptRLAgent:
         # Load model and tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = GPTNeoXForCausalLM.from_pretrained(model_name)
-        # device handling
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device handling (CUDA, MPS, or CPU)
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
         self.model.to(self.device)
         self.model.eval()
         
