@@ -191,11 +191,16 @@ class LengthPolicyOptimizer:
                                                 device=self.agent.device, dtype=torch.float32)
                 
                 # Policy decision
+                print("State features:", state_features)
                 policy_logits = self.policy_net(state_features)
+                print("Policy logits:", policy_logits)
                 policy_probs = F.softmax(policy_logits, dim=-1)
+                print("Policy probs:", policy_probs)
                 policy_dist = torch.distributions.Categorical(policy_probs)
                 action = policy_dist.sample()
+                print("Sampled action:", action)
                 log_prob = policy_dist.log_prob(action)
+                print("Log prob:", log_prob)
                 
                 # Execute action: 0=REMOVE, 1=KEEP, 2=RETRACT
                 action_val = int(action.item())
@@ -227,7 +232,7 @@ class LengthPolicyOptimizer:
                 with torch.no_grad():
                     final_likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
                     base_reward = alpha * final_likelihood - beta * current_length
-                
+                    print(f"final_likelihood: {final_likelihood}, current_length: {current_length},base_reward: {base_reward}, ")
                 # Natural learning rewards (no artificial exploration penalties)
                 discovery_bonus = 0
                 if action_val == 0:  # REMOVE action
@@ -239,8 +244,10 @@ class LengthPolicyOptimizer:
                     efficiency_bonus = (initial_prompt_length - current_length) * 0.05
                     discovery_bonus += efficiency_bonus
                 
+                print(f" discovery_bonus: {discovery_bonus}")
+
                 reward = base_reward + discovery_bonus
-                
+                print(f"reward: {reward}")
                 # Store for policy update (convert to float to avoid tensor issues)
                 episode_rewards.append(float(reward))
                 episode_log_probs.append(log_prob)
