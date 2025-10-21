@@ -8,23 +8,9 @@ import os
 import yaml
 import random
 import time
-from datasets import load_dataset
 from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
+from dataset_utils import ToxicChatDatasetManager
 import numpy as np
-
-def load_toxic_chat_dataset(split='train', max_samples=None, min_length=20, max_length=200):
-    """Load and filter the toxic-chat dataset for training."""
-    dataset = load_dataset("lmsys/toxic-chat", "toxicchat0124", split=split)
-    
-    prompts = []
-    for example in dataset:
-        prompt = example.get('model_output', '')
-        if prompt and min_length <= len(prompt) <= max_length:
-            prompts.append(prompt.strip())
-            if max_samples and len(prompts) >= max_samples:
-                break
-    
-    return prompts
 
 def train_on_dataset_fast(cfg):
     """Fast training with optimized settings for speed."""
@@ -64,12 +50,17 @@ def train_on_dataset_fast(cfg):
     print(f"  Batch processing: {batch_size} prompts")
     print(f"Alpha: {alpha}, Beta: {beta}")
     
-    # Load dataset
-    prompts = load_toxic_chat_dataset(
-        split='train', 
-        max_samples=max_prompts,
+    # Load dataset using the new dataset manager with config split ratios
+    dataset_manager = ToxicChatDatasetManager(seed=seed)
+    ds_cfg = cfg.get('dataset', {})
+    prompts = dataset_manager.load_train_set(
         min_length=min_prompt_length,
-        max_length=max_prompt_length
+        max_length=max_prompt_length,
+        max_samples=max_prompts,
+        train_ratio=ds_cfg.get('train_ratio', 0.7),
+        val_ratio=ds_cfg.get('val_ratio', 0.15),
+        test_ratio=ds_cfg.get('test_ratio', 0.15),
+        use_cache=True
     )
     
     if not prompts:
@@ -205,7 +196,8 @@ def train_on_dataset_fast(cfg):
                 plt.legend()
                 plt.grid(True, alpha=0.3)
                 
-                plot_path = f"results/{train_cfg.get('plots_prefix', 'fast_training')}_rewards.png"
+                fmt = train_cfg.get('plots_format', 'png')
+                plot_path = f"results/{train_cfg.get('plots_prefix', 'fast_training')}_rewards.{fmt}"
                 os.makedirs(os.path.dirname(plot_path), exist_ok=True)
                 plt.savefig(plot_path, dpi=150, bbox_inches='tight')
                 plt.close()

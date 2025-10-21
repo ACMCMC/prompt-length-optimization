@@ -2,6 +2,12 @@
 model: EleutherAI/pythia-70m
 seed: 2262
 
+# Dataset split ratios (must sum to 1.0)
+dataset:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
 train:
   # Dataset parameters
   max_prompts: 50                    # Number of prompts to train on
@@ -27,6 +33,7 @@ train:
   save_path: models/trained_policy.pt
   plots_prefix: training
   no_plots: false
+  plots_format: pdf                  # png|pdf (default: pdf)
 
 eval:
   # Test dataset parameters
@@ -42,7 +49,8 @@ eval:
   
   # Output
   results_file: results/eval_results.csv
-  save_trace: false                  # Don't save individual traces
+  save_trace: true                  # Don't save individual traces
   trace_path: results/eval_trace.csv
-  no_plots: true                     # Don't create individual plots
+  no_plots: false                     # Don't create individual plots
   plots_prefix: eval
+  plots_format: pdf                  # png|pdf (for when plots are enabled)

@@ -3,7 +3,7 @@
 This document is to keep track of things to do.
 
 ## Tasks 
-    - Integrate Full Dataset - Aldan
+    - Done: Integrate Full Dataset - Aldan
     - Explore RL Policy Update - Atharv
     - Implement [this paper](https://aclanthology.org/2025.acl-long.133/)
 ### Discussion about RL Setup (Meeting on October 13)

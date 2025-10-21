@@ -9,8 +9,8 @@ import os
 import yaml
 import random
 import numpy as np
-from datasets import load_dataset
 from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
+from dataset_utils import ToxicChatDatasetManager
 from plot_utils import plot_eval_trace, save_trace_csv
 import pandas as pd
 
@@ -43,14 +43,14 @@ def evaluate_prompt(cfg, agent, optimizer):
         initial_prompt_length=init_len,
         lr_embeddings=0.01,
         lr_policy=0.0003,
-        alpha=cfg.get('alpha', 1.0),
-        beta=cfg.get('beta', 0.1),
+        alpha=cfg.get('train', {}).get('alpha', 1.0),
+        beta=cfg.get('train', {}).get('beta', 0.1),
         log_every=0  # No logging during evaluation
     )
     
     # Calculate reward (negative of the combined loss)
-    alpha = cfg.get('alpha', 1.0)
-    beta = cfg.get('beta', 0.1)
+    alpha = cfg.get('train', {}).get('alpha', 1.0)
+    beta = cfg.get('train', {}).get('beta', 0.1)
     reward = alpha * best_likelihood - beta * len(best_prompt)
     
     # Decode the compressed prompt for display
@@ -67,25 +67,25 @@ def evaluate_prompt(cfg, agent, optimizer):
         'compressed_prompt': compressed_prompt
     }
 
-def load_test_prompts(max_samples=20, min_length=30, max_length=200):
-    """Load test prompts from the toxic-chat dataset."""
+def load_test_prompts(seed=2262, max_samples=20, min_length=30, max_length=200, ds_cfg=None):
+    """Load test prompts from the toxic-chat dataset using proper split."""
     print(f"Loading test prompts from toxic-chat dataset...")
     
-    dataset = load_dataset("lmsys/toxic-chat", "toxicchat0124", split='train')
-    print(f"Loaded {len(dataset)} samples")
+    # Use the dataset manager to get the proper test split
+    dataset_manager = ToxicChatDatasetManager(seed=seed)
+    ds_cfg = ds_cfg or {}
+    test_prompts = dataset_manager.load_test_set(
+        min_length=min_length,
+        max_length=max_length,
+        max_samples=max_samples,
+        train_ratio=ds_cfg.get('train_ratio', 0.7),
+        val_ratio=ds_cfg.get('val_ratio', 0.15),
+        test_ratio=ds_cfg.get('test_ratio', 0.15),
+        use_cache=True
+    )
     
-    # Extract model outputs and filter by length
-    prompts = []
-    for example in dataset:
-        # Use model_output column as the text to compress
-        prompt = example.get('model_output', '')
-        if prompt and min_length <= len(prompt) <= max_length:
-            prompts.append(prompt.strip())
-            if len(prompts) >= max_samples:
-                break
-    
-    print(f"Selected {len(prompts)} test prompts (length {min_length}-{max_length} chars)")
-    return prompts
+    print(f"Loaded {len(test_prompts)} test prompts (length {min_length}-{max_length} chars)")
+    return test_prompts
 
 def evaluate_on_dataset(cfg, model_path):
     """Evaluate the trained policy on multiple test examples."""
@@ -100,14 +100,19 @@ def evaluate_on_dataset(cfg, model_path):
     
     results_file = eval_cfg.get('results_file', 'results/dataset_eval_results.csv')
     
+    seed = cfg.get('seed', 2262)
+    ds_cfg = cfg.get('dataset', {})
+    
     print(f"Dataset evaluation with {max_test_prompts} test prompts")
     print(f"Model: {model_path}")
     
-    # Load test prompts
+    # Load test prompts using proper test split
     test_prompts = load_test_prompts(
+        seed=seed,
         max_samples=max_test_prompts,
         min_length=min_prompt_length,
-        max_length=max_prompt_length
+        max_length=max_prompt_length,
+        ds_cfg=ds_cfg
     )
     
     if not test_prompts:
@@ -117,7 +122,11 @@ def evaluate_on_dataset(cfg, model_path):
     agent, optimizer, checkpoint = load_trained_model(model_path)
     
     print(f"Loaded model with {len(checkpoint.get('training_rewards', []))} training examples")
-    print(f"Original best training reward: {checkpoint.get('best_reward', 'unknown'):.3f}")
+    best_reward_val = checkpoint.get('best_reward', None)
+    if isinstance(best_reward_val, (int, float)):
+        print(f"Original best training reward: {best_reward_val:.3f}")
+    else:
+        print("Original best training reward: unknown")
     
     # Evaluate on each test prompt
     results = []
@@ -137,14 +146,14 @@ def evaluate_on_dataset(cfg, model_path):
                 initial_prompt_length=init_len,
                 lr_embeddings=0.01,
                 lr_policy=0.0003,
-                alpha=cfg.get('alpha', 1.0),
-                beta=cfg.get('beta', 0.1),
+                alpha=cfg.get('train', {}).get('alpha', 1.0),
+                beta=cfg.get('train', {}).get('beta', 0.1),
                 log_every=0  # No logging during evaluation
             )
             
             # Calculate reward
-            alpha = cfg.get('alpha', 1.0)
-            beta = cfg.get('beta', 0.1)
+            alpha = cfg.get('train', {}).get('alpha', 1.0)
+            beta = cfg.get('train', {}).get('beta', 0.1)
             reward = alpha * best_likelihood - beta * len(best_prompt)
             
             # Store results
