@@ -10,7 +10,7 @@ dataset:
 
 train:
   # Dataset parameters
-  max_prompts: 50                    # Number of prompts to train on
+  max_prompts: 200                   # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   

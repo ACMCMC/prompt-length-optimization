@@ -113,6 +113,7 @@ class LengthPolicyOptimizer:
         self.length_history = []
         self.likelihood_history = []
         self.action_history = []
+        self.trace = []  # Structured trace for plotting
         
     def optimize_prompt(self, target_completion: str, episodes=100, steps_per_episode=50,
                        initial_prompt_length=32, lr_embeddings=0.01, lr_policy=3e-4,
@@ -130,6 +131,11 @@ class LengthPolicyOptimizer:
         
         best_overall_reward = float('-inf')
         best_prompt = None
+        best_overall_likelihood = float('-inf')
+        
+        # Reset trace for this optimization
+        self.trace = []
+        global_step = 0
         
         for episode in range(episodes):
             # Reset for new episode
@@ -256,6 +262,23 @@ class LengthPolicyOptimizer:
                 self.length_history.append(current_length)
                 self.action_history.append(action_val)
                 
+                # Track best likelihood
+                if current_likelihood > best_overall_likelihood:
+                    best_overall_likelihood = float(current_likelihood)
+                
+                # Add to structured trace
+                self.trace.append({
+                    'step': global_step,
+                    'episode': episode,
+                    'likelihood': float(current_likelihood),
+                    'best_likelihood': float(best_overall_likelihood),
+                    'length': current_length,
+                    'action': action_val,
+                    'reward': float(reward),
+                    'improved': reward > best_overall_reward
+                })
+                global_step += 1
+                
                 # Logging
                 if log_every > 0 and episode % log_every == 0 and step % 10 == 0:
                     print(f"Ep {episode:3d} Step {step:2d}: action={action_val} length={current_length} "
@@ -287,7 +310,7 @@ class LengthPolicyOptimizer:
                 print(f"Episode {episode}: return={episode_return:.2f} avg_length={avg_length:.1f} "
                       f"best_reward={best_overall_reward:.3f}")
         
-        return best_prompt, float(best_overall_reward), self.loss_history
+        return best_prompt, float(best_overall_reward), self.trace
     
     def _get_likelihood_from_embeddings(self, prompt_embeds: torch.Tensor, completion_tokens: List[int]) -> torch.Tensor:
         """Calculate log P(completion | continuous prompt embeddings)"""

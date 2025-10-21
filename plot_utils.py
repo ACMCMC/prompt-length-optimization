@@ -43,39 +43,65 @@ def plot_training_progress(likelihood_history, length_history, action_history, o
     return path
 
 
-def plot_eval_trace(trace_rows, out_dir="results", prefix="eval"):
+def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, beta=0.2):
+    """
+    Plot evaluation trace with step on x-axis and likelihood/length/reward on y-axes.
+    
+    Args:
+        trace_rows: List of dicts with 'step', 'likelihood', 'best_likelihood', 'length'
+        out_dir: Output directory for plot
+        prefix: Filename prefix
+        alpha: Likelihood weight for reward calculation
+        beta: Length penalty for reward calculation
+    """
     if not trace_rows:
         return None
     os.makedirs(out_dir, exist_ok=True)
+    
     steps = [r['step'] for r in trace_rows]
     likelihoods = [r['likelihood'] for r in trace_rows]
     bests = [r['best_likelihood'] for r in trace_rows]
     lengths = [r.get('length') for r in trace_rows]
+    
+    # Calculate rewards: alpha * likelihood - beta * length
+    rewards = [alpha * lik - beta * length if length is not None else None 
+               for lik, length in zip(likelihoods, lengths)]
+    best_rewards = [alpha * best - beta * length if length is not None else None 
+                    for best, length in zip(bests, lengths)]
 
-    fig, ax1 = plt.subplots(figsize=(9,5))
-    ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue')
-    ax1.plot(steps, bests, label='best', linestyle='--', color='tab:cyan')
-    ax1.set_xlabel('Step')
-    ax1.set_ylabel('Likelihood', color='tab:blue')
-    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    # Create figure with 3 subplots stacked vertically
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
+    
+    # Plot 1: Likelihood
+    ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
+    ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
+    ax1.set_ylabel('Log Likelihood', fontsize=11)
+    ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
-
+    ax1.set_title('Likelihood Over Steps', fontsize=12, fontweight='bold')
+    
+    # Plot 2: Length
     if any(l is not None for l in lengths):
-        ax2 = ax1.twinx()
-        ax2.plot(steps, lengths, label='length', color='tab:orange')
-        ax2.set_ylabel('Prompt Length', color='tab:orange')
-        ax2.tick_params(axis='y', labelcolor='tab:orange')
-        # Combined legend
-        lines, labels = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines+lines2, labels+labels2, loc='upper right')
-    else:
-        ax1.legend(loc='upper right')
-
-    fig.suptitle('Evaluation Optimization Trace (Likelihood & Length)')
+        ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2)
+        ax2.set_ylabel('Prompt Length (tokens)', fontsize=11)
+        ax2.legend(loc='best')
+        ax2.grid(True, alpha=0.3)
+        ax2.set_title('Prompt Length Over Steps', fontsize=12, fontweight='bold')
+    
+    # Plot 3: Reward
+    if any(r is not None for r in rewards):
+        ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2)
+        ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2)
+        ax3.set_xlabel('Step', fontsize=11)
+        ax3.set_ylabel(f'Reward (α={alpha}, β={beta})', fontsize=11)
+        ax3.legend(loc='best')
+        ax3.grid(True, alpha=0.3)
+        ax3.set_title('Reward Over Steps', fontsize=12, fontweight='bold')
+    
+    fig.suptitle('Evaluation Optimization Trace', fontsize=14, fontweight='bold')
     path = os.path.join(out_dir, f"{prefix}_trace.pdf")
-    fig.tight_layout(rect=[0,0,1,0.96])
-    fig.savefig(path)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     return path
 

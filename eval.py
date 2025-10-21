@@ -128,6 +128,15 @@ def evaluate_on_dataset(cfg, model_path):
     else:
         print("Original best training reward: unknown")
     
+    # Get alpha and beta for reward calculation
+    alpha = cfg.get('train', {}).get('alpha', 1.0)
+    beta = cfg.get('train', {}).get('beta', 0.1)
+    
+    # Check if we should save plots
+    save_plots = not eval_cfg.get('no_plots', True)
+    plots_format = eval_cfg.get('plots_format', 'pdf')
+    plots_prefix = eval_cfg.get('plots_prefix', 'eval')
+    
     # Evaluate on each test prompt
     results = []
     
@@ -139,22 +148,21 @@ def evaluate_on_dataset(cfg, model_path):
         
         try:
             # Evaluate using the optimizer directly
-            best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
+            best_prompt, best_reward, trace = optimizer.optimize_prompt(
                 test_prompt,
                 episodes=1,  # Single episode for evaluation
                 steps_per_episode=max_policy_steps,
                 initial_prompt_length=init_len,
                 lr_embeddings=0.01,
                 lr_policy=0.0003,
-                alpha=cfg.get('train', {}).get('alpha', 1.0),
-                beta=cfg.get('train', {}).get('beta', 0.1),
+                alpha=alpha,
+                beta=beta,
                 log_every=0  # No logging during evaluation
             )
             
-            # Calculate reward
-            alpha = cfg.get('train', {}).get('alpha', 1.0)
-            beta = cfg.get('train', {}).get('beta', 0.1)
-            reward = alpha * best_likelihood - beta * len(best_prompt)
+            # Get final likelihood from trace (best_reward is actually the final reward)
+            final_likelihood = trace[-1]['likelihood'] if trace else 0.0
+            final_reward = alpha * final_likelihood - beta * len(best_prompt)
             
             # Store results
             result_row = {
@@ -164,14 +172,28 @@ def evaluate_on_dataset(cfg, model_path):
                 'initial_tokens': init_len,
                 'final_tokens': len(best_prompt),
                 'compression_ratio': (init_len - len(best_prompt)) / init_len * 100,
-                'final_likelihood': float(best_likelihood),
-                'final_reward': float(reward),
+                'final_likelihood': float(final_likelihood),
+                'final_reward': float(final_reward),
                 'compressed_prompt': str(best_prompt)
             }
             results.append(result_row)
             
             print(f"Result: {init_len}→{len(best_prompt)} tokens ({result_row['compression_ratio']:.1f}% compression)")
-            print(f"Likelihood: {best_likelihood:.3f}, Reward: {reward:.3f}")
+            print(f"Likelihood: {final_likelihood:.3f}, Reward: {final_reward:.3f}")
+            
+            # Generate per-prompt plot if enabled
+            if save_plots and trace:
+                try:
+                    plot_path = plot_eval_trace(
+                        trace,
+                        out_dir="results/traces",
+                        prefix=f"{plots_prefix}_prompt_{i:03d}",
+                        alpha=alpha,
+                        beta=beta
+                    )
+                    print(f"  Plot saved: {plot_path}")
+                except Exception as plot_err:
+                    print(f"  Warning: Could not generate plot: {plot_err}")
             
         except Exception as e:
             print(f"Error evaluating prompt {i+1}: {e}")
