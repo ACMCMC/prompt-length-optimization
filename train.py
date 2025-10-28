@@ -23,7 +23,7 @@ def load_toxic_chat_dataset(split='train', max_samples=None, min_length=20, max_
             prompts.append(prompt.strip())
             if max_samples and len(prompts) >= max_samples:
                 break
-    
+    print("prompts loaded:", prompts)
     return prompts
 
 def decode_tokens(agent, token_ids):
@@ -86,12 +86,14 @@ def train_on_dataset(cfg, fast_mode=False, preview_first=True, log_every=None):
     print(f"RL logging frequency: every {log_every} episode(s)\n")
     
     # Load dataset
-    prompts = load_toxic_chat_dataset(
-        split='train', 
-        max_samples=max_prompts,
-        min_length=min_prompt_length,
-        max_length=max_prompt_length
-    )
+    # prompts = load_toxic_chat_dataset(
+    #     split='train', 
+    #     max_samples=max_prompts,
+    #     min_length=min_prompt_length,
+    #     max_length=max_prompt_length
+    # )
+
+    prompts = ['You are a bad person. You do bad things. You are very bad.']
     
     if not prompts:
         raise ValueError("No valid prompts found in dataset")
@@ -113,13 +115,17 @@ def train_on_dataset(cfg, fast_mode=False, preview_first=True, log_every=None):
 
     # Optional single-prompt preview (uses first prompt in list)
     processed_prompts = 0
+    preview_plot_trace = train_cfg.get('preview_plot_trace', True)
+    collect_prompt_traces = train_cfg.get('collect_prompt_traces', False)
+    prompt_trace_dir = train_cfg.get('prompt_trace_dir', 'results/traces')
+
     if preview_first:
         preview_prompt_text = prompts[0]
         print("\n=== SINGLE PROMPT PREVIEW ===")
         print(f"Prompt 1/{total_prompts} (preview target completion text shown below):")
         print(f"----\n{preview_prompt_text}\n----")
         preview_start = time.time()
-        preview_prompt, preview_reward, _ = optimizer.optimize_prompt(
+        preview_prompt, preview_reward, preview_trace = optimizer.optimize_prompt(
             preview_prompt_text,
             episodes=episodes_per_prompt,
             steps_per_episode=steps_per_episode,
@@ -128,7 +134,10 @@ def train_on_dataset(cfg, fast_mode=False, preview_first=True, log_every=None):
             lr_policy=lr_policy,
             alpha=alpha,
             beta=beta,
-            log_every=max(1, log_every)
+            log_every=max(1, log_every),
+            collect_trace=True,
+            plot_trace=preview_plot_trace,
+            plot_path=os.path.join(prompt_trace_dir, "preview_trace.png") if preview_plot_trace else None
         )
         preview_time = time.time() - preview_start
         preview_decoded = decode_tokens(agent, preview_prompt)
@@ -137,6 +146,8 @@ def train_on_dataset(cfg, fast_mode=False, preview_first=True, log_every=None):
         print(f"[preview] Optimized prompt tokens: {preview_prompt}")
         print(f"[preview] Optimized prompt text: '{preview_decoded}'")
         print(f"[preview] Time elapsed: {preview_time:.1f}s\n")
+        if preview_plot_trace:
+            print(f"[preview] Trace plotting enabled. Latest plot stored in '{prompt_trace_dir}'.")
 
         processed_prompts += 1
         all_rewards.append(float(preview_reward))
@@ -181,7 +192,9 @@ def train_on_dataset(cfg, fast_mode=False, preview_first=True, log_every=None):
                     lr_policy=lr_policy,
                     alpha=alpha,
                     beta=beta,
-                    log_every=max(1, log_every)
+                    log_every=max(1, log_every),
+                    collect_trace=collect_prompt_traces,
+                    plot_trace=False
                 )
                 
                 all_rewards.append(float(best_reward))

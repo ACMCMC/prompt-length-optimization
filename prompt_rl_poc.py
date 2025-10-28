@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from transformers import GPTNeoXForCausalLM, AutoTokenizer
 import numpy as np
 import random
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from collections import deque
 import torch.nn as nn
 import torch.optim as optim
@@ -16,6 +16,7 @@ import argparse
 import os
 import csv
 import matplotlib.pyplot as plt
+import time
 
 class PromptRLAgent:
     def __init__(self, model_name="EleutherAI/pythia-410m"):
@@ -85,6 +86,7 @@ class LengthPolicyOptimizer:
     def __init__(self, agent: PromptRLAgent):
         self.agent = agent
         self.emb_dim = self.agent.model.get_input_embeddings().weight.shape[1]
+        self.action_labels = {0: "REMOVE", 1: "KEEP", 2: "RETRACT"}
         
         # Policy network that decides length changes based on current state
         # Actions: 0=REMOVE, 1=KEEP, 2=RETRACT (restore last removed)
@@ -116,7 +118,9 @@ class LengthPolicyOptimizer:
         
     def optimize_prompt(self, target_completion: str, episodes=100, steps_per_episode=50,
                        initial_prompt_length=32, lr_embeddings=0.01, lr_policy=3e-4,
-                       alpha=1.0, beta=0.1, log_every=10) -> Tuple[List[int], float, List[float]]:
+                       alpha=1.0, beta=0.1, log_every=10,
+                       collect_trace=False, plot_trace=False,
+                       plot_path: Optional[str] = None) -> Tuple[List[int], float, List[Dict]]:
         """
         Train policy to learn optimal length adjustments while optimizing embeddings
         Policy learns when to remove/keep/add tokens based on current state
@@ -130,8 +134,12 @@ class LengthPolicyOptimizer:
         
         best_overall_reward = float('-inf')
         best_prompt = None
+        prompt_start_time = time.time()
+        step_trace = [] if (collect_trace or plot_trace) else None
+        total_steps = 0
         
         for episode in range(episodes):
+            print(f"\n[episode {episode + 1}/{episodes}] Initializing new run")
             # Reset for new episode
             current_length = initial_prompt_length
             self.prompt_embeddings = nn.Parameter(
@@ -149,6 +157,7 @@ class LengthPolicyOptimizer:
             likelihood_history = deque(maxlen=10)  # Track recent likelihoods for momentum calculation
             
             for step in range(steps_per_episode):
+                print(f"\n  [episode {episode + 1}] step {step + 1}/{steps_per_episode}")
                 # Optimize embeddings for a few steps to get optimization momentum
                 recent_likelihoods = []
                 for emb_step in range(5):  # Track 5 embedding optimization steps
@@ -158,6 +167,8 @@ class LengthPolicyOptimizer:
                     emb_loss = -likelihood
                     emb_loss.backward()
                     self.prompt_optimizer.step()
+                print(f"    embedding opt likelihoods: start={recent_likelihoods[0]:.4f} "
+                      f"end={recent_likelihoods[-1]:.4f}")
                 
                 # Calculate optimization momentum features
                 current_likelihood = recent_likelihoods[-1]
@@ -191,16 +202,12 @@ class LengthPolicyOptimizer:
                                                 device=self.agent.device, dtype=torch.float32)
                 
                 # Policy decision
-                print("State features:", state_features)
                 policy_logits = self.policy_net(state_features)
-                print("Policy logits:", policy_logits)
                 policy_probs = F.softmax(policy_logits, dim=-1)
-                print("Policy probs:", policy_probs)
                 policy_dist = torch.distributions.Categorical(policy_probs)
                 action = policy_dist.sample()
-                print("Sampled action:", action)
+                action_label = self.action_labels.get(int(action.item()), f"UNKNOWN-{int(action.item())}")
                 log_prob = policy_dist.log_prob(action)
-                print("Log prob:", log_prob)
                 
                 # Execute action: 0=REMOVE, 1=KEEP, 2=RETRACT
                 action_val = int(action.item())
@@ -232,7 +239,6 @@ class LengthPolicyOptimizer:
                 with torch.no_grad():
                     final_likelihood = self._get_likelihood_from_embeddings(self.prompt_embeddings, completion_tokens)
                     base_reward = alpha * final_likelihood - beta * current_length
-                    print(f"final_likelihood: {final_likelihood}, current_length: {current_length},base_reward: {base_reward}, ")
                 # Natural learning rewards (no artificial exploration penalties)
                 discovery_bonus = 0
                 if action_val == 0:  # REMOVE action
@@ -244,10 +250,8 @@ class LengthPolicyOptimizer:
                     efficiency_bonus = (initial_prompt_length - current_length) * 0.05
                     discovery_bonus += efficiency_bonus
                 
-                print(f" discovery_bonus: {discovery_bonus}")
 
                 reward = base_reward + discovery_bonus
-                print(f"reward: {reward}")
                 # Store for policy update (convert to float to avoid tensor issues)
                 episode_rewards.append(float(reward))
                 episode_log_probs.append(log_prob)
@@ -257,6 +261,20 @@ class LengthPolicyOptimizer:
                 if reward > best_overall_reward:
                     best_overall_reward = float(reward)  # Convert to Python float
                     best_prompt = self._embeddings_to_tokens(self.prompt_embeddings.detach())
+                
+                if step_trace is not None:
+                    step_trace.append({
+                        'episode': episode,
+                        'step': step,
+                        'global_step': total_steps,
+                        'elapsed_time': time.time() - prompt_start_time,
+                        'length': current_length,
+                        'reward': float(reward),
+                        'likelihood': float(final_likelihood),
+                        'action': action_val,
+                        'action_label': action_label
+                    })
+                total_steps += 1
                 
                 # Logging with momentum info
                 self.likelihood_history.append(float(current_likelihood))
@@ -273,16 +291,21 @@ class LengthPolicyOptimizer:
             episode_return = sum(episode_rewards)
             returns = []
             G = 0
+            print("episode rewards:", ["{0:.2f}".format(r) for r in episode_rewards])
             for r in reversed(episode_rewards):
                 G = r + G  
                 returns.insert(0, G)
             
             returns = torch.tensor(returns, device=self.agent.device)
+            print("returns before normalization:", ["{0:.2f}".format(r) for r in returns.tolist()])
             # Normalize returns
             returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            print("returns after normalization:", ["{0:.2f}".format(r) for r in returns.tolist()])
+
             
             policy_loss = 0
             for log_prob, ret in zip(episode_log_probs, returns):
+                print(f"    log_prob: {log_prob:.4f}, ret: {ret:.4f}")
                 policy_loss = policy_loss - log_prob * ret
             
             self.policy_optimizer.zero_grad()
@@ -291,10 +314,24 @@ class LengthPolicyOptimizer:
             
             if log_every > 0 and episode % log_every == 0:
                 avg_length = sum(self.length_history[-steps_per_episode:]) / steps_per_episode
-                print(f"Episode {episode}: return={episode_return:.2f} avg_length={avg_length:.1f} "
+                avg_reward = np.mean(episode_rewards)
+                print(f"[episode {episode + 1} summary] return={episode_return:.2f} "
+                      f"avg_reward={avg_reward:.3f} avg_length={avg_length:.1f} "
                       f"best_reward={best_overall_reward:.3f}")
         
-        return best_prompt, float(best_overall_reward), self.loss_history
+        if plot_trace and step_trace:
+            try:
+                plot_file = self._plot_single_prompt_trace(
+                    step_trace,
+                    plot_path=plot_path,
+                    title_suffix=f"Target length {initial_prompt_length}"
+                )
+                print(f"[trace] Saved reward/length trace to: {plot_file}")
+            except Exception as exc:
+                print(f"[trace] Failed to generate plot: {exc}")
+        
+        history = step_trace if step_trace is not None else self.loss_history
+        return best_prompt, float(best_overall_reward), history
     
     def _get_likelihood_from_embeddings(self, prompt_embeds: torch.Tensor, completion_tokens: List[int]) -> torch.Tensor:
         """Calculate log P(completion | continuous prompt embeddings)"""
@@ -334,6 +371,61 @@ class LengthPolicyOptimizer:
             tokens.append(closest_token)
         
         return tokens
+
+    def _plot_single_prompt_trace(self, step_trace: List[Dict], plot_path: Optional[str] = None,
+                                  title_suffix: Optional[str] = None) -> str:
+        """Create a dual-axis plot for reward and length over time."""
+        if not step_trace:
+            raise ValueError("Trace is empty; nothing to plot.")
+        
+        times = [entry['elapsed_time'] for entry in step_trace]
+        rewards = [entry['reward'] for entry in step_trace]
+        lengths = [entry['length'] for entry in step_trace]
+        episodes = [entry['episode'] for entry in step_trace]
+        
+        fig, ax_reward = plt.subplots(figsize=(10, 6))
+        color_reward = 'tab:blue'
+        color_length = 'tab:orange'
+        
+        ax_reward.plot(times, rewards, color=color_reward, label='Reward')
+        ax_reward.set_xlabel('Elapsed Time (s)')
+        ax_reward.set_ylabel('Reward', color=color_reward)
+        ax_reward.tick_params(axis='y', labelcolor=color_reward)
+        ax_reward.grid(True, alpha=0.3)
+        
+        ax_length = ax_reward.twinx()
+        ax_length.plot(times, lengths, color=color_length, linestyle='--', label='Prompt Length')
+        ax_length.set_ylabel('Prompt Length (tokens)', color=color_length)
+        ax_length.tick_params(axis='y', labelcolor=color_length)
+        
+        title = "Single Prompt Optimization Trace"
+        if title_suffix:
+            title = f"{title} – {title_suffix}"
+        ax_reward.set_title(title)
+        
+        # Combine legends from both axes
+        lines_reward, labels_reward = ax_reward.get_legend_handles_labels()
+        lines_length, labels_length = ax_length.get_legend_handles_labels()
+        ax_reward.legend(lines_reward + lines_length, labels_reward + labels_length, loc='best')
+        
+        # Annotate episode boundaries for clarity
+        unique_episodes = sorted(set(episodes))
+        for ep in unique_episodes[1:]:
+            idx = episodes.index(ep)
+            ax_reward.axvline(times[idx], color='grey', linestyle=':', alpha=0.4)
+        
+        fig.tight_layout()
+        
+        if not plot_path:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            os.makedirs("results", exist_ok=True)
+            plot_path = os.path.join("results", f"prompt_trace_{timestamp}.png")
+        else:
+            os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return plot_path
 
 # Main function removed - use train.py and eval.py instead
 

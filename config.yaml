@@ -4,14 +4,14 @@ seed: 2262
 
 train:
   # Dataset parameters
-  max_prompts: 50                    # Number of prompts to train on
+  max_prompts: 1                  # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 3             # Episodes to train on each prompt
+  episodes_per_prompt: 10             # Episodes to train on each prompt
   steps_per_episode: 100             # Steps per episode (increased for better RL learning)
-  init_len: 32                       # Initial prompt length in tokens
+  init_len: 100                       # Initial prompt length in tokens
   
   # Optimization parameters
   lr_embeddings: 0.01
