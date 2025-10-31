@@ -5,3 +5,4 @@ numpy
 pyyaml
 datasets
 pandas
+tqdm

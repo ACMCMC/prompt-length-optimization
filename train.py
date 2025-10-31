@@ -25,6 +25,9 @@ def train_on_dataset_fast(cfg):
     lr_policy = train_cfg.get('lr_policy', 3e-4) * 2
     alpha = train_cfg.get('alpha', 1.0)
     beta = train_cfg.get('beta', 0.2)
+    length_ratio_penalty = train_cfg.get('length_ratio_penalty', 0.0)
+    entropy_coef = train_cfg.get('entropy_coef', 0.01)
+    baseline_momentum = train_cfg.get('baseline_momentum', 0.9)
     save_path = train_cfg.get('save_path', 'models/trained_policy_fast.pt')
     
     # Batch processing for faster training
@@ -48,7 +51,8 @@ def train_on_dataset_fast(cfg):
     print(f"  Steps per episode: {steps_per_episode} (reduced)")
     print(f"  Learning rates: {lr_embeddings:.3f} / {lr_policy:.6f} (increased)")
     print(f"  Batch processing: {batch_size} prompts")
-    print(f"Alpha: {alpha}, Beta: {beta}")
+    print(f"Alpha: {alpha}, Beta: {beta}, Length ratio penalty: {length_ratio_penalty}")
+    print(f"Entropy coef: {entropy_coef}, Baseline momentum: {baseline_momentum}")
     
     # Load dataset using the new dataset manager with config split ratios
     dataset_manager = ToxicChatDatasetManager(seed=seed)
@@ -101,7 +105,10 @@ def train_on_dataset_fast(cfg):
                     lr_policy=lr_policy,
                     alpha=alpha,
                     beta=beta,
-                    log_every=0  # Disable detailed logging for speed
+                    length_ratio_penalty=length_ratio_penalty,
+                    entropy_coef=entropy_coef,
+                    log_every=0,  # Disable detailed logging for speed
+                    baseline_momentum=baseline_momentum
                 )
                 
                 all_rewards.append(float(best_reward))
@@ -150,7 +157,10 @@ def train_on_dataset_fast(cfg):
             'episodes_per_prompt': episodes_per_prompt,
             'steps_per_episode': steps_per_episode,
             'lr_embeddings': lr_embeddings,
-            'lr_policy': lr_policy
+            'lr_policy': lr_policy,
+            'length_ratio_penalty': length_ratio_penalty,
+            'entropy_coef': entropy_coef,
+            'baseline_momentum': baseline_momentum
         }
     }
     

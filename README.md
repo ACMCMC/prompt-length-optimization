@@ -1,354 +1,130 @@
-# Prompt Length Optimization with Reinforcement Learning# Prompt Length Optimization with Reinforcement Learning# Prompt & Generation Length Optimization via RL
+# Prompt Length Optimization via Reinforcement Learning
 
+This repository explores how to shorten prompts without sacrificing the likelihood of a fixed target completion. A frozen causal language model (Pythia) is paired with a reinforcement learning (RL) policy that decides when to add, remove, or keep tokens while an inner gradient loop refines continuous prompt embeddings.
 
+---
 
-A reinforcement learning approach to optimize prompt compression while maintaining generation quality. Uses the toxic-chat dataset to train policies that balance prompt length reduction with likelihood preservation.
+## Quick Start
 
-
-
-## Quick StartA reinforcement learning approach to optimize prompt compression while maintaining generation quality. Uses the toxic-chat dataset to train policies that balance prompt length reduction with likelihood preservation.**Research Project** | *Aldan Creo* | MSDS @ UC San Diego
-
-
-
-1. **Install dependencies:**
+Install dependencies:
 
 ```bash
-
-pip install -r requirements.txt## Quick Start---
-
+pip install -r requirements.txt
 ```
 
+Train with the fast configuration (recommended for experimentation):
 
-
-2. **Train the policy:**
-
-```bash1. **Install dependencies:**## 🎯 Research Concept
-
-# Fast training (recommended - 50 prompts in ~2-3 minutes)
-
-python train_fast.py --config config.yaml```bash
-
-
-
-# Standard training (50 prompts in ~15-20 minutes)  pip install -r requirements.txtThis project explores the application of **reinforcement learning** to optimize prompt discovery for **fixed target completions**. Given a desired generation/completion, we want to find the minimal prompt that maximizes the posterior probability of that specific completion.
-
+```bash
 python train.py --config config.yaml
+```
 
-``````
-
-
-
-3. **Evaluate on test set:**### Core Question
+Evaluate a saved policy on held-out prompts:
 
 ```bash
-
-python eval.py --config config.yaml2. **Train the policy:**
-
+python eval.py --config config.yaml
 ```
 
-```bash> *Given a target completion, can we train an RL agent to find the shortest prompt that maximizes P(completion | prompt)?*
-
-## How It Works
-
-python train.py --config config.yaml
-
-- **Dataset**: Uses `lmsys/toxic-chat` model outputs as training data
-
-- **Policy**: Learns when to compress vs. continue optimizing based on improvement rates```**Key Insight**: Traditional prompt optimization uses gradient descent on input embeddings, but this doesn't optimize for prompt length. We introduce an RL agent that can dynamically add/remove tokens to balance:
-
-- **Reward**: Balances likelihood preservation (α) with length reduction (β)
-
-- **Actions**: REMOVE (compress), KEEP (optimize), RETRACT (undo compression)1. **Likelihood Maximization**: High P(target_completion | prompt)  
-
-
-
-## Performance Optimizations ⚡3. **Evaluate on test set:**2. **Length Minimization**: Shortest possible prompt
-
-
-
-We've implemented several speed optimizations that provide **6-9x speedup**:```bash
-
-
-
-- **Fast Training Mode** (`train_fast.py`): Optimized hyperparameters for faster convergencepython eval.py --config config.yaml---
-
-- **Parallel Processing** (`train_parallel.py`): Multi-worker training (experimental)
-
-- **Batch Processing**: Efficient progress tracking and vectorized operations```
-
-
-
-See `OPTIMIZATION_RESULTS.md` for detailed performance analysis.## 💡 Key Ideas
-
-
-
-## Configuration## How It Works
-
-
-
-Edit `config.yaml` to adjust:### 1. RL-Based Prompt Length Optimization
-
-- **Training**: Episodes per prompt, steps per episode, learning rates
-
-- **Dataset**: Number of prompts, length filters  - **Dataset**: Uses `lmsys/toxic-chat` model outputs as training data
-
-- **Reward**: α (likelihood weight) and β (compression penalty)
-
-- **Performance**: Batch size, parallel workers- **Policy**: Learns when to compress vs. continue optimizing based on improvement rates**Concept**: Frame prompt discovery as an RL task where the agent learns to build optimal prompts token by token.
-
-- **Evaluation**: Test set size, output paths
-
-- **Reward**: Balances likelihood preservation (α) with length reduction (β)
-
-## Quick Examples
-
-- **Actions**: REMOVE (compress), KEEP (optimize), RETRACT (undo compression)**RL Formulation**:
-
-```bash
-
-# Quick experiment (10 prompts, ~30 seconds)- **State**: Current prompt sequence + target completion + current likelihood score
-
-python train_fast.py --config config.yaml --prompts 10 --episodes 1 --steps 20
-
-## Configuration- **Action**: Add token at start, remove token from start, or stop
-
-# Development training (50 prompts, ~2 minutes)
-
-python train_fast.py --config config.yaml --prompts 50 --episodes 1 --steps 30- **Reward**: α * log P(completion | prompt) - β * prompt_length
-
-
-
-# Full training (100 prompts, ~5 minutes)Edit `config.yaml` to adjust:- **Policy**: Learns when to add/remove tokens to optimize the dual objective
-
-python train_fast.py --config config.yaml --prompts 100 --episodes 2 --steps 50
-
-```- **Training**: Episodes per prompt, steps per episode, learning rates
-
-
-
-## Results- **Dataset**: Number of prompts, length filters  **Simplification**: Only modify tokens at sequence start to avoid complex positional encoding issues.
-
-
-
-Training produces:- **Reward**: α (likelihood weight) and β (compression penalty)
-
-- `models/trained_policy.pt` - Trained policy weights
-
-- `results/eval_results.csv` - Evaluation metrics per test prompt- **Evaluation**: Test set size, output paths**Approach**:
-
-- `OPTIMIZATION_RESULTS.md` - Performance analysis and speedup details
-
-- Start with preset number of tokens (random or heuristic initialization)
-
-## Research Background
-
-## Results- Agent decides whether to add/remove tokens at the beginning
-
-This work explores using reinforcement learning to find minimal prompts that maximize the posterior probability of target completions. The policy learns to balance:
-
-- Evaluate P(target_completion | current_prompt) after each action
-
-1. **Compression**: Removing tokens to reduce prompt length
-
-2. **Optimization**: Continuing embedding optimization for better likelihoodTraining produces:- Optimize for high likelihood with minimal prompt length
-
-3. **Quality**: Maintaining generation quality through likelihood preservation
-
-- `models/trained_policy.pt` - Trained policy weights
-
-The approach uses real-world model outputs from the toxic-chat dataset to ensure robust learning across diverse text types.
-- `results/eval_results.csv` - Evaluation metrics per test prompt### 2. Comparison to Gradient-Based Methods
-
-- Plots showing training progress and compression performance
-
-**Traditional Approach**:
-
-## Research Background- Gradient descent on input embeddings: `∇_embeddings log P(completion | prompt)`
-
-- Final projection onto discrete token IDs
-
-This work explores using reinforcement learning to find minimal prompts that maximize the posterior probability of target completions. The policy learns to balance:- **Limitation**: Fixed prompt length, no length optimization
-
-
-
-1. **Compression**: Removing tokens to reduce prompt length**Our RL Approach**:
-
-2. **Optimization**: Continuing embedding optimization for better likelihood- Dynamic prompt length via add/remove actions
-
-3. **Quality**: Maintaining generation quality through likelihood preservation- Direct optimization of length-likelihood tradeoff
-
-- More flexible than gradient-based methods for length constraints
-
-The approach uses real-world model outputs from the toxic-chat dataset to ensure robust learning across diverse text types.
-**Advantage**: Can discover that shorter prompts might actually yield higher likelihood for some completions.
+All generated artefacts (checkpoints, reward traces, plots) are written to `models/` and `results/`.
 
 ---
 
-## 🎓 Related Work & Context
+## Method Overview
 
-### Yangkun Wang's ACL Paper
-- **Key Innovation**: DPO with continuous representations
-- Combines gradient-based optimization with discrete token mapping
-- Currently fixed-length prompts
-- Challenge: Making prompt length differentiable
+Given a desired completion \( y = (y_1, \ldots, y_m) \), we seek a discrete prompt \( p \) that maximises the trade-off
 
-### Existing Approaches
-- **Gumbel-Softmax**: Rough approximation for gradient-based prompt optimization
-- **Soft Prompts**: Continuous prompt embeddings (but not length-variable)
-- **Prompt Tuning**: Optimizes prompt content, not length
+\[
+R(p) = \alpha \log P_\theta(y \mid p) - \beta \, |p|,
+\]
 
-### Open Challenges
-- Prompt length isn't differentiable
-- Hard to pass gradients through autoregressive generation
-- RL requires reasonable initialization (can't start from random)
+where \( P_\theta \) is the frozen language model, \( \alpha \) weights fidelity to the target completion, and \( \beta \) penalises prompt length.
+
+The optimisation loop alternates between:
+
+1. **Continuous embedding updates**  
+   For the current prompt embeddings \( \tilde{p} \), run several gradient steps on
+   \[
+   \mathcal{L}_{\text{emb}} = -\log P_\theta(y \mid \tilde{p}),
+   \]
+   using Adam to improve completion likelihood while keeping the prompt length fixed.
+
+2. **RL-driven structure edits**  
+   A policy network \( \pi_\phi(a \mid s) \) observes scalar features (likelihood, improvement trends, gradient norms, entropy) plus compact embedding summaries of the prompt and top next-token candidate. It samples actions from:
+   - `REMOVE_LAST`
+   - `KEEP`
+   - `RETRACT` (restore previously removed token)
+   - `ADD_FOCUSED` (append a top-k candidate or the next completion token)
+   - `ADD_RANDOM`
+
+   After executing the action, the prompt embeddings are adjusted and the reward \( R(p) \) (with shaping bonuses) is recorded.
+
+3. **Policy update**  
+   At the end of each episode, REINFORCE with normalised returns updates the policy parameters:
+   \[
+   \mathcal{L}_{\text{policy}} = - \sum_{t} \log \pi_\phi(a_t \mid s_t) \, \hat{G}_t.
+   \]
+
+4. **Discrete refinement**  
+   The best prompt found so far is greedily pruned token-by-token if the reward does not drop.
 
 ---
 
-## 🔬 Research Approach
+## Key Components
 
-### RL Agent Design
+- **`prompt_rl_poc.py`**
+  - `PromptRLAgent`: wraps tokenizer/model loading, device selection (CUDA/MPS/CPU), and likelihood utilities.
+  - `LengthPolicyOptimizer`: implements the two-level optimisation loop, state construction, action execution, and policy training.
 
-**State Representation**:
-```python
-state = {
-    'current_prompt': [token_ids],
-    'target_completion': [token_ids], 
-    'current_likelihood': float,
-    'prompt_length': int
-}
+- **`train.py`**
+  - Loads toxic-chat prompts via `dataset_utils.py`.
+  - Iterates through prompts in batches, invoking `LengthPolicyOptimizer.optimize_prompt`.
+  - Saves checkpoints containing policy weights, reward history, and metadata.
+
+- **`eval.py`**
+  - Reloads a checkpoint and re-optimises each evaluation prompt for a single episode.
+  - Writes compression statistics to CSV and optionally generates trace plots (`plot_utils.py`).
+
+- **`config.yaml`**
+  - Controls model name, dataset filters, reward weights (\(\alpha, \beta\)), inner-loop steps, maximum policy length, and plotting options.
+
+---
+
+## Configuration Highlights
+
+| Key | Purpose |
+| --- | --- |
+| `train.init_len` | Initial prompt length in tokens before RL editing. |
+| `train.lr_embeddings` / `train.embedding_opt_steps` | Inner-loop Adam configuration for continuous prompt optimisation. |
+| `train.lr_policy` | Learning rate for the policy network. |
+| `train.top_k_tokens` | Number of high-probability candidates considered by `ADD_FOCUSED`. |
+| `train.policy_max_prompt_len` | Upper bound on prompt length during exploration. |
+| `train.alpha`, `train.beta` | Reward weights for likelihood and length. |
+| `eval.*` | Mirrors the training knobs for evaluation runs. |
+
+Modify `config.yaml` to tailor the experiment (model size, number of prompts, reward balance, plotting).
+
+---
+
+## Repository Structure
+
+```
+prompt-length-optimization/
+├── prompt_rl_poc.py         # RL agent and optimisation loop
+├── train.py                 # Dataset-driven training pipeline
+├── eval.py                  # Evaluation on held-out prompts
+├── dataset_utils.py         # Toxic-chat dataset loading/splitting
+├── plot_utils.py            # Plotting utilities for rewards/traces
+├── config.yaml              # Experiment configuration
+├── requirements.txt         # Python dependencies
+└── results/, models/        # Generated outputs (ignored by git)
 ```
 
-**Action Space**:
-- `ADD_TOKEN_START`: Prepend a token to the prompt
-- `REMOVE_TOKEN_START`: Remove first token from prompt  
-- `STOP`: Finish prompt construction
-
-**Reward Function**:
-```python
-R = α * log P(completion | prompt) - β * len(prompt) + γ * stop_bonus
-```
-
-**Policy Training**:
-1. Start with random/heuristic prompt initialization
-2. Agent takes actions to modify prompt
-3. Evaluate likelihood after each modification
-4. Update policy using PPO/DPO based on reward signal
-
-### Experimental Setup
-
-**Baseline Comparisons**:
-- Gradient descent on embeddings (fixed length)
-- Random prompt search
-- Greedy token removal/addition
-- Human-written prompts
-
-**Datasets**:
-- Common sense reasoning completions
-- Code generation targets
-- Creative writing samples
-- Factual question-answer pairs
-
-**Metrics**:
-- Final likelihood P(completion | discovered_prompt)
-- Prompt length efficiency (likelihood per token)
-- Convergence speed and stability
-- Generalization across completion types
-
 ---
 
-## 📊 Why This Matters
+## Notes
 
-### Practical Benefits
-1. **Memory Efficiency**: Shorter prompts → more space for longer generations
-2. **Cost Reduction**: Fewer tokens → lower inference costs
-3. **Interpretability**: Minimal prompts reveal what the model actually needs
-4. **Elegance**: Information-theoretic appeal of minimal sufficient representations
+- The code automatically prefers Apple’s Metal backend (`torch.backends.mps`) on macOS when available.
+- Reward shaping and action design are intentionally modular; try adjusting `beta`, `policy_max_prompt_len`, or the action bonuses to study different compression behaviours.
+- For quick iteration, lower `train.max_prompts`, `train.episodes_per_prompt`, and `train.steps_per_episode`; then scale up once the policy behaves as expected.
 
-### Research Value
-- Bridges discrete optimization (token selection) and continuous optimization (gradients)
-- Novel application of RL to LLM efficiency
-- Insights into attention mechanisms and token importance
+Happy experimenting!
 
----
-
-## 🚧 Open Questions
-
-1. **Technical Feasibility**
-   - Can we make length optimization differentiable enough for practical training?
-   - How do we handle positional encoding when removing tokens?
-   - What's the right balance between sparsity and stability?
-
-2. **Empirical Validation**
-   - Does prompt compression actually improve downstream performance?
-   - What's the quality-length tradeoff curve?
-   - Do learned compressions generalize across tasks?
-
-3. **Scalability**
-   - Is the training cost worth the inference savings?
-   - Can this work with very large models (70B+)?
-   - How does this interact with existing optimizations (KV caching, etc.)?
-
----
-
-## 🛠️ Getting Started
-
-*Coming soon: experiment setup, baseline implementations, and initial results*
-
-### Prerequisites
-- PyTorch / JAX
-- Transformers library
-- RL framework (TBD: stable-baselines3, TRL, etc.)
-
-### Roadmap
-- [ ] Literature review
-- [ ] Baseline implementation
-- [ ] Attention sparsity experiments
-- [ ] RL policy training
-- [ ] Benchmarking & evaluation
-
----
-
-## 📝 Notes & Ideas
-
-### From Email Discussion (Oct 2025)
-
-**Yangkun's Insights**:
-- Inference cost dominated by generation, not prompt length
-- Generation compression might be more impactful
-- Gumbel-Softmax doesn't work well for LMs
-- Training autoregressive model with gradients is challenging
-
-**Secondary Benefits of Prompt Compression**:
-- Memory efficiency in context window
-- Interpretability improvements
-- Human preference for conciseness
-- Information-theoretic elegance
-
-**Concerns**:
-- Uncertain about scalability benefits
-- May be focusing on wrong bottleneck (prompt vs generation)
-- Technical challenges in making length differentiable
-
----
-
-## 📚 References
-
-*To be populated with relevant papers*
-
-- Yangkun Wang et al. - ACL 2025 (DPO with continuous representations)
-- Prompt compression literature
-- Attention sparsity papers
-- RL for LLM optimization
-
----
-
-## 📧 Contact
-
-**Aldan Creo**  
-MSDS @ Halıcıoğlu Data Science Institute  
-University of California San Diego  
-🌐 [acmc.fyi](https://acmc.fyi)
-
----
-
-*Last Updated: October 3, 2025*

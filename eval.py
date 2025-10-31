@@ -36,6 +36,11 @@ def evaluate_prompt(cfg, agent, optimizer):
     max_policy_steps = eval_cfg['max_policy_steps']
     
     # Use optimize_prompt with minimal steps for evaluation
+    train_cfg = cfg.get('train', {})
+    alpha = train_cfg.get('alpha', 1.0)
+    beta = train_cfg.get('beta', 0.1)
+    length_ratio_penalty = train_cfg.get('length_ratio_penalty', 0.0)
+
     best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
         test_prompt,
         episodes=1,  # Single episode for evaluation
@@ -43,20 +48,26 @@ def evaluate_prompt(cfg, agent, optimizer):
         initial_prompt_length=init_len,
         lr_embeddings=0.01,
         lr_policy=0.0003,
-        alpha=cfg.get('train', {}).get('alpha', 1.0),
-        beta=cfg.get('train', {}).get('beta', 0.1),
+        alpha=alpha,
+        beta=beta,
+        length_ratio_penalty=length_ratio_penalty,
         log_every=0  # No logging during evaluation
     )
-    
-    # Calculate reward (negative of the combined loss)
-    alpha = cfg.get('train', {}).get('alpha', 1.0)
-    beta = cfg.get('train', {}).get('beta', 0.1)
-    reward = alpha * best_likelihood - beta * len(best_prompt)
-    
+
+    # Calculate reward with updated length penalty
+    completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
+    reward = agent.calculate_reward(
+        best_prompt,
+        completion_tokens,
+        alpha=alpha,
+        beta=beta,
+        length_ratio_penalty=length_ratio_penalty,
+        reference_length=init_len
+    )
+
     # Decode the compressed prompt for display
     try:
-        tokens = agent.tokenizer.encode(test_prompt)[:len(best_prompt)]
-        compressed_prompt = agent.tokenizer.decode(tokens)
+        compressed_prompt = agent.tokenizer.decode(best_prompt)
     except:
         compressed_prompt = str(best_prompt)  # Fallback if decoding fails
     
@@ -148,6 +159,10 @@ def evaluate_on_dataset(cfg, model_path):
         
         try:
             # Evaluate using the optimizer directly
+            alpha = cfg.get('train', {}).get('alpha', 1.0)
+            beta = cfg.get('train', {}).get('beta', 0.1)
+            length_ratio_penalty = cfg.get('train', {}).get('length_ratio_penalty', 0.0)
+
             best_prompt, best_reward, trace = optimizer.optimize_prompt(
                 test_prompt,
                 episodes=1,  # Single episode for evaluation
@@ -157,12 +172,21 @@ def evaluate_on_dataset(cfg, model_path):
                 lr_policy=0.0003,
                 alpha=alpha,
                 beta=beta,
+                length_ratio_penalty=length_ratio_penalty,
                 log_every=0  # No logging during evaluation
             )
-            
-            # Get final likelihood from trace (best_reward is actually the final reward)
+
+            # Get final likelihood and consistent reward
             final_likelihood = trace[-1]['likelihood'] if trace else 0.0
-            final_reward = alpha * final_likelihood - beta * len(best_prompt)
+            completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
+            final_reward = agent.calculate_reward(
+                best_prompt,
+                completion_tokens,
+                alpha=alpha,
+                beta=beta,
+                length_ratio_penalty=length_ratio_penalty,
+                reference_length=init_len
+            )
             
             # Store results
             result_row = {
