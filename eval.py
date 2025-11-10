@@ -34,6 +34,10 @@ def evaluate_prompt(cfg, agent, optimizer):
     test_prompt = eval_cfg['test_prompt']
     init_len = eval_cfg['init_len']
     max_policy_steps = eval_cfg['max_policy_steps']
+    optimization_mode = eval_cfg.get('optimization_mode', cfg.get('train', {}).get('optimization_mode', 'continuous'))
+    gcg_top_k = eval_cfg.get('gcg_top_k', cfg.get('train', {}).get('gcg_top_k', 16))
+    gcg_batch_size = eval_cfg.get('gcg_batch_size', cfg.get('train', {}).get('gcg_batch_size', 32))
+    gcg_steps = eval_cfg.get('gcg_steps', cfg.get('train', {}).get('gcg_steps', 5))
     
     # Use optimize_prompt with minimal steps for evaluation
     best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
@@ -45,7 +49,11 @@ def evaluate_prompt(cfg, agent, optimizer):
         lr_policy=0.0003,
         alpha=cfg.get('train', {}).get('alpha', 1.0),
         beta=cfg.get('train', {}).get('beta', 0.1),
-        log_every=0  # No logging during evaluation
+        log_every=0,  # No logging during evaluation
+        optimization_mode=optimization_mode,
+        gcg_top_k=gcg_top_k,
+        gcg_batch_size=gcg_batch_size,
+        gcg_steps=gcg_steps
     )
     
     # Calculate reward (negative of the combined loss)
@@ -97,6 +105,10 @@ def evaluate_on_dataset(cfg, model_path):
     max_policy_steps = eval_cfg.get('max_policy_steps', 50)
     min_prompt_length = eval_cfg.get('min_prompt_length', 20)
     max_prompt_length = eval_cfg.get('max_prompt_length', 200)
+    optimization_mode = eval_cfg.get('optimization_mode', cfg.get('train', {}).get('optimization_mode', 'continuous'))
+    gcg_top_k = eval_cfg.get('gcg_top_k', cfg.get('train', {}).get('gcg_top_k', 16))
+    gcg_batch_size = eval_cfg.get('gcg_batch_size', cfg.get('train', {}).get('gcg_batch_size', 32))
+    gcg_steps = eval_cfg.get('gcg_steps', cfg.get('train', {}).get('gcg_steps', 5))
     
     results_file = eval_cfg.get('results_file', 'results/dataset_eval_results.csv')
     
@@ -106,14 +118,46 @@ def evaluate_on_dataset(cfg, model_path):
     print(f"Dataset evaluation with {max_test_prompts} test prompts")
     print(f"Model: {model_path}")
     
-    # Load test prompts using proper test split
-    test_prompts = load_test_prompts(
-        seed=seed,
-        max_samples=max_test_prompts,
-        min_length=min_prompt_length,
-        max_length=max_prompt_length,
-        ds_cfg=ds_cfg
-    )
+    # Determine dataset to evaluate (default: toxicchat)
+    dataset_name = eval_cfg.get('dataset', cfg.get('dataset', {}).get('name', 'toxicchat'))
+
+    # Load test prompts using proper test split or AdvBench if requested
+    if dataset_name.lower() == 'advbench':
+        from datasets import load_dataset
+        print("Loading AdvBench test set...")
+        raw = load_dataset("walledai/AdvBench", split='train')
+        PROMPT_KEYS = ["prompt", "instruction", "input", "question"]
+        COMPLETION_KEYS = ["target", "completion", "output", "response", "answer"]
+        test_prompts = []
+        for ex in raw:
+            base = None
+            for k in PROMPT_KEYS:
+                if k in ex and ex[k]:
+                    base = ex[k]
+                    break
+            if base is None:
+                continue
+            target = None
+            for k in COMPLETION_KEYS:
+                if k in ex and ex[k] is not None:
+                    target = ex[k]
+                    break
+            if target is None:
+                target = ""
+            test_prompts.append({'base': base.strip(), 'target': target.strip()})
+        import random as _rand
+        _rand.seed(seed)
+        _rand.shuffle(test_prompts)
+        test_prompts = test_prompts[:max_test_prompts]
+        print(f"Loaded {len(test_prompts)} AdvBench test examples")
+    else:
+        test_prompts = load_test_prompts(
+            seed=seed,
+            max_samples=max_test_prompts,
+            min_length=min_prompt_length,
+            max_length=max_prompt_length,
+            ds_cfg=ds_cfg
+        )
     
     if not test_prompts:
         raise ValueError("No test prompts found")
@@ -148,39 +192,98 @@ def evaluate_on_dataset(cfg, model_path):
         
         try:
             # Evaluate using the optimizer directly
-            best_prompt, best_reward, trace = optimizer.optimize_prompt(
-                test_prompt,
-                episodes=1,  # Single episode for evaluation
-                steps_per_episode=max_policy_steps,
-                initial_prompt_length=init_len,
-                lr_embeddings=0.01,
-                lr_policy=0.0003,
-                alpha=alpha,
-                beta=beta,
-                log_every=0  # No logging during evaluation
-            )
-            
-            # Get final likelihood from trace (best_reward is actually the final reward)
-            final_likelihood = trace[-1]['likelihood'] if trace else 0.0
-            final_reward = alpha * final_likelihood - beta * len(best_prompt)
-            
+            if isinstance(test_prompt, dict):
+                base_text = test_prompt.get('base', '')
+                target_text = test_prompt.get('target', '')
+                best_prompt, best_reward, trace = optimizer.optimize_prompt(
+                    target_completion=target_text,
+                    episodes=1,
+                    steps_per_episode=max_policy_steps,
+                    initial_prompt_length=init_len,
+                    lr_embeddings=0.01,
+                    lr_policy=0.0003,
+                    alpha=alpha,
+                    beta=beta,
+                    log_every=0,
+                    optimization_mode=optimization_mode,
+                    gcg_top_k=gcg_top_k,
+                    gcg_batch_size=gcg_batch_size,
+                    gcg_steps=gcg_steps,
+                    base_prompt=base_text
+                )
+                # final likelihood is log P(target | final prompt)
+                final_likelihood = trace[-1]['likelihood'] if trace else 0.0
+                # compute avg per-token likelihood for the completion
+                completion_tokens = agent.tokenizer.encode(target_text, add_special_tokens=False)
+                avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1)
+                final_reward = alpha * final_likelihood - beta * len(best_prompt)
+                input_prompt_text = base_text
+                target_completion_text = target_text
+            else:
+                # legacy behavior: test_prompt is a raw prompt string
+                best_prompt, best_reward, trace = optimizer.optimize_prompt(
+                    test_prompt,
+                    episodes=1,  # Single episode for evaluation
+                    steps_per_episode=max_policy_steps,
+                    initial_prompt_length=init_len,
+                    lr_embeddings=0.01,
+                    lr_policy=0.0003,
+                    alpha=alpha,
+                    beta=beta,
+                    log_every=0,  # No logging during evaluation
+                    optimization_mode=optimization_mode,
+                    gcg_top_k=gcg_top_k,
+                    gcg_batch_size=gcg_batch_size,
+                    gcg_steps=gcg_steps
+                )
+                final_likelihood = trace[-1]['likelihood'] if trace else 0.0
+                final_reward = alpha * final_likelihood - beta * len(best_prompt)
+                avg_likelihood = float('nan')
+                input_prompt_text = test_prompt
+                target_completion_text = ""
+
+            # Build decoded optimized prompt and suffix for reporting
+            try:
+                optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
+            except Exception:
+                optimized_full_text = str(best_prompt)
+
+            # Attempt to get suffix by removing base prefix
+            optimized_suffix_text = ''
+            try:
+                if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
+                    base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
+                    if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
+                        suffix_ids = best_prompt[len(base_ids):]
+                        optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+                    else:
+                        optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
+                else:
+                    optimized_suffix_text = optimized_full_text
+            except Exception:
+                optimized_suffix_text = optimized_full_text
+
             # Store results
             result_row = {
                 'prompt_id': i,
-                'prompt_text': test_prompt,
-                'prompt_length_chars': len(test_prompt),
+                'prompt_text': input_prompt_text,
+                'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
                 'initial_tokens': init_len,
-                'final_tokens': len(best_prompt),
-                'compression_ratio': (init_len - len(best_prompt)) / init_len * 100,
+                'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
+                'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
                 'final_likelihood': float(final_likelihood),
+                'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
                 'final_reward': float(final_reward),
+                'target_completion': target_completion_text,
+                'optimized_full_prompt': optimized_full_text,
+                'optimized_suffix': optimized_suffix_text,
                 'compressed_prompt': str(best_prompt)
             }
             results.append(result_row)
-            
-            print(f"Result: {init_len}→{len(best_prompt)} tokens ({result_row['compression_ratio']:.1f}% compression)")
-            print(f"Likelihood: {final_likelihood:.3f}, Reward: {final_reward:.3f}")
-            
+
+            print(f"Result: {init_len}→{result_row['final_tokens']} tokens ({result_row['compression_ratio']:.1f}% compression)")
+            print(f"Likelihood: {final_likelihood:.3f}, Avg token likelihood: {result_row['avg_likelihood'] if not np.isnan(result_row['avg_likelihood']) else 'N/A'}, Reward: {final_reward:.3f}")
+
             # Generate per-prompt plot if enabled
             if save_plots and trace:
                 try:

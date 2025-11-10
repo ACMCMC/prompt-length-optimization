@@ -12,57 +12,109 @@ from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
 from dataset_utils import ToxicChatDatasetManager
 import numpy as np
 
-def train_on_dataset_fast(cfg):
-    """Fast training with optimized settings for speed."""
+def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
+    """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
+
+    dataset_name: 'advbench' or 'toxicchat' (default 'advbench')
+    """
     model_name = cfg['model']
     train_cfg = cfg['train']
-    
-    # Reduced training hyperparameters for speed
-    episodes_per_prompt = max(1, train_cfg.get('episodes_per_prompt', 3) // 2)  # Halve episodes
-    steps_per_episode = max(20, train_cfg.get('steps_per_episode', 100) // 2)  # Halve steps
+
+    base_episodes = train_cfg.get('episodes_per_prompt', 3)
+    base_steps = train_cfg.get('steps_per_episode', 100)
     init_len = train_cfg.get('init_len', 32)
-    lr_embeddings = train_cfg.get('lr_embeddings', 0.01) * 2  # Double learning rate for faster convergence
-    lr_policy = train_cfg.get('lr_policy', 3e-4) * 2
+    base_lr_embeddings = train_cfg.get('lr_embeddings', 0.01)
+    base_lr_policy = train_cfg.get('lr_policy', 3e-4)
     alpha = train_cfg.get('alpha', 1.0)
     beta = train_cfg.get('beta', 0.2)
-    save_path = train_cfg.get('save_path', 'models/trained_policy_fast.pt')
-    
-    # Batch processing for faster training
+    optimization_mode = train_cfg.get('optimization_mode', 'continuous')
+    gcg_top_k = train_cfg.get('gcg_top_k', 16)
+    gcg_batch_size = train_cfg.get('gcg_batch_size', 32)
+    gcg_steps = train_cfg.get('gcg_steps', 5)
+    save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
+
     batch_size = train_cfg.get('batch_size', 8)
-    
-    # Dataset parameters
+
     max_prompts = train_cfg.get('max_prompts', 50)
     min_prompt_length = train_cfg.get('min_prompt_length', 30)
     max_prompt_length = train_cfg.get('max_prompt_length', 150)
-    
+
+    episodes_per_prompt = base_episodes
+    steps_per_episode = base_steps
+    lr_embeddings = base_lr_embeddings
+    lr_policy = base_lr_policy
+
+    if fast_mode:
+        episodes_per_prompt = max(1, base_episodes // 2)
+        steps_per_episode = max(20, base_steps // 2)
+        lr_embeddings = base_lr_embeddings * 2
+        lr_policy = base_lr_policy * 2
+
     seed = cfg.get('seed', 2262)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
-    
-    print(f"Fast training mode with {max_prompts} prompts")
+
+    mode_name = "Fast" if fast_mode else "Standard"
+    print(f"{mode_name} training with {max_prompts} prompts")
     print(f"Model: {model_name}")
-    print(f"OPTIMIZED SETTINGS:")
-    print(f"  Episodes per prompt: {episodes_per_prompt} (reduced)")
-    print(f"  Steps per episode: {steps_per_episode} (reduced)")
-    print(f"  Learning rates: {lr_embeddings:.3f} / {lr_policy:.6f} (increased)")
-    print(f"  Batch processing: {batch_size} prompts")
+    print(f"Episodes per prompt: {episodes_per_prompt}")
+    print(f"Steps per episode: {steps_per_episode}")
+    print(f"Learning rates: {lr_embeddings:.3f} / {lr_policy:.6f}")
+    print(f"Batch size: {batch_size}")
     print(f"Alpha: {alpha}, Beta: {beta}")
+    if fast_mode:
+        print("Fast mode applies half episodes/steps and doubles learning rates relative to config values.")
     
-    # Load dataset using the new dataset manager with config split ratios
-    dataset_manager = ToxicChatDatasetManager(seed=seed)
+    # Load dataset according to selected dataset_name
+    prompts = []
     ds_cfg = cfg.get('dataset', {})
-    prompts = dataset_manager.load_train_set(
-        min_length=min_prompt_length,
-        max_length=max_prompt_length,
-        max_samples=max_prompts,
-        train_ratio=ds_cfg.get('train_ratio', 0.7),
-        val_ratio=ds_cfg.get('val_ratio', 0.15),
-        test_ratio=ds_cfg.get('test_ratio', 0.15),
-        use_cache=True
-    )
-    
+    if dataset_name.lower() == 'advbench':
+        # Load AdvBench and extract (base prompt, target completion) pairs
+        from datasets import load_dataset
+        print("Loading AdvBench dataset...")
+        raw = load_dataset("walledai/AdvBench", split='train')
+        PROMPT_KEYS = ["prompt", "instruction", "input", "question"]
+        COMPLETION_KEYS = ["target", "completion", "output", "response", "answer"]
+        for ex in raw:
+            # find prompt-like field
+            base = None
+            for k in PROMPT_KEYS:
+                if k in ex and ex[k]:
+                    base = ex[k]
+                    break
+            if base is None:
+                continue
+            # find completion-like field
+            target = None
+            for k in COMPLETION_KEYS:
+                if k in ex and ex[k] is not None:
+                    target = ex[k]
+                    break
+            if target is None:
+                target = ""
+            prompts.append({'base': base.strip(), 'target': target.strip()})
+        # deterministic sampling/shuffle
+        import random as _rand
+        _rand.seed(seed)
+        _rand.shuffle(prompts)
+        prompts = prompts[:max_prompts]
+        print(f"Loaded {len(prompts)} AdvBench examples")
+    else:
+        # Fallback: toxic-chat using existing manager (only base prompt available)
+        dataset_manager = ToxicChatDatasetManager(seed=seed)
+        toxic_prompts = dataset_manager.load_train_set(
+            min_length=min_prompt_length,
+            max_length=max_prompt_length,
+            max_samples=max_prompts,
+            train_ratio=ds_cfg.get('train_ratio', 0.7),
+            val_ratio=ds_cfg.get('val_ratio', 0.15),
+            test_ratio=ds_cfg.get('test_ratio', 0.15),
+            use_cache=True
+        )
+        prompts = [{'base': p, 'target': ''} for p in toxic_prompts]
+
     if not prompts:
         raise ValueError("No valid prompts found in dataset")
     
@@ -87,13 +139,16 @@ def train_on_dataset_fast(cfg):
         
         batch_start_time = time.time()
         
-        for prompt_idx, prompt_text in enumerate(batch_prompts):
+        for prompt_idx, prompt_record in enumerate(batch_prompts):
             global_idx = batch_start + prompt_idx
-            
+
             try:
-                # Train on this specific prompt with reduced parameters
+                base_text = prompt_record.get('base', '')
+                target_text = prompt_record.get('target', '')
+
+                # Train on this specific prompt with reduced parameters; pass target and base explicitly
                 best_prompt_result, best_reward, history = optimizer.optimize_prompt(
-                    prompt_text,
+                    target_completion=target_text,
                     episodes=episodes_per_prompt,
                     steps_per_episode=steps_per_episode,
                     initial_prompt_length=init_len,
@@ -101,20 +156,51 @@ def train_on_dataset_fast(cfg):
                     lr_policy=lr_policy,
                     alpha=alpha,
                     beta=beta,
-                    log_every=0  # Disable detailed logging for speed
+                    log_every=0,  # Disable detailed logging for speed
+                    optimization_mode=optimization_mode,
+                    gcg_top_k=gcg_top_k,
+                    gcg_batch_size=gcg_batch_size,
+                    gcg_steps=gcg_steps,
+                    base_prompt=base_text
                 )
-                
+
                 all_rewards.append(float(best_reward))
-                
+
                 if best_reward > best_overall_reward:
                     best_overall_reward = float(best_reward)  # Ensure it's a Python float
                     best_prompt = best_prompt_result
-                    best_prompt_text = prompt_text
-                
+                    best_prompt_text = base_text
+
+                # Print input, optimized suffix/full prompt, and target completion for transparency
+                try:
+                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
+                except Exception:
+                    optimized_text = str(best_prompt_result)
+
+                # Determine optimized suffix by removing base token ids if possible
+                optimized_suffix_text = ''
+                try:
+                    if isinstance(best_prompt_result, list) and base_text:
+                        base_ids = agent.tokenizer.encode(base_text, add_special_tokens=False)
+                        if len(best_prompt_result) >= len(base_ids) and best_prompt_result[:len(base_ids)] == base_ids:
+                            suffix_ids = best_prompt_result[len(base_ids):]
+                            optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+                        else:
+                            optimized_suffix_text = optimized_text.replace(base_text, '', 1).strip()
+                    else:
+                        optimized_suffix_text = optimized_text
+                except Exception:
+                    optimized_suffix_text = optimized_text
+
+                print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                print(f"Target completion: {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
+
                 # Quick progress update
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                     print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
-                
+
             except Exception as e:
                 print(f"  Error on prompt {global_idx+1}: {e}")
                 continue
@@ -146,13 +232,19 @@ def train_on_dataset_fast(cfg):
         'best_prompt': best_prompt,
         'best_prompt_text': best_prompt_text,
         'training_time': training_time,
-        'fast_mode_settings': {
-            'episodes_per_prompt': episodes_per_prompt,
-            'steps_per_episode': steps_per_episode,
-            'lr_embeddings': lr_embeddings,
-            'lr_policy': lr_policy
-        }
+        'fast_mode': fast_mode,
+        'episodes_per_prompt': episodes_per_prompt,
+        'steps_per_episode': steps_per_episode,
+        'lr_embeddings': lr_embeddings,
+        'lr_policy': lr_policy
     }
+    if fast_mode:
+        checkpoint['fast_mode_settings'] = {
+            'base_episodes_per_prompt': base_episodes,
+            'base_steps_per_episode': base_steps,
+            'base_lr_embeddings': base_lr_embeddings,
+            'base_lr_policy': base_lr_policy
+        }
     
     torch.save(checkpoint, save_path)
     
@@ -162,7 +254,7 @@ def train_on_dataset_fast(cfg):
         std_reward = np.std(all_rewards)
         
         print(f"\n{'='*60}")
-        print(f"FAST TRAINING COMPLETE!")
+        print(f"{mode_name.upper()} TRAINING COMPLETE!")
         print(f"Trained on {len(all_rewards)} prompts in {training_time:.1f}s")
         print(f"Speed: {len(all_rewards)/training_time:.2f} prompts/second")
         print(f"Average time per prompt: {training_time/len(all_rewards):.2f}s")
@@ -170,10 +262,16 @@ def train_on_dataset_fast(cfg):
         print(f"Average reward: {avg_reward:.3f} ± {std_reward:.3f}")
         print(f"Best prompt text: '{best_prompt_text[:80]}{'...' if len(best_prompt_text) > 80 else ''}'")
         print(f"Model saved to: {save_path}")
-        print(f"OPTIMIZATION USED:")
-        print(f"  - Reduced episodes: {episodes_per_prompt} (vs {train_cfg.get('episodes_per_prompt', 3)})")
-        print(f"  - Reduced steps: {steps_per_episode} (vs {train_cfg.get('steps_per_episode', 100)})")
-        print(f"  - Increased LR: {lr_embeddings:.3f} (vs {train_cfg.get('lr_embeddings', 0.01):.3f})")
+        print(f"Training hyperparameters used:")
+        print(f"  Episodes per prompt: {episodes_per_prompt}")
+        print(f"  Steps per episode : {steps_per_episode}")
+        print(f"  LR (embeddings)   : {lr_embeddings:.4f}")
+        print(f"  LR (policy)       : {lr_policy:.6f}")
+        if fast_mode:
+            print(f"  Base config episodes: {base_episodes}")
+            print(f"  Base config steps   : {base_steps}")
+            print(f"  Base LR embeddings  : {base_lr_embeddings:.4f}")
+            print(f"  Base LR policy      : {base_lr_policy:.6f}")
         print(f"{'='*60}")
         
         # Generate plots if enabled (simple reward plot)
@@ -190,14 +288,16 @@ def train_on_dataset_fast(cfg):
                 plt.plot(range(1, len(plot_rewards) + 1), plot_rewards, 'b-', alpha=0.7, label='Rewards')
                 plt.axhline(y=np.mean(plot_rewards), color='r', linestyle='--', alpha=0.7, label=f'Average: {np.mean(plot_rewards):.3f}')
                 plt.axhline(y=plot_best_reward, color='g', linestyle='--', alpha=0.7, label=f'Best: {plot_best_reward:.3f}')
-                plt.title(f"Fast Training Progress ({len(plot_rewards)} prompts)")
+                plt.title(f"{mode_name} Training Progress ({len(plot_rewards)} prompts)")
                 plt.xlabel("Prompt Number")
                 plt.ylabel("Reward")
                 plt.legend()
                 plt.grid(True, alpha=0.3)
                 
                 fmt = train_cfg.get('plots_format', 'png')
-                plot_path = f"results/{train_cfg.get('plots_prefix', 'fast_training')}_rewards.{fmt}"
+                default_prefix = 'fast_training' if fast_mode else 'training'
+                plot_prefix = train_cfg.get('plots_prefix', default_prefix)
+                plot_path = f"results/{plot_prefix}_rewards.{fmt}"
                 os.makedirs(os.path.dirname(plot_path), exist_ok=True)
                 plt.savefig(plot_path, dpi=150, bbox_inches='tight')
                 plt.close()
@@ -215,6 +315,8 @@ if __name__ == "__main__":
     parser.add_argument("--prompts", type=int, help="Number of prompts (overrides config)")
     parser.add_argument("--episodes", type=int, help="Episodes per prompt (overrides config)")
     parser.add_argument("--steps", type=int, help="Steps per episode (overrides config)")
+    parser.add_argument("--fast", action="store_true", help="Use speed-optimized hyperparameters")
+    parser.add_argument("--dataset", type=str, default="advbench", choices=["advbench", "toxicchat"], help="Dataset to use (default: advbench)")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
@@ -228,4 +330,4 @@ if __name__ == "__main__":
     if args.steps:
         cfg['train']['steps_per_episode'] = args.steps
     
-    train_on_dataset_fast(cfg)
+    train_on_dataset(cfg, fast_mode=args.fast, dataset_name=args.dataset)

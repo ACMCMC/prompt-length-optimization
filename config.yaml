@@ -35,15 +35,20 @@ train:
   no_plots: false
   plots_format: pdf                  # png|pdf (default: pdf)
 
+  optimization_mode: discrete
+  gcg_top_k: 16
+  gcg_batch_size: 32
+  gcg_steps: 5
+
 eval:
   # Test dataset parameters
-  max_test_prompts: 20               # Number of test prompts
+  max_test_prompts: 10               # Number of test prompts
   min_prompt_length: 30              # Min test prompt length
   max_prompt_length: 150             # Max test prompt length
   
   # Evaluation parameters
   init_len: 32                       # Initial prompt length
-  max_policy_steps: 30               # Max policy steps per prompt
+  max_policy_steps: 100               # Max policy steps per prompt
   opt_steps: 15                      # Optimization steps (fewer for dataset eval)
   log_every_opt: 999                 # Reduce logging
   
