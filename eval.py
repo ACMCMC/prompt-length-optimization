@@ -181,138 +181,227 @@ def evaluate_on_dataset(cfg, model_path):
     plots_format = eval_cfg.get('plots_format', 'pdf')
     plots_prefix = eval_cfg.get('plots_prefix', 'eval')
     
-    # Evaluate on each test prompt
+    # Evaluate in batches to allow vectorized/batched optimizers
     results = []
-    
-    for i, test_prompt in enumerate(test_prompts):
+    batch_size = eval_cfg.get('batch_size', cfg.get('train', {}).get('batch_size', 8))
+
+    def _extract_final_likelihood(trace_obj, idx_in_batch=0):
+        """Robustly extract final likelihood for a single example from various trace shapes.
+
+        Handles:
+        - trace = [] -> 0.0
+        - trace = list(dicts) where dict has key 'likelihood' (single-example traces)
+        - trace = list(dicts) where dict has key 'likelihoods' (list per-batch)
+        - trace = list(dicts) where dict has key 'best_likelihoods' (discrete batched)
+        """
+        if not trace_obj:
+            return 0.0
+        # If trace_obj is a dict (single aggregated trace), try common keys
+        if isinstance(trace_obj, dict):
+            if 'likelihood' in trace_obj:
+                return float(trace_obj.get('likelihood', 0.0))
+            if 'likelihoods' in trace_obj and isinstance(trace_obj['likelihoods'], (list, tuple)):
+                vals = trace_obj['likelihoods']
+                return float(vals[idx_in_batch]) if idx_in_batch < len(vals) else 0.0
+            if 'best_likelihoods' in trace_obj and isinstance(trace_obj['best_likelihoods'], (list, tuple)):
+                vals = trace_obj['best_likelihoods']
+                return float(vals[idx_in_batch]) if idx_in_batch < len(vals) else 0.0
+
+        # If trace_obj is a list of steps/episodes
+        if isinstance(trace_obj, (list, tuple)) and len(trace_obj) > 0:
+            last = trace_obj[-1]
+            if isinstance(last, dict):
+                if 'likelihood' in last:
+                    return float(last.get('likelihood', 0.0))
+                if 'likelihoods' in last and isinstance(last['likelihoods'], (list, tuple)):
+                    vals = last['likelihoods']
+                    return float(vals[idx_in_batch]) if idx_in_batch < len(vals) else 0.0
+                if 'best_likelihoods' in last and isinstance(last['best_likelihoods'], (list, tuple)):
+                    vals = last['best_likelihoods']
+                    return float(vals[idx_in_batch]) if idx_in_batch < len(vals) else 0.0
+
+        # fallback
+        return 0.0
+
+    for batch_start in range(0, len(test_prompts), batch_size):
+        batch_end = min(batch_start + batch_size, len(test_prompts))
+        batch = test_prompts[batch_start:batch_end]
         print(f"\n{'='*60}")
-        print(f"Evaluating {i+1}/{len(test_prompts)}")
-        print(f"Test prompt: '{test_prompt[:100]}{'...' if len(test_prompt) > 100 else ''}'")
+        print(f"Evaluating prompts {batch_start+1}-{batch_end} (batch size={len(batch)})")
         print(f"{'='*60}")
-        
+
+        # Prepare inputs
+        targets = []
+        bases = []
+        raw_inputs = []
+        for tp in batch:
+            if isinstance(tp, dict):
+                bases.append(tp.get('base', ''))
+                targets.append(tp.get('target', ''))
+                raw_inputs.append(tp)
+            else:
+                bases.append('')
+                targets.append(tp)
+                raw_inputs.append(tp)
+
         try:
-            # Evaluate using the optimizer directly
-            if isinstance(test_prompt, dict):
-                base_text = test_prompt.get('base', '')
-                target_text = test_prompt.get('target', '')
-                best_prompt, best_reward, trace = optimizer.optimize_prompt(
-                    target_completion=target_text,
+            if optimization_mode.lower() == 'continuous':
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                    target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
                     initial_prompt_length=init_len,
                     lr_embeddings=0.01,
-                    lr_policy=0.0003,
                     alpha=alpha,
                     beta=beta,
-                    log_every=0,
-                    optimization_mode=optimization_mode,
+                    base_prompts=bases,
+                    inner_steps=5
+                )
+            elif optimization_mode.lower() == 'discrete':
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_discrete(
+                    target_completions=targets,
+                    episodes=1,
+                    steps_per_episode=max_policy_steps,
+                    initial_prompt_length=init_len,
                     gcg_top_k=gcg_top_k,
                     gcg_batch_size=gcg_batch_size,
                     gcg_steps=gcg_steps,
-                    base_prompt=base_text
-                )
-                # final likelihood is log P(target | final prompt)
-                final_likelihood = trace[-1]['likelihood'] if trace else 0.0
-                # compute avg per-token likelihood for the completion
-                completion_tokens = agent.tokenizer.encode(target_text, add_special_tokens=False)
-                avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1)
-                final_reward = alpha * final_likelihood - beta * len(best_prompt)
-                input_prompt_text = base_text
-                target_completion_text = target_text
-            else:
-                # legacy behavior: test_prompt is a raw prompt string
-                best_prompt, best_reward, trace = optimizer.optimize_prompt(
-                    test_prompt,
-                    episodes=1,  # Single episode for evaluation
-                    steps_per_episode=max_policy_steps,
-                    initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
-                    lr_policy=0.0003,
                     alpha=alpha,
                     beta=beta,
-                    log_every=0,  # No logging during evaluation
-                    optimization_mode=optimization_mode,
-                    gcg_top_k=gcg_top_k,
-                    gcg_batch_size=gcg_batch_size,
-                    gcg_steps=gcg_steps
+                    base_prompts=bases
                 )
-                final_likelihood = trace[-1]['likelihood'] if trace else 0.0
-                final_reward = alpha * final_likelihood - beta * len(best_prompt)
-                avg_likelihood = float('nan')
-                input_prompt_text = test_prompt
-                target_completion_text = ""
-
-            # Build decoded optimized prompt and suffix for reporting
-            try:
-                optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
-            except Exception:
-                optimized_full_text = str(best_prompt)
-
-            # Attempt to get suffix by removing base prefix
-            optimized_suffix_text = ''
-            try:
-                if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
-                    base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
-                    if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
-                        suffix_ids = best_prompt[len(base_ids):]
-                        optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+            else:
+                # fallback: run sequentially
+                best_prompts_batch = []
+                best_rewards_batch = []
+                traces_batch = []
+                for tp in raw_inputs:
+                    if isinstance(tp, dict):
+                        base_text = tp.get('base', '')
+                        target_text = tp.get('target', '')
+                        best_prompt, best_reward, trace = optimizer.optimize_prompt(
+                            target_completion=target_text,
+                            episodes=1,
+                            steps_per_episode=max_policy_steps,
+                            initial_prompt_length=init_len,
+                            lr_embeddings=0.01,
+                            lr_policy=0.0003,
+                            alpha=alpha,
+                            beta=beta,
+                            log_every=0,
+                            optimization_mode=optimization_mode,
+                            gcg_top_k=gcg_top_k,
+                            gcg_batch_size=gcg_batch_size,
+                            gcg_steps=gcg_steps,
+                            base_prompt=base_text
+                        )
                     else:
-                        optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
-                else:
-                    optimized_suffix_text = optimized_full_text
-            except Exception:
-                optimized_suffix_text = optimized_full_text
+                        best_prompt, best_reward, trace = optimizer.optimize_prompt(
+                            tp,
+                            episodes=1,
+                            steps_per_episode=max_policy_steps,
+                            initial_prompt_length=init_len,
+                            lr_embeddings=0.01,
+                            lr_policy=0.0003,
+                            alpha=alpha,
+                            beta=beta,
+                            log_every=0,
+                            optimization_mode=optimization_mode,
+                            gcg_top_k=gcg_top_k,
+                            gcg_batch_size=gcg_batch_size,
+                            gcg_steps=gcg_steps
+                        )
+                    best_prompts_batch.append(best_prompt)
+                    best_rewards_batch.append(best_reward)
+                    traces_batch.append(trace)
 
-            # Store results
-            result_row = {
-                'prompt_id': i,
-                'prompt_text': input_prompt_text,
-                'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
-                'initial_tokens': init_len,
-                'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
-                'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
-                'final_likelihood': float(final_likelihood),
-                'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
-                'final_reward': float(final_reward),
-                'target_completion': target_completion_text,
-                'optimized_full_prompt': optimized_full_text,
-                'optimized_suffix': optimized_suffix_text,
-                'compressed_prompt': str(best_prompt)
-            }
-            results.append(result_row)
+            # Unpack batch results
+            for idx_in_batch, best_prompt in enumerate(best_prompts_batch):
+                global_idx = batch_start + idx_in_batch
+                best_reward = best_rewards_batch[idx_in_batch]
+                trace = traces_batch[idx_in_batch] if traces_batch is not None and idx_in_batch < len(traces_batch) else []
 
-            print(f"Result: {init_len}→{result_row['final_tokens']} tokens ({result_row['compression_ratio']:.1f}% compression)")
-            print(f"Likelihood: {final_likelihood:.3f}, Avg token likelihood: {result_row['avg_likelihood'] if not np.isnan(result_row['avg_likelihood']) else 'N/A'}, Reward: {final_reward:.3f}")
+                # Determine texts
+                input_prompt_text = bases[idx_in_batch] if bases[idx_in_batch] else (raw_inputs[idx_in_batch] if isinstance(raw_inputs[idx_in_batch], str) else '')
+                target_completion_text = targets[idx_in_batch]
 
-            # Generate per-prompt plot if enabled
-            if save_plots and trace:
+                final_likelihood = _extract_final_likelihood(trace, idx_in_batch)
+                completion_tokens = agent.tokenizer.encode(target_completion_text, add_special_tokens=False)
+                avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1) if completion_tokens else float('nan')
+                final_reward = alpha * final_likelihood - beta * (len(best_prompt) if isinstance(best_prompt, list) else 0)
+
                 try:
-                    plot_path = plot_eval_trace(
-                        trace,
-                        out_dir="results/traces",
-                        prefix=f"{plots_prefix}_prompt_{i:03d}",
-                        alpha=alpha,
-                        beta=beta
-                    )
-                    print(f"  Plot saved: {plot_path}")
-                except Exception as plot_err:
-                    print(f"  Warning: Could not generate plot: {plot_err}")
-            
+                    optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
+                except Exception:
+                    optimized_full_text = str(best_prompt)
+
+                optimized_suffix_text = ''
+                try:
+                    if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
+                        base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
+                        if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
+                            suffix_ids = best_prompt[len(base_ids):]
+                            optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+                        else:
+                            optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
+                    else:
+                        optimized_suffix_text = optimized_full_text
+                except Exception:
+                    optimized_suffix_text = optimized_full_text
+
+                result_row = {
+                    'prompt_id': global_idx,
+                    'prompt_text': input_prompt_text,
+                    'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
+                    'initial_tokens': init_len,
+                    'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
+                    'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
+                    'final_likelihood': float(final_likelihood),
+                    'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
+                    'final_reward': float(final_reward),
+                    'target_completion': target_completion_text,
+                    'optimized_full_prompt': optimized_full_text,
+                    'optimized_suffix': optimized_suffix_text,
+                    'compressed_prompt': str(best_prompt)
+                }
+                results.append(result_row)
+
+                print(f"Result: {init_len}→{result_row['final_tokens']} tokens ({result_row['compression_ratio']:.1f}% compression)")
+                print(f"Likelihood: {final_likelihood:.3f}, Avg token likelihood: {result_row['avg_likelihood'] if not np.isnan(result_row['avg_likelihood']) else 'N/A'}, Reward: {final_reward:.3f}")
+
+                if save_plots and trace:
+                    try:
+                        plot_path = plot_eval_trace(
+                            trace,
+                            out_dir="results/traces",
+                            prefix=f"{plots_prefix}_prompt_{global_idx:03d}",
+                            alpha=alpha,
+                            beta=beta
+                        )
+                        print(f"  Plot saved: {plot_path}")
+                    except Exception as plot_err:
+                        print(f"  Warning: Could not generate plot: {plot_err}")
+
         except Exception as e:
-            print(f"Error evaluating prompt {i+1}: {e}")
-            # Add error result
-            results.append({
-                'prompt_id': i,
-                'prompt_text': test_prompt,
-                'prompt_length_chars': len(test_prompt),
-                'initial_tokens': init_len,
-                'final_tokens': init_len,
-                'compression_ratio': 0.0,
-                'final_likelihood': float('nan'),
-                'final_reward': float('nan'),
-                'compressed_prompt': 'ERROR',
-                'error': str(e)
-            })
+            import traceback
+            print(f"Error evaluating prompts {batch_start+1}-{batch_end}: {repr(e)}")
+            traceback.print_exc()
+            # add error rows for each prompt in the batch
+            for j in range(len(batch)):
+                idx = batch_start + j
+                tp = batch[j]
+                results.append({
+                    'prompt_id': idx,
+                    'prompt_text': tp if isinstance(tp, str) else tp.get('base', ''),
+                    'prompt_length_chars': len(tp) if isinstance(tp, str) else len(tp.get('base', '')),
+                    'initial_tokens': init_len,
+                    'final_tokens': init_len,
+                    'compression_ratio': 0.0,
+                    'final_likelihood': float('nan'),
+                    'final_reward': float('nan'),
+                    'compressed_prompt': 'ERROR',
+                    'error': str(e)
+                })
             continue
     
     # Save results to CSV

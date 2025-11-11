@@ -8,6 +8,8 @@ import os
 import yaml
 import random
 import time
+import csv
+from datetime import datetime
 from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
 from dataset_utils import ToxicChatDatasetManager
 import numpy as np
@@ -33,7 +35,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     gcg_steps = train_cfg.get('gcg_steps', 5)
     save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
 
-    batch_size = train_cfg.get('batch_size', 8)
+    # Default to a larger prompt-batch to better utilize a single GPU
+    batch_size = train_cfg.get('batch_size', 16)
 
     max_prompts = train_cfg.get('max_prompts', 50)
     min_prompt_length = train_cfg.get('min_prompt_length', 30)
@@ -55,6 +58,17 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
+
+    # Force single GPU (cuda:0) if available and enable cuDNN autotuner for throughput
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.set_device(0)
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
 
     mode_name = "Fast" if fast_mode else "Standard"
     print(f"{mode_name} training with {max_prompts} prompts")
@@ -121,6 +135,61 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     # Initialize agent and optimizer
     agent = PromptRLAgent(model_name=model_name)
     optimizer = LengthPolicyOptimizer(agent)
+    # Prepare metrics output
+    metrics_dir = "results"
+    os.makedirs(metrics_dir, exist_ok=True)
+    metrics_path = os.path.join(metrics_dir, "training_metrics.csv")
+    # write header if file doesn't exist
+    if not os.path.exists(metrics_path):
+        with open(metrics_path, 'w', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                'timestamp', 'batch_idx', 'global_prompt_idx', 'local_prompt_idx',
+                'episode_count', 'final_likelihood', 'best_likelihood', 'best_episode', 'best_reward', 'base_text'
+            ])
+
+    # Shared helper to extract per-prompt final and best likelihood from batched traces
+    def _extract_metrics_from_traces(traces_list, idx):
+        final_ll = None
+        best_ll = float('-inf')
+        best_ep = None
+        best_reward_val = None
+        # iterate through trace entries in order
+        for t in traces_list:
+            ll_val = None
+            if isinstance(t, dict):
+                if 'likelihoods' in t and isinstance(t['likelihoods'], (list, tuple)):
+                    try:
+                        ll_val = float(t['likelihoods'][idx])
+                    except Exception:
+                        ll_val = None
+                elif 'best_likelihoods' in t and isinstance(t['best_likelihoods'], (list, tuple)):
+                    try:
+                        ll_val = float(t['best_likelihoods'][idx])
+                    except Exception:
+                        ll_val = None
+                elif 'likelihood' in t and (not isinstance(t['likelihood'], (list, tuple))):
+                    try:
+                        ll_val = float(t['likelihood'])
+                    except Exception:
+                        ll_val = None
+            if ll_val is not None:
+                # update final and best
+                final_ll = ll_val
+                if ll_val > best_ll:
+                    best_ll = ll_val
+                    best_ep = t.get('episode', t.get('step', None)) if isinstance(t, dict) else None
+                    best_reward_val = None
+                    if isinstance(t, dict) and 'best_rewards' in t and isinstance(t['best_rewards'], (list, tuple)):
+                        try:
+                            best_reward_val = float(t['best_rewards'][idx])
+                        except Exception:
+                            best_reward_val = None
+        if final_ll is None:
+            final_ll = 0.0
+        if best_ll == float('-inf'):
+            best_ll = final_ll
+        return float(final_ll), float(best_ll), best_ep, best_reward_val
     
     # Track training progress across all prompts
     all_rewards = []
@@ -140,70 +209,251 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         batch_start_time = time.time()
         
         for prompt_idx, prompt_record in enumerate(batch_prompts):
-            global_idx = batch_start + prompt_idx
+            # We'll handle the entire batch at once if continuous mode is selected
+            pass
 
+        # If continuous optimization is selected, run a batched optimizer over the whole batch
+        if optimization_mode.lower() == 'continuous':
+            targets = [p.get('target', '') for p in batch_prompts]
+            bases = [p.get('base', None) for p in batch_prompts]
+            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
+                target_completions=targets,
+                episodes=episodes_per_prompt,
+                steps_per_episode=steps_per_episode,
+                initial_prompt_length=init_len,
+                lr_embeddings=lr_embeddings,
+                alpha=alpha,
+                beta=beta,
+                base_prompts=bases,
+                inner_steps=5
+            )
+
+            # unpack and report per-prompt
+            # --- batch-level trace logging ---
             try:
-                base_text = prompt_record.get('base', '')
-                target_text = prompt_record.get('target', '')
+                if traces:
+                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    # If many trace entries, show head/tail to avoid huge logs
+                    show_all = len(traces) <= 50
+                    entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
+                    for t in entries_to_show:
+                        if 'likelihoods' in t:
+                            ll = t['likelihoods']
+                            print(f"  Ep {t.get('episode', '?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                        elif 'best_likelihoods' in t:
+                            bl = t['best_likelihoods']
+                            print(f"  Ep {t.get('episode', '?')} step {t.get('step', '?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                        else:
+                            # generic trace dump
+                            print(f"  trace entry: {t}")
+                    if not show_all:
+                        print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
+            except Exception as _:
+                print("  (could not pretty-print traces)")
+            
 
-                # Train on this specific prompt with reduced parameters; pass target and base explicitly
-                best_prompt_result, best_reward, history = optimizer.optimize_prompt(
-                    target_completion=target_text,
-                    episodes=episodes_per_prompt,
-                    steps_per_episode=steps_per_episode,
-                    initial_prompt_length=init_len,
-                    lr_embeddings=lr_embeddings,
-                    lr_policy=lr_policy,
-                    alpha=alpha,
-                    beta=beta,
-                    log_every=0,  # Disable detailed logging for speed
-                    optimization_mode=optimization_mode,
-                    gcg_top_k=gcg_top_k,
-                    gcg_batch_size=gcg_batch_size,
-                    gcg_steps=gcg_steps,
-                    base_prompt=base_text
-                )
-
+            for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
+                global_idx = batch_start + prompt_idx
                 all_rewards.append(float(best_reward))
-
                 if best_reward > best_overall_reward:
-                    best_overall_reward = float(best_reward)  # Ensure it's a Python float
+                    best_overall_reward = float(best_reward)
                     best_prompt = best_prompt_result
-                    best_prompt_text = base_text
+                    best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
-                # Print input, optimized suffix/full prompt, and target completion for transparency
                 try:
                     optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
                 except Exception:
                     optimized_text = str(best_prompt_result)
 
-                # Determine optimized suffix by removing base token ids if possible
-                optimized_suffix_text = ''
-                try:
-                    if isinstance(best_prompt_result, list) and base_text:
-                        base_ids = agent.tokenizer.encode(base_text, add_special_tokens=False)
-                        if len(best_prompt_result) >= len(base_ids) and best_prompt_result[:len(base_ids)] == base_ids:
-                            suffix_ids = best_prompt_result[len(base_ids):]
-                            optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
-                        else:
-                            optimized_suffix_text = optimized_text.replace(base_text, '', 1).strip()
-                    else:
-                        optimized_suffix_text = optimized_text
-                except Exception:
-                    optimized_suffix_text = optimized_text
+                optimized_suffix_text = optimized_text
 
-                print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                # Extract final and best likelihoods from traces for this prompt
+                try:
+                    final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
+                except Exception:
+                    final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+
+                # Print per-prompt episode metrics
+                print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+
+                # Append to CSV for later reference
+                try:
+                    with open(metrics_path, 'a', newline='') as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow([
+                            datetime.utcnow().isoformat(),
+                            batch_start // batch_size,
+                            global_idx,
+                            prompt_idx,
+                            len(traces),
+                            final_ll,
+                            best_ll,
+                            best_ep,
+                            best_reward_val if best_reward_val is not None else best_reward,
+                            batch_prompts[prompt_idx].get('base', '')[:200]
+                        ])
+                except Exception as _:
+                    print("Warning: failed to write training metrics to CSV")
+                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
                 print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
                 print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
-                print(f"Target completion: {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
+                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
-                # Quick progress update
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                     print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+        elif optimization_mode.lower() == 'discrete':
+            # Use the batched discrete (GCG) optimizer for this whole batch
+            print(f"Running batched discrete optimizer on batch size={len(batch_prompts)} (gcg_top_k={gcg_top_k}, gcg_batch_size={gcg_batch_size})")
+            targets = [p.get('target', '') for p in batch_prompts]
+            bases = [p.get('base', None) for p in batch_prompts]
+            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch_discrete(
+                target_completions=targets,
+                episodes=episodes_per_prompt,
+                steps_per_episode=steps_per_episode,
+                initial_prompt_length=init_len,
+                gcg_top_k=gcg_top_k,
+                gcg_batch_size=gcg_batch_size,
+                gcg_steps=gcg_steps,
+                alpha=alpha,
+                beta=beta,
+                base_prompts=bases
+            )
 
-            except Exception as e:
-                print(f"  Error on prompt {global_idx+1}: {e}")
-                continue
+            for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
+                global_idx = batch_start + prompt_idx
+                all_rewards.append(float(best_reward))
+                if best_reward > best_overall_reward:
+                    best_overall_reward = float(best_reward)
+                    best_prompt = best_prompt_result
+                    best_prompt_text = batch_prompts[prompt_idx].get('base', '')
+
+                try:
+                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
+                except Exception:
+                    optimized_text = str(best_prompt_result)
+
+                optimized_suffix_text = optimized_text
+                # Extract final and best likelihoods from traces for this prompt (discrete)
+                try:
+                    final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
+                except Exception:
+                    final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+
+                print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+
+                # Append to CSV for later reference
+                try:
+                    with open(metrics_path, 'a', newline='') as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow([
+                            datetime.utcnow().isoformat(),
+                            batch_start // batch_size,
+                            global_idx,
+                            prompt_idx,
+                            len(traces),
+                            final_ll,
+                            best_ll,
+                            best_ep,
+                            best_reward_val if best_reward_val is not None else best_reward,
+                            batch_prompts[prompt_idx].get('base', '')[:200]
+                        ])
+                except Exception:
+                    print("Warning: failed to write training metrics to CSV")
+
+                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+
+                if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
+                    print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+            # --- batch-level trace logging for discrete optimizer ---
+            try:
+                if traces:
+                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    show_all = len(traces) <= 50
+                    entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
+                    for t in entries_to_show:
+                        if 'best_likelihoods' in t:
+                            bl = t['best_likelihoods']
+                            print(f"  Ep {t.get('episode','?')} step {t.get('step','?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                        elif 'likelihoods' in t:
+                            ll = t['likelihoods']
+                            print(f"  Ep {t.get('episode','?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                        else:
+                            print(f"  trace entry: {t}")
+                    if not show_all:
+                        print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
+            except Exception:
+                print("  (could not pretty-print discrete traces)")
+
+        else:
+            # Fallback to per-prompt sequential processing for other/unknown modes
+            for prompt_idx, prompt_record in enumerate(batch_prompts):
+                global_idx = batch_start + prompt_idx
+
+                try:
+                    base_text = prompt_record.get('base', '')
+                    target_text = prompt_record.get('target', '')
+
+                    # Train on this specific prompt with reduced parameters; pass target and base explicitly
+                    best_prompt_result, best_reward, history = optimizer.optimize_prompt(
+                        target_completion=target_text,
+                        episodes=episodes_per_prompt,
+                        steps_per_episode=steps_per_episode,
+                        initial_prompt_length=init_len,
+                        lr_embeddings=lr_embeddings,
+                        lr_policy=lr_policy,
+                        alpha=alpha,
+                        beta=beta,
+                        log_every=0,  # Disable detailed logging for speed
+                        optimization_mode=optimization_mode,
+                        gcg_top_k=gcg_top_k,
+                        gcg_batch_size=gcg_batch_size,
+                        gcg_steps=gcg_steps,
+                        base_prompt=base_text
+                    )
+
+                    all_rewards.append(float(best_reward))
+
+                    if best_reward > best_overall_reward:
+                        best_overall_reward = float(best_reward)  # Ensure it's a Python float
+                        best_prompt = best_prompt_result
+                        best_prompt_text = base_text
+
+                    # Print input, optimized suffix/full prompt, and target completion for transparency
+                    try:
+                        optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
+                    except Exception:
+                        optimized_text = str(best_prompt_result)
+
+                    # Determine optimized suffix by removing base token ids if possible
+                    optimized_suffix_text = ''
+                    try:
+                        if isinstance(best_prompt_result, list) and base_text:
+                            base_ids = agent.tokenizer.encode(base_text, add_special_tokens=False)
+                            if len(best_prompt_result) >= len(base_ids) and best_prompt_result[:len(base_ids)] == base_ids:
+                                suffix_ids = best_prompt_result[len(base_ids):]
+                                optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
+                            else:
+                                optimized_suffix_text = optimized_text.replace(base_text, '', 1).strip()
+                        else:
+                            optimized_suffix_text = optimized_text
+                    except Exception:
+                        optimized_suffix_text = optimized_text
+
+                    print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                    print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                    print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                    print(f"Target completion: {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
+
+                    # Quick progress update
+                    if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
+                        print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+
+                except Exception as e:
+                    print(f"  Error on prompt {global_idx+1}: {e}")
+                    continue
         
         batch_time = time.time() - batch_start_time
         avg_time_per_prompt = batch_time / len(batch_prompts)
