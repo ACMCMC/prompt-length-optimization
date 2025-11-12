@@ -153,7 +153,15 @@ class LengthPolicyOptimizer:
                        initial_prompt_length=32, lr_embeddings=0.01, lr_policy=3e-4,
                        alpha=1.0, beta=0.1, log_every=10, optimization_mode: str = "continuous",
                        gcg_top_k: int = 16, gcg_batch_size: int = 32, gcg_steps: int = 5,
-                       base_prompt: Optional[str] = None) -> Tuple[List[int], float, List[float]]:
+                       base_prompt: Optional[str] = None,
+                       # PPO params (if enabled)
+                       use_ppo: bool = True,
+                       ppo_epochs: int = 4,
+                       ppo_clip: float = 0.2,
+                       gamma: float = 0.99,
+                       gae_lambda: float = 0.95,
+                       value_coef: float = 0.5,
+                       entropy_coef: float = 0.01) -> Tuple[List[int], float, List[float]]:
         """Train the length-adjustment policy while optimizing the prompt.
 
         When ``optimization_mode`` is ``"continuous"`` (default) the prompt is optimized in
@@ -456,35 +464,91 @@ class LengthPolicyOptimizer:
             returns = torch.tensor(returns, device=self.agent.device)
             returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
-            # Compute value estimates and advantages (actor-critic style)
-            policy_loss = torch.tensor(0.0, device=self.agent.device)
-            value_loss = torch.tensor(0.0, device=self.agent.device)
+            # Compute value estimates and advantages (either PPO with GAE or vanilla actor-critic)
+            device = self.agent.device
 
             if len(episode_states) > 0:
                 states_batch = torch.stack(episode_states)  # [T, state_dim]
-                values = self.value_net(states_batch).squeeze()  # [T]
-                # Ensure same device
-                returns = returns.to(values.device)
-                advantages = returns - values.detach()
+                T = states_batch.shape[0]
 
-                # Policy loss with baseline (advantage)
-                for log_prob, adv in zip(episode_log_probs, advantages):
-                    policy_loss = policy_loss - log_prob * adv
+                # values from critic (no grad needed for computing advantages)
+                with torch.no_grad():
+                    values = self.value_net(states_batch).squeeze()  # [T]
 
-                # Value loss (MSE)
-                value_loss = F.mse_loss(values, returns)
+                # Convert rewards to tensor on same device
+                rewards_tensor = torch.tensor(episode_rewards, dtype=torch.float32, device=device)
+
+                if use_ppo:
+                    # GAE advantage estimation
+                    advantages = torch.zeros(T, dtype=torch.float32, device=device)
+                    last_gae = 0.0
+                    # bootstrap with 0 for episode end
+                    for t in reversed(range(T)):
+                        if t == T - 1:
+                            next_value = 0.0
+                        else:
+                            next_value = float(values[t + 1].item())
+                        delta = float(rewards_tensor[t].item()) + gamma * next_value - float(values[t].item())
+                        last_gae = delta + gamma * gae_lambda * last_gae
+                        advantages[t] = last_gae
+
+                    returns_tensor = advantages + values.detach()
+                    # normalize advantages
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                    # old log probs and actions
+                    old_log_probs = torch.stack(episode_log_probs).detach().to(device)
+                    actions_tensor = torch.tensor(episode_actions, dtype=torch.long, device=device)
+
+                    # PPO epochs (simple full-batch updates)
+                    for _ in range(max(1, ppo_epochs)):
+                        policy_logits = self.policy_net(states_batch)
+                        policy_probs = F.softmax(policy_logits, dim=-1)
+                        policy_dist = torch.distributions.Categorical(policy_probs)
+                        new_log_probs = policy_dist.log_prob(actions_tensor)
+                        entropy = policy_dist.entropy().mean()
+
+                        ratios = torch.exp(new_log_probs - old_log_probs)
+                        surr1 = ratios * advantages
+                        surr2 = torch.clamp(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip) * advantages
+                        policy_loss = -torch.mean(torch.min(surr1, surr2))
+
+                        # value loss
+                        value_preds = self.value_net(states_batch).squeeze()
+                        value_loss = F.mse_loss(value_preds, returns_tensor)
+
+                        total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+                        self.policy_optimizer.zero_grad()
+                        self.value_optimizer.zero_grad()
+                        total_loss.backward()
+                        self.policy_optimizer.step()
+                        self.value_optimizer.step()
+                else:
+                    # Vanilla actor-critic (REINFORCE-with-baseline)
+                    returns = returns.to(values.device)
+                    advantages = returns - values.detach()
+
+                    policy_loss = torch.tensor(0.0, device=device)
+                    for log_prob, adv in zip(episode_log_probs, advantages):
+                        policy_loss = policy_loss - log_prob * adv
+
+                    value_loss = F.mse_loss(values, returns)
+
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    total_loss = policy_loss + 0.5 * value_loss
+                    total_loss.backward()
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
             else:
                 # fallback to REINFORCE if no stored states
+                policy_loss = torch.tensor(0.0, device=device)
                 for log_prob, ret in zip(episode_log_probs, returns):
                     policy_loss = policy_loss - log_prob * ret
-
-            # Update both policy and value networks
-            self.policy_optimizer.zero_grad()
-            self.value_optimizer.zero_grad()
-            total_loss = policy_loss + 0.5 * value_loss
-            total_loss.backward()
-            self.policy_optimizer.step()
-            self.value_optimizer.step()
+                self.policy_optimizer.zero_grad()
+                policy_loss.backward()
+                self.policy_optimizer.step()
 
             if log_every > 0 and episode % log_every == 0:
                 recent_lengths = self.length_history[-steps_per_episode:]
