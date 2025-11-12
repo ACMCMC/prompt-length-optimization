@@ -176,6 +176,12 @@ class LengthPolicyOptimizer:
                 f"Unsupported optimization_mode='{optimization_mode}'. Use 'continuous' or 'discrete'."
             )
         use_continuous = mode == "continuous"
+        # Update policy/value learning rates if caller overrides them
+        if lr_policy is not None:
+            for pg in self.policy_optimizer.param_groups:
+                pg['lr'] = lr_policy
+            for pg in self.value_optimizer.param_groups:
+                pg['lr'] = lr_policy
 
         completion_tokens = self.agent.tokenizer.encode(target_completion, add_special_tokens=False)
 
@@ -605,20 +611,32 @@ class LengthPolicyOptimizer:
 
         return best_prompt, float(best_overall_reward), self.trace
 
-    def _optimize_continuous_prompt(self, completion_tokens: List[int], steps: int = 5) -> List[float]:
-        """Run gradient steps on the continuous prompt embeddings and collect likelihoods."""
+    def _optimize_continuous_prompt(
+        self,
+        completion_tokens: List[int],
+        steps: int = 5,
+        prompt_embeddings: Optional[torch.Tensor] = None,
+        prompt_optimizer: Optional[optim.Optimizer] = None,
+        base_embeds: Optional[torch.Tensor] = None
+    ) -> List[float]:
+        """Run gradient steps on continuous prompt embeddings and collect likelihoods."""
+        target_embeddings = prompt_embeddings if prompt_embeddings is not None else self.prompt_embeddings
+        target_optimizer = prompt_optimizer if prompt_optimizer is not None else self.prompt_optimizer
+        base_prefix = base_embeds if base_embeds is not None else getattr(self, 'current_base_embeds', None)
+        if target_embeddings is None or target_optimizer is None:
+            return []
         likelihoods: List[float] = []
         for _ in range(max(1, steps)):
-            self.prompt_optimizer.zero_grad()
+            target_optimizer.zero_grad()
             # include base embeddings (if any) when calculating likelihood
-            if getattr(self, 'current_base_embeds', None) is not None:
-                combined = torch.cat([self.current_base_embeds, self.prompt_embeddings], dim=0)
+            if base_prefix is not None and base_prefix.numel() > 0:
+                combined = torch.cat([base_prefix, target_embeddings], dim=0)
             else:
-                combined = self.prompt_embeddings
+                combined = target_embeddings
             likelihood = self._get_likelihood_from_embeddings(combined, completion_tokens)
             likelihoods.append(float(likelihood))
             (-likelihood).backward()
-            self.prompt_optimizer.step()
+            target_optimizer.step()
         return likelihoods
 
     def _run_gcg_updates(self, prompt_tokens: List[int], completion_tokens: List[int], *, steps: int,
@@ -634,8 +652,11 @@ class LengthPolicyOptimizer:
     def _compute_importance_stats(self, *, use_continuous: bool, completion_tokens: List[int],
                                    prompt_embeddings: Optional[torch.Tensor] = None,
                                    prompt_tokens: Optional[List[int]] = None,
-                                   tail_k: int = 3) -> Dict[str, float]:
+                                   tail_k: int = 3,
+                                   base_embeds: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """Estimate token importance via gradient norms and return summary statistics."""
+        if base_embeds is None:
+            base_embeds = getattr(self, 'current_base_embeds', None)
         if use_continuous:
             if prompt_embeddings is None or prompt_embeddings.shape[0] == 0:
                 return {
@@ -647,8 +668,8 @@ class LengthPolicyOptimizer:
                 }
             temp_embeds = prompt_embeddings.detach().clone().requires_grad_(True)
             # prepend base embeds if present so the gradient reflects base+suffix
-            if getattr(self, 'current_base_embeds', None) is not None:
-                combined = torch.cat([self.current_base_embeds, temp_embeds], dim=0)
+            if base_embeds is not None and base_embeds.numel() > 0:
+                combined = torch.cat([base_embeds, temp_embeds], dim=0)
             else:
                 combined = temp_embeds
             self.agent.model.zero_grad(set_to_none=True)
@@ -670,10 +691,9 @@ class LengthPolicyOptimizer:
             completion_tensor = torch.tensor(completion_tokens, dtype=torch.long, device=self.agent.device)
             completion_embeds = embedding_layer(completion_tensor)
             # include base embeds if present
-            if getattr(self, 'current_base_embeds', None) is not None:
-                base = self.current_base_embeds
-                full_embeds = torch.cat([base, prompt_embeds, completion_embeds], dim=0).unsqueeze(0)
-                prompt_len = base.shape[0] + prompt_embeds.shape[0]
+            if base_embeds is not None and base_embeds.numel() > 0:
+                full_embeds = torch.cat([base_embeds, prompt_embeds, completion_embeds], dim=0).unsqueeze(0)
+                prompt_len = base_embeds.shape[0] + prompt_embeds.shape[0]
             else:
                 full_embeds = torch.cat([prompt_embeds, completion_embeds], dim=0).unsqueeze(0)
                 prompt_len = prompt_embeds.shape[0]
@@ -1253,6 +1273,321 @@ class LengthPolicyOptimizer:
                 })
 
         return best_prompts, best_rewards, traces
+
+    def optimize_prompts_batch_ppo(
+        self,
+        target_completions: List[str],
+        episodes: int = 3,
+        steps_per_episode: int = 50,
+        initial_prompt_length: int = 32,
+        lr_embeddings: float = 0.01,
+        lr_policy: float = 3e-4,
+        alpha: float = 1.0,
+        beta: float = 0.1,
+        base_prompts: Optional[List[str]] = None,
+        optimization_mode: str = "continuous",
+        inner_steps: int = 5,
+        use_ppo: bool = True,
+        ppo_epochs: int = 4,
+        ppo_clip: float = 0.2,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        value_coef: float = 0.5,
+        entropy_coef: float = 0.01
+    ) -> Tuple[List[List[int]], List[float], List[dict]]:
+        """Run PPO training over a batch of prompts in parallel.
+
+        Currently only the continuous (embedding) inner optimizer is supported.
+        """
+        mode = optimization_mode.lower()
+        if mode != "continuous":
+            raise NotImplementedError("optimize_prompts_batch_ppo currently supports continuous mode only.")
+        if lr_policy is not None:
+            for pg in self.policy_optimizer.param_groups:
+                pg['lr'] = lr_policy
+            for pg in self.value_optimizer.param_groups:
+                pg['lr'] = lr_policy
+
+        device = self.agent.device
+        B = len(target_completions)
+        if B == 0:
+            return [], [], []
+
+        embedding_layer = self.agent.model.get_input_embeddings()
+
+        completion_tokens_list = [
+            self.agent.tokenizer.encode(t, add_special_tokens=False) for t in target_completions
+        ]
+
+        if base_prompts is None:
+            base_prompts = [None] * B
+
+        base_tokens_list: List[List[int]] = []
+        base_embeds_list: List[Optional[torch.Tensor]] = []
+        for bp in base_prompts:
+            if bp:
+                btoks = self.agent.tokenizer.encode(bp, add_special_tokens=False)
+                base_tokens_list.append(btoks)
+                bt = torch.tensor(btoks, dtype=torch.long, device=device)
+                base_embeds_list.append(embedding_layer(bt).detach())
+            else:
+                base_tokens_list.append([])
+                base_embeds_list.append(None)
+
+        best_prompts: List[Optional[List[int]]] = [None] * B
+        best_rewards: List[float] = [float('-inf')] * B
+        traces: List[dict] = []
+        global_step = 0
+
+        for episode in range(episodes):
+            # Initialize suffix parameters for each example
+            prompt_params: List[nn.Parameter] = []
+            prompt_opts: List[optim.Optimizer] = []
+            lengths = []
+            for _ in range(B):
+                param = nn.Parameter(
+                    torch.randn(initial_prompt_length, self.emb_dim, device=device) * 0.1
+                )
+                prompt_params.append(param)
+                prompt_opts.append(optim.Adam([param], lr=lr_embeddings))
+                lengths.append(initial_prompt_length)
+
+            recent_likelihoods = [deque(maxlen=10) for _ in range(B)]
+            episode_states: List[torch.Tensor] = []
+            episode_actions: List[torch.Tensor] = []
+            episode_log_probs: List[torch.Tensor] = []
+            episode_rewards: List[torch.Tensor] = []
+
+            for step in range(steps_per_episode):
+                state_vectors: List[torch.Tensor] = []
+                current_likelihoods: List[float] = []
+                improvement_rates: List[float] = []
+                steps_since_improv_list: List[int] = []
+                importance_cache: List[Dict[str, float]] = []
+
+                for i in range(B):
+                    ll_trace = self._optimize_continuous_prompt(
+                        completion_tokens_list[i],
+                        steps=max(1, inner_steps),
+                        prompt_embeddings=prompt_params[i],
+                        prompt_optimizer=prompt_opts[i],
+                        base_embeds=base_embeds_list[i]
+                    )
+                    if ll_trace:
+                        current_ll = float(ll_trace[-1])
+                    else:
+                        combined = prompt_params[i].detach()
+                        if base_embeds_list[i] is not None and base_embeds_list[i].numel() > 0:
+                            combined = torch.cat([base_embeds_list[i], combined], dim=0)
+                        current_ll = float(self._get_likelihood_from_embeddings(combined, completion_tokens_list[i]))
+
+                    recent_likelihoods[i].append(current_ll)
+                    current_likelihoods.append(current_ll)
+
+                    if len(recent_likelihoods[i]) >= 3:
+                        improvement_rates.append(float(recent_likelihoods[i][-1] - recent_likelihoods[i][0]))
+                    else:
+                        improvement_rates.append(0.0)
+
+                    improvement_threshold = 0.1
+                    steps_since = 0
+                    for past_ll in reversed(list(recent_likelihoods[i])):
+                        if current_ll - past_ll > improvement_threshold:
+                            break
+                        steps_since += 1
+                    steps_since_improv_list.append(steps_since)
+
+                    importance_stats = self._compute_importance_stats(
+                        use_continuous=True,
+                        completion_tokens=completion_tokens_list[i],
+                        prompt_embeddings=prompt_params[i],
+                        base_embeds=base_embeds_list[i]
+                    )
+                    importance_cache.append(importance_stats)
+
+                    state_vector = torch.tensor(
+                        [
+                            lengths[i],
+                            current_ll,
+                            step / max(1, steps_per_episode),
+                            improvement_rates[-1],
+                            steps_since,
+                            importance_stats['min_score'],
+                            importance_stats['mean_score'],
+                            importance_stats['max_score'],
+                            importance_stats['weakest_pos_norm'],
+                            importance_stats['tail_avg_score']
+                        ],
+                        dtype=torch.float32,
+                        device=device
+                    )
+                    state_vectors.append(state_vector)
+
+                states_batch = torch.stack(state_vectors)  # [B, state_dim]
+                episode_states.append(states_batch)
+
+                policy_logits = self.policy_net(states_batch)
+                policy_probs = F.softmax(policy_logits, dim=-1)
+                policy_dist = torch.distributions.Categorical(policy_probs)
+                actions = policy_dist.sample()
+                log_probs = policy_dist.log_prob(actions)
+
+                episode_actions.append(actions)
+                episode_log_probs.append(log_probs)
+
+                batch_rewards = torch.zeros(B, dtype=torch.float32, device=device)
+
+                final_ll_snapshot: List[float] = []
+                for i in range(B):
+                    action_val = int(actions[i].item())
+                    new_length = lengths[i]
+
+                    if action_val == 0 and lengths[i] > 1:
+                        updated = prompt_params[i].detach()[:-1].clone()
+                        prompt_params[i] = nn.Parameter(updated.requires_grad_(True))
+                        prompt_opts[i] = optim.Adam([prompt_params[i]], lr=lr_embeddings)
+                        new_length = lengths[i] - 1
+                    elif action_val == 2:
+                        current_embeds = prompt_params[i].detach()
+                        if base_embeds_list[i] is not None and base_embeds_list[i].numel() > 0:
+                            combined_base = torch.cat([base_embeds_list[i], current_embeds], dim=0)
+                        else:
+                            combined_base = current_embeds
+                        new_token_embed = self._initialize_continuous_append(
+                            base_embeds=combined_base,
+                            completion_tokens=completion_tokens_list[i]
+                        )
+                        append_embed = new_token_embed.unsqueeze(0)
+                        updated = torch.cat([current_embeds, append_embed], dim=0)
+                        prompt_params[i] = nn.Parameter(updated.clone().detach().requires_grad_(True))
+                        prompt_opts[i] = optim.Adam([prompt_params[i]], lr=lr_embeddings)
+                        new_length = lengths[i] + 1
+
+                    lengths[i] = new_length
+
+                    if base_embeds_list[i] is not None and base_embeds_list[i].numel() > 0:
+                        combined = torch.cat([base_embeds_list[i], prompt_params[i].detach()], dim=0)
+                    else:
+                        combined = prompt_params[i].detach()
+                    final_ll = float(self._get_likelihood_from_embeddings(combined, completion_tokens_list[i]))
+                    final_ll_snapshot.append(final_ll)
+
+                    base_reward = alpha * final_ll - beta * lengths[i]
+                    discovery_bonus = 0.0
+                    if action_val == 0:
+                        discovery_bonus += 0.1
+                    if lengths[i] < initial_prompt_length and final_ll > -1.0:
+                        discovery_bonus += (initial_prompt_length - lengths[i]) * 0.05
+
+                    total_reward = base_reward + discovery_bonus
+                    batch_rewards[i] = total_reward
+
+                    if total_reward > best_rewards[i]:
+                        best_rewards[i] = float(total_reward)
+                        suffix_tokens = self._embeddings_to_tokens(prompt_params[i].detach())
+                        base_ids = base_tokens_list[i]
+                        best_prompts[i] = (base_ids + suffix_tokens) if base_ids else suffix_tokens
+
+                episode_rewards.append(batch_rewards)
+                traces.append({
+                    'episode': episode,
+                    'step': step,
+                    'likelihoods': [float(v) for v in final_ll_snapshot],
+                    'lengths': [int(L) for L in lengths],
+                    'actions': [int(a.item()) for a in actions],
+                    'rewards': [float(r) for r in batch_rewards.tolist()],
+                    'best_rewards': best_rewards.copy(),
+                    'global_step': global_step
+                })
+                global_step += 1
+
+            # After collecting trajectories for the batch, run PPO (or vanilla) updates
+            states_tensor = torch.stack(episode_states)  # [T, B, state_dim]
+            actions_tensor = torch.stack(episode_actions)  # [T, B]
+            log_probs_tensor = torch.stack(episode_log_probs)  # [T, B]
+            rewards_tensor = torch.stack(episode_rewards)  # [T, B]
+            T = states_tensor.shape[0]
+
+            states_flat = states_tensor.view(T * B, self.state_dim)
+            values_flat = self.value_net(states_flat).squeeze()
+            values_tensor = values_flat.view(T, B)
+
+            device = self.agent.device
+
+            if use_ppo:
+                advantages = torch.zeros_like(rewards_tensor, device=device)
+                last_gae = torch.zeros(B, dtype=torch.float32, device=device)
+                next_value = torch.zeros(B, dtype=torch.float32, device=device)
+                for t in reversed(range(T)):
+                    delta = rewards_tensor[t] + gamma * next_value - values_tensor[t]
+                    last_gae = delta + gamma * gae_lambda * last_gae
+                    advantages[t] = last_gae
+                    next_value = values_tensor[t]
+
+                returns_tensor = advantages + values_tensor
+                advantages_flat = advantages.view(-1)
+                returns_flat = returns_tensor.view(-1)
+                advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8)
+
+                old_log_probs_flat = log_probs_tensor.view(-1).detach()
+                actions_flat = actions_tensor.view(-1)
+
+                for _ in range(max(1, ppo_epochs)):
+                    policy_logits = self.policy_net(states_flat)
+                    policy_probs = F.softmax(policy_logits, dim=-1)
+                    policy_dist = torch.distributions.Categorical(policy_probs)
+                    new_log_probs = policy_dist.log_prob(actions_flat)
+                    entropy = policy_dist.entropy().mean()
+
+                    ratios = torch.exp(new_log_probs - old_log_probs_flat)
+                    surr1 = ratios * advantages_flat
+                    surr2 = torch.clamp(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip) * advantages_flat
+                    policy_loss = -torch.mean(torch.min(surr1, surr2))
+
+                    value_preds = self.value_net(states_flat).squeeze()
+                    value_loss = F.mse_loss(value_preds, returns_flat)
+
+                    total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    total_loss.backward()
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
+            else:
+                returns_tensor = torch.zeros_like(rewards_tensor, device=device)
+                next_return = torch.zeros(B, dtype=torch.float32, device=device)
+                for t in reversed(range(T)):
+                    next_return = rewards_tensor[t] + gamma * next_return
+                    returns_tensor[t] = next_return
+                returns_flat = returns_tensor.view(-1)
+                values_detached = values_flat.detach()
+                advantages = returns_flat - values_detached
+
+                policy_loss = -(log_probs_tensor.view(-1) * advantages.detach()).mean()
+                value_loss = F.mse_loss(values_flat, returns_flat)
+
+                self.policy_optimizer.zero_grad()
+                self.value_optimizer.zero_grad()
+                total_loss = policy_loss + value_coef * value_loss
+                total_loss.backward()
+                self.policy_optimizer.step()
+                self.value_optimizer.step()
+
+        self.trace = traces
+        final_prompts: List[List[int]] = []
+        for idx in range(B):
+            if best_prompts[idx] is not None:
+                final_prompts.append(best_prompts[idx])  # already includes base tokens
+            else:
+                if 'prompt_params' in locals() and idx < len(prompt_params):
+                    suffix_tokens = self._embeddings_to_tokens(prompt_params[idx].detach())
+                else:
+                    suffix_tokens = []
+                base_ids = base_tokens_list[idx]
+                combined_tokens = (base_ids + suffix_tokens) if base_ids else suffix_tokens
+                final_prompts.append(combined_tokens)
+
+        return final_prompts, best_rewards, traces
 
 # Main function removed - use train.py and eval.py instead
 

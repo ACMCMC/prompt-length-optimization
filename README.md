@@ -100,6 +100,8 @@ Edit `config.yaml` to adjust:### 1. RL-Based Prompt Length Optimization
 
 - **Reward**: Balances likelihood preservation (α) with length reduction (β)
 
+- **Policy modes**: Set `train.optimization_mode: ppo_parallel` to enable the batched PPO policy updates described in this repo. Tune the `train.ppo.*` hyperparameters (clip, epochs, γ, λ, etc.) to control policy stability when running parallel batches.
+
 ## Quick Examples
 
 - **Actions**: REMOVE (compress), KEEP (optimize), RETRACT (undo compression)**RL Formulation**:

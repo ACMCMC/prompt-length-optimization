@@ -39,6 +39,14 @@ train:
   gcg_top_k: 32
   gcg_batch_size: 64
   gcg_steps: 10
+  # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
+  ppo:
+    epochs: 4
+    clip: 0.2
+    gamma: 0.99
+    gae_lambda: 0.95
+    value_coef: 0.5
+    entropy_coef: 0.01
 
 eval:
   # Test dataset parameters

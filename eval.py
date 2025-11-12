@@ -38,23 +38,41 @@ def evaluate_prompt(cfg, agent, optimizer):
     gcg_top_k = eval_cfg.get('gcg_top_k', cfg.get('train', {}).get('gcg_top_k', 16))
     gcg_batch_size = eval_cfg.get('gcg_batch_size', cfg.get('train', {}).get('gcg_batch_size', 32))
     gcg_steps = eval_cfg.get('gcg_steps', cfg.get('train', {}).get('gcg_steps', 5))
-    
-    # Use optimize_prompt with minimal steps for evaluation
-    best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
-        test_prompt,
-        episodes=1,  # Single episode for evaluation
-        steps_per_episode=max_policy_steps,
-        initial_prompt_length=init_len,
-        lr_embeddings=0.01,
-        lr_policy=0.0003,
-        alpha=cfg.get('train', {}).get('alpha', 1.0),
-        beta=cfg.get('train', {}).get('beta', 0.1),
-        log_every=0,  # No logging during evaluation
-        optimization_mode=optimization_mode,
-        gcg_top_k=gcg_top_k,
-        gcg_batch_size=gcg_batch_size,
-        gcg_steps=gcg_steps
-    )
+    opt_mode = optimization_mode.lower()
+    if 'ppo' in opt_mode:
+        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch_ppo(
+            target_completions=[test_prompt],
+            episodes=1,
+            steps_per_episode=max_policy_steps,
+            initial_prompt_length=init_len,
+            lr_embeddings=0.01,
+            lr_policy=0.0003,
+            alpha=cfg.get('train', {}).get('alpha', 1.0),
+            beta=cfg.get('train', {}).get('beta', 0.1),
+            base_prompts=[None],
+            optimization_mode='continuous',
+            inner_steps=5
+        )
+        best_prompt = best_prompts_batch[0] if best_prompts_batch else []
+        completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
+        best_likelihood = agent.get_completion_likelihood(best_prompt, completion_tokens) if best_prompt else 0.0
+    else:
+        # Use optimize_prompt with minimal steps for evaluation
+        best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
+            test_prompt,
+            episodes=1,  # Single episode for evaluation
+            steps_per_episode=max_policy_steps,
+            initial_prompt_length=init_len,
+            lr_embeddings=0.01,
+            lr_policy=0.0003,
+            alpha=cfg.get('train', {}).get('alpha', 1.0),
+            beta=cfg.get('train', {}).get('beta', 0.1),
+            log_every=0,  # No logging during evaluation
+            optimization_mode=optimization_mode,
+            gcg_top_k=gcg_top_k,
+            gcg_batch_size=gcg_batch_size,
+            gcg_steps=gcg_steps
+        )
     
     # Calculate reward (negative of the combined loss)
     alpha = cfg.get('train', {}).get('alpha', 1.0)
@@ -244,8 +262,32 @@ def evaluate_on_dataset(cfg, model_path):
                 targets.append(tp)
                 raw_inputs.append(tp)
 
+        opt_mode = optimization_mode.lower()
         try:
-            if optimization_mode.lower() == 'continuous':
+            if 'ppo' in opt_mode:
+                if 'discrete' in opt_mode:
+                    raise NotImplementedError("Parallel PPO evaluation currently supports continuous mode only.")
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_ppo(
+                    target_completions=targets,
+                    episodes=1,
+                    steps_per_episode=max_policy_steps,
+                    initial_prompt_length=init_len,
+                    lr_embeddings=0.01,
+                    lr_policy=0.0003,
+                    alpha=alpha,
+                    beta=beta,
+                    base_prompts=bases,
+                    optimization_mode='continuous',
+                    inner_steps=5,
+                    use_ppo=True,
+                    ppo_epochs=ppo_epochs,
+                    ppo_clip=ppo_clip,
+                    gamma=ppo_gamma,
+                    gae_lambda=ppo_lambda,
+                    value_coef=ppo_value_coef,
+                    entropy_coef=ppo_entropy_coef
+                )
+            elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
                     target_completions=targets,
                     episodes=1,
@@ -257,7 +299,7 @@ def evaluate_on_dataset(cfg, model_path):
                     base_prompts=bases,
                     inner_steps=5
                 )
-            elif optimization_mode.lower() == 'discrete':
+            elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_discrete(
                     target_completions=targets,
                     episodes=1,
@@ -316,15 +358,16 @@ def evaluate_on_dataset(cfg, model_path):
                     traces_batch.append(trace)
 
             # Unpack batch results
+            trace_source = traces_batch if traces_batch is not None else []
             for idx_in_batch, best_prompt in enumerate(best_prompts_batch):
                 global_idx = batch_start + idx_in_batch
                 best_reward = best_rewards_batch[idx_in_batch]
-                trace = traces_batch[idx_in_batch] if traces_batch is not None and idx_in_batch < len(traces_batch) else []
 
                 # Determine texts
                 input_prompt_text = bases[idx_in_batch] if bases[idx_in_batch] else (raw_inputs[idx_in_batch] if isinstance(raw_inputs[idx_in_batch], str) else '')
                 target_completion_text = targets[idx_in_batch]
 
+                trace = trace_source
                 final_likelihood = _extract_final_likelihood(trace, idx_in_batch)
                 completion_tokens = agent.tokenizer.encode(target_completion_text, add_special_tokens=False)
                 avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1) if completion_tokens else float('nan')

@@ -34,6 +34,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     gcg_batch_size = train_cfg.get('gcg_batch_size', 32)
     gcg_steps = train_cfg.get('gcg_steps', 5)
     save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
+    ppo_cfg = train_cfg.get('ppo', {})
+    ppo_epochs = ppo_cfg.get('epochs', 4)
+    ppo_clip = ppo_cfg.get('clip', 0.2)
+    ppo_gamma = ppo_cfg.get('gamma', 0.99)
+    ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
+    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
+    ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
 
     # Default to a larger prompt-batch to better utilize a single GPU
     batch_size = train_cfg.get('batch_size', 16)
@@ -199,6 +206,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     
     start_time = time.time()
     
+    optimization_mode_lower = optimization_mode.lower()
+
     # Process prompts in batches for better progress tracking
     for batch_start in range(0, len(prompts), batch_size):
         batch_end = min(batch_start + batch_size, len(prompts))
@@ -212,8 +221,82 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             # We'll handle the entire batch at once if continuous mode is selected
             pass
 
-        # If continuous optimization is selected, run a batched optimizer over the whole batch
-        if optimization_mode.lower() == 'continuous':
+        # Select optimization pipeline based on config
+        opt_mode = optimization_mode_lower
+        if 'ppo' in opt_mode:
+            if 'discrete' in opt_mode:
+                raise NotImplementedError("Parallel PPO currently supports continuous mode only.")
+            targets = [p.get('target', '') for p in batch_prompts]
+            bases = [p.get('base', None) for p in batch_prompts]
+            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch_ppo(
+                target_completions=targets,
+                episodes=episodes_per_prompt,
+                steps_per_episode=steps_per_episode,
+                initial_prompt_length=init_len,
+                lr_embeddings=lr_embeddings,
+                lr_policy=lr_policy,
+                alpha=alpha,
+                beta=beta,
+                base_prompts=bases,
+                optimization_mode='continuous',
+                inner_steps=5,
+                use_ppo=True,
+                ppo_epochs=ppo_epochs,
+                ppo_clip=ppo_clip,
+                gamma=ppo_gamma,
+                gae_lambda=ppo_lambda,
+                value_coef=ppo_value_coef,
+                entropy_coef=ppo_entropy_coef
+            )
+
+            for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
+                global_idx = batch_start + prompt_idx
+                all_rewards.append(float(best_reward))
+                if best_reward > best_overall_reward:
+                    best_overall_reward = float(best_reward)
+                    best_prompt = best_prompt_result
+                    best_prompt_text = batch_prompts[prompt_idx].get('base', '')
+
+                try:
+                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
+                except Exception:
+                    optimized_text = str(best_prompt_result)
+
+                optimized_suffix_text = optimized_text
+                try:
+                    final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
+                except Exception:
+                    final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+
+                print(f"PPO metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+
+                try:
+                    with open(metrics_path, 'a', newline='') as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow([
+                            datetime.utcnow().isoformat(),
+                            batch_start // batch_size,
+                            global_idx,
+                            prompt_idx,
+                            len(traces),
+                            final_ll,
+                            best_ll,
+                            best_ep,
+                            best_reward_val if best_reward_val is not None else best_reward,
+                            batch_prompts[prompt_idx].get('base', '')[:200]
+                        ])
+                except Exception as _:
+                    print("Warning: failed to write training metrics to CSV")
+
+                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+
+                if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
+                    print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest PPO reward: {best_reward:.3f}")
+
+        elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
             bases = [p.get('base', None) for p in batch_prompts]
             best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
