@@ -26,8 +26,7 @@ train:
   beta: 0.2                          # Length penalty (higher = more compression)
   
   # Parallel processing parameters
-  batch_size: 16                      # Prompts per batch for parallel processing
-  num_workers: 4                     # Number of parallel worker processes
+  batch_size: 64                      # Prompts per batch for progress tracking
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -41,7 +40,7 @@ train:
   gcg_steps: 10
   # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
   ppo:
-    epochs: 4
+    epochs: 1
     clip: 0.2
     gamma: 0.99
     gae_lambda: 0.95
