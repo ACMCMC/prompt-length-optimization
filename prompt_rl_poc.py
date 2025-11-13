@@ -56,35 +56,42 @@ class PromptRLAgent:
         # Vocabulary for random token sampling
         self.vocab_size = len(self.tokenizer)
         
-    def get_completion_likelihood(self, prompt_tokens: List[int], completion_tokens: List[int]) -> float:
+    def get_completion_likelihood(self, prompt_tokens: torch.Tensor, completion_tokens: torch.Tensor) -> float:
         """Calculate log P(completion | prompt)"""
-        if not prompt_tokens:
+        # Convert to tensors if needed
+        if isinstance(prompt_tokens, list):
+            prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.long, device=self.device)
+        if isinstance(completion_tokens, list):
+            completion_tokens = torch.tensor(completion_tokens, dtype=torch.long, device=self.device)
+        
+        if prompt_tokens.numel() == 0:
             # If no prompt, just use BOS token
-            input_ids = [self.tokenizer.bos_token_id] + completion_tokens
+            bos_token = torch.tensor([self.tokenizer.bos_token_id], dtype=torch.long, device=self.device)
+            input_ids = torch.cat([bos_token, completion_tokens])
         else:
-            input_ids = prompt_tokens + completion_tokens
+            input_ids = torch.cat([prompt_tokens, completion_tokens])
             
-        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+        input_tensor = input_ids.unsqueeze(0)
         
         with torch.no_grad():
             outputs = self.model(input_tensor, labels=input_tensor)
             logits = outputs.logits
             
             # Calculate likelihood only for completion tokens
-            prompt_len = len(prompt_tokens) if prompt_tokens else 1  # Account for BOS
+            prompt_len = prompt_tokens.shape[0] if prompt_tokens.numel() > 0 else 1  # Account for BOS
             completion_logits = logits[0, prompt_len-1:-1]  # Shift for next token prediction
-            completion_targets = torch.tensor(completion_tokens, dtype=torch.long, device=self.device)
+            completion_targets = completion_tokens
             
             # Get log probabilities
             log_probs = F.log_softmax(completion_logits, dim=-1)
             token_log_probs = log_probs.gather(1, completion_targets.unsqueeze(1)).squeeze()
             return float(token_log_probs.sum())
     
-    def calculate_reward(self, prompt_tokens: List[int], completion_tokens: List[int], 
+    def calculate_reward(self, prompt_tokens: torch.Tensor, completion_tokens: torch.Tensor, 
                         alpha=1.0, beta=0.1) -> float:
         """Calculate reward: α * log P(completion | prompt) - β * prompt_length"""
         likelihood = self.get_completion_likelihood(prompt_tokens, completion_tokens)
-        length_penalty = len(prompt_tokens)
+        length_penalty = prompt_tokens.shape[0] if isinstance(prompt_tokens, torch.Tensor) else len(prompt_tokens)
         return alpha * likelihood - beta * length_penalty
     
     def get_random_token(self) -> int:
@@ -160,7 +167,7 @@ class LengthPolicyOptimizer:
                        gamma: float = 0.99,
                        gae_lambda: float = 0.95,
                        value_coef: float = 0.5,
-                       entropy_coef: float = 0.01) -> Tuple[List[int], float, List[float]]:
+                       entropy_coef: float = 0.01) -> Tuple[torch.Tensor, float, List[float]]:
         """Train the length-adjustment policy while optimizing the prompt.
 
         When ``optimization_mode`` is ``"continuous"`` (default) the prompt is optimized in
@@ -182,7 +189,8 @@ class LengthPolicyOptimizer:
             for pg in self.value_optimizer.param_groups:
                 pg['lr'] = lr_policy
 
-        completion_tokens = self.agent.tokenizer.encode(target_completion, add_special_tokens=False)
+        completion_tokens_list = self.agent.tokenizer.encode(target_completion, add_special_tokens=False)
+        completion_tokens = torch.tensor(completion_tokens_list, dtype=torch.long, device=self.agent.device)
 
         print(f"Target completion: '{target_completion}'")
         print(f"Training policy for {episodes} episodes, {steps_per_episode} steps each")
@@ -192,10 +200,10 @@ class LengthPolicyOptimizer:
         print("-" * 60)
 
         best_overall_reward = float('-inf')
-        best_prompt: Optional[List[int]] = None
+        best_prompt: Optional[torch.Tensor] = None
         best_overall_likelihood = float('-inf')
 
-        last_prompt_tokens: Optional[List[int]] = None
+        last_prompt_tokens: Optional[torch.Tensor] = None
         last_prompt_embeds: Optional[torch.Tensor] = None
 
         self.trace = []
@@ -211,7 +219,7 @@ class LengthPolicyOptimizer:
                 self.prompt_optimizer = optim.Adam([self.prompt_embeddings], lr=lr_embeddings)
             else:
                 # suffix tokens only
-                prompt_tokens = [self.agent.get_random_token() for _ in range(current_length)]
+                prompt_tokens = torch.tensor([self.agent.get_random_token() for _ in range(current_length)], dtype=torch.long, device=self.agent.device)
             episode_rewards = torch.tensor([], dtype=torch.float32, device=self.agent.device)
             episode_log_probs = []
             episode_actions = torch.tensor([], dtype=torch.long, device=self.agent.device)
@@ -219,7 +227,7 @@ class LengthPolicyOptimizer:
             likelihood_history = deque(maxlen=10)
             initial_likelihood: Optional[float] = None
             final_likelihood_last: Optional[float] = None
-            best_episode_prompt_tokens: Optional[List[int]] = None
+            best_episode_prompt_tokens: Optional[torch.Tensor] = None
             best_episode_likelihood = float('-inf')
 
             step_bar = trange(
@@ -316,7 +324,7 @@ class LengthPolicyOptimizer:
                         )
                         self.prompt_optimizer = optim.Adam([self.prompt_embeddings], lr=lr_embeddings)
                     else:
-                        prompt_tokens.pop()
+                        prompt_tokens = prompt_tokens[:-1]
                     new_length = current_length - 1
                 elif action_val == 2:
                     if use_continuous:
@@ -338,7 +346,7 @@ class LengthPolicyOptimizer:
                             completion_tokens=completion_tokens,
                             top_k=gcg_top_k
                         )
-                        prompt_tokens.append(int(new_token))
+                        prompt_tokens = torch.cat([prompt_tokens, torch.tensor([new_token], dtype=torch.long, device=self.agent.device)])
                     new_length = current_length + 1
 
                 current_length = new_length
@@ -353,9 +361,9 @@ class LengthPolicyOptimizer:
                 if final_likelihood_last > best_episode_likelihood:
                     best_episode_likelihood = final_likelihood_last
                     if use_continuous:
-                        best_episode_prompt_tokens = self._embeddings_to_tokens(self.prompt_embeddings.detach()) if getattr(self, 'prompt_embeddings', None) is not None else []
+                        best_episode_prompt_tokens = self._embeddings_to_tokens(self.prompt_embeddings.detach()) if getattr(self, 'prompt_embeddings', None) is not None else torch.tensor([], dtype=torch.long, device=self.agent.device)
                     else:
-                        best_episode_prompt_tokens = prompt_tokens.copy()
+                        best_episode_prompt_tokens = prompt_tokens.clone()
 
                 base_reward = alpha * final_likelihood - beta * current_length
                 # print("final likelihood:", final_likelihood)
@@ -380,7 +388,7 @@ class LengthPolicyOptimizer:
                     if use_continuous:
                         best_prompt = self._embeddings_to_tokens(self.prompt_embeddings.detach())
                     else:
-                        best_prompt = prompt_tokens.copy()
+                        best_prompt = prompt_tokens.clone()
 
                 self.likelihood_history = torch.cat([self.likelihood_history, torch.tensor([current_likelihood], dtype=torch.float32, device=self.agent.device)])
                 self.length_history = torch.cat([self.length_history, torch.tensor([current_length], dtype=torch.long, device=self.agent.device)])
@@ -421,7 +429,7 @@ class LengthPolicyOptimizer:
             if use_continuous:
                 last_prompt_embeds = self.prompt_embeddings.detach().clone()
             else:
-                last_prompt_tokens = prompt_tokens.copy()
+                last_prompt_tokens = prompt_tokens.clone()
 
             episode_return = float(episode_rewards.sum().item())
             # Compute returns using tensor operations
@@ -530,13 +538,14 @@ class LengthPolicyOptimizer:
             # Ensure we define `episode_tokens` regardless of logging frequency so the
             # later summary printing does not reference an uninitialized variable.
             if use_continuous:
-                episode_suffix_tokens = self._embeddings_to_tokens(self.prompt_embeddings.detach()) if getattr(self, 'prompt_embeddings', None) is not None else []
+                episode_suffix_tokens = self._embeddings_to_tokens(self.prompt_embeddings.detach()) if getattr(self, 'prompt_embeddings', None) is not None else torch.tensor([], dtype=torch.long, device=self.agent.device)
             else:
                 # prompt_tokens should exist for discrete mode, but guard defensively
-                episode_suffix_tokens = prompt_tokens.copy() if 'prompt_tokens' in locals() and prompt_tokens is not None else []
+                episode_suffix_tokens = prompt_tokens.clone() if 'prompt_tokens' in locals() and prompt_tokens is not None else torch.tensor([], dtype=torch.long, device=self.agent.device)
 
             episode_tokens = episode_suffix_tokens
-            episode_text = self.agent.tokenizer.decode(episode_tokens, skip_special_tokens=True) if episode_tokens else ""
+            episode_tokens_list = episode_tokens.tolist() if isinstance(episode_tokens, torch.Tensor) else episode_tokens
+            episode_text = self.agent.tokenizer.decode(episode_tokens_list, skip_special_tokens=True) if len(episode_tokens_list) > 0 else ""
             print(f"Episode {episode}: final prompt text=\"{episode_text}\"")
             final_ll = final_likelihood_last if final_likelihood_last is not None else 0.0
             final_avg = final_ll / max(len(episode_tokens), 1)
@@ -565,13 +574,13 @@ class LengthPolicyOptimizer:
             elif not use_continuous and last_prompt_tokens is not None:
                 best_prompt = last_prompt_tokens
             else:
-                best_prompt = []
+                best_prompt = torch.tensor([], dtype=torch.long, device=self.agent.device)
 
         return best_prompt, float(best_overall_reward), self.trace
 
     def _optimize_continuous_prompt(
         self,
-        completion_tokens: List[int],
+        completion_tokens: torch.Tensor,
         steps: int = 5,
         prompt_embeddings: Optional[torch.Tensor] = None,
         prompt_optimizer: Optional[optim.Optimizer] = None
@@ -590,8 +599,8 @@ class LengthPolicyOptimizer:
             target_optimizer.step()
         return likelihoods
 
-    def _run_gcg_updates(self, prompt_tokens: List[int], completion_tokens: List[int], *, steps: int,
-                          top_k: int, batch_size: int) -> Tuple[List[int], torch.Tensor]:
+    def _run_gcg_updates(self, prompt_tokens: torch.Tensor, completion_tokens: torch.Tensor, *, steps: int,
+                          top_k: int, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply multiple GCG steps in token space and return updated tokens and likelihood trace."""
         updated_tokens = prompt_tokens
         likelihoods = torch.tensor([], dtype=torch.float32, device=self.agent.device)
@@ -600,9 +609,9 @@ class LengthPolicyOptimizer:
             likelihoods = torch.cat([likelihoods, torch.tensor([likelihood], dtype=torch.float32, device=self.agent.device)])
         return updated_tokens, likelihoods
 
-    def _compute_importance_stats(self, *, use_continuous: bool, completion_tokens: List[int],
+    def _compute_importance_stats(self, *, use_continuous: bool, completion_tokens: torch.Tensor,
                                    prompt_embeddings: Optional[torch.Tensor] = None,
-                                   prompt_tokens: Optional[List[int]] = None,
+                                   prompt_tokens: Optional[torch.Tensor] = None,
                                    tail_k: int = 3) -> Dict[str, float]:
         """Estimate token importance via gradient norms and return summary statistics."""
         if use_continuous:
@@ -630,9 +639,9 @@ class LengthPolicyOptimizer:
                     'tail_avg_score': 0.0
                 }
             embedding_layer = self.agent.model.get_input_embeddings()
-            prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=self.agent.device)
+            prompt_tensor = prompt_tokens if isinstance(prompt_tokens, torch.Tensor) else torch.tensor(prompt_tokens, dtype=torch.long, device=self.agent.device)
             prompt_embeds = embedding_layer(prompt_tensor).detach().requires_grad_(True)
-            completion_tensor = torch.tensor(completion_tokens, dtype=torch.long, device=self.agent.device)
+            completion_tensor = completion_tokens if isinstance(completion_tokens, torch.Tensor) else torch.tensor(completion_tokens, dtype=torch.long, device=self.agent.device)
             completion_embeds = embedding_layer(completion_tensor)
             full_embeds = torch.cat([prompt_embeds, completion_embeds], dim=0).unsqueeze(0)
             prompt_len = prompt_embeds.shape[0]
@@ -679,7 +688,7 @@ class LengthPolicyOptimizer:
         }
 
     def _initialize_continuous_append(self, *, base_embeds: Optional[torch.Tensor],
-                                       completion_tokens: List[int], ascent_steps: int = 6,
+                                       completion_tokens: torch.Tensor, ascent_steps: int = 6,
                                        step_size: float = 0.05) -> torch.Tensor:
         """Craft an appended embedding by following the gradient of the likelihood objective."""
         device = self.agent.device
@@ -706,7 +715,7 @@ class LengthPolicyOptimizer:
         self.agent.model.zero_grad(set_to_none=True)
         return candidate.detach()
 
-    def _select_append_token(self, *, prompt_tokens: List[int], completion_tokens: List[int],
+    def _select_append_token(self, *, prompt_tokens: torch.Tensor, completion_tokens: torch.Tensor,
                               top_k: int) -> int:
         """Select a new token to append using the gradient signal of an inserted slot."""
         device = self.agent.device
@@ -752,19 +761,19 @@ class LengthPolicyOptimizer:
 
         return random.choice(candidates)
 
-    def _gcg_step(self, prompt_tokens: List[int], completion_tokens: List[int], *, top_k: int, batch_size: int) -> Tuple[List[int], float]:
+    def _gcg_step(self, prompt_tokens: torch.Tensor, completion_tokens: torch.Tensor, *, top_k: int, batch_size: int) -> Tuple[torch.Tensor, float]:
         """Perform one Greedy Coordinate Gradient update in token space."""
-        if not prompt_tokens:
+        if prompt_tokens.numel() == 0:
             likelihood = self.agent.get_completion_likelihood(prompt_tokens, completion_tokens)
             return prompt_tokens, likelihood
 
         device = self.agent.device
         embedding_layer = self.agent.model.get_input_embeddings()
 
-        prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
+        prompt_tensor = prompt_tokens if isinstance(prompt_tokens, torch.Tensor) else torch.tensor(prompt_tokens, dtype=torch.long, device=device)
         prompt_embeds = embedding_layer(prompt_tensor).detach().requires_grad_(True)
 
-        completion_tensor = torch.tensor(completion_tokens, dtype=torch.long, device=device)
+        completion_tensor = completion_tokens if isinstance(completion_tokens, torch.Tensor) else torch.tensor(completion_tokens, dtype=torch.long, device=device)
         completion_embeds = embedding_layer(completion_tensor)
 
         full_embeds = torch.cat([prompt_embeds, completion_embeds], dim=0).unsqueeze(0)
@@ -798,7 +807,7 @@ class LengthPolicyOptimizer:
             candidate_sets.append(filtered)
 
         base_likelihood = self.agent.get_completion_likelihood(prompt_tokens, completion_tokens)
-        best_tokens = prompt_tokens.copy()
+        best_tokens = prompt_tokens.clone()
         best_likelihood = base_likelihood
 
         # Only consider indices within the suffix (prompt_tokens) when proposing swaps
@@ -811,9 +820,9 @@ class LengthPolicyOptimizer:
             if not candidates:
                 continue
             candidate_token = random.choice(candidates)
-            if candidate_token == prompt_tokens[position]:
+            if candidate_token == int(prompt_tokens[position].item()):
                 continue
-            candidate_prompt = prompt_tokens.copy()
+            candidate_prompt = prompt_tokens.clone()
             candidate_prompt[position] = candidate_token
             likelihood = self.agent.get_completion_likelihood(candidate_prompt, completion_tokens)
             if likelihood > best_likelihood:
@@ -822,10 +831,10 @@ class LengthPolicyOptimizer:
 
         return best_tokens, best_likelihood
 
-    def _get_likelihood_from_embeddings(self, prompt_embeds: torch.Tensor, completion_tokens: List[int]) -> torch.Tensor:
+    def _get_likelihood_from_embeddings(self, prompt_embeds: torch.Tensor, completion_tokens: torch.Tensor) -> torch.Tensor:
         """Calculate log P(completion | continuous prompt embeddings)"""
         # Convert completion tokens to embeddings
-        completion_tensor = torch.tensor(completion_tokens, dtype=torch.long, device=self.agent.device)
+        completion_tensor = completion_tokens if isinstance(completion_tokens, torch.Tensor) else torch.tensor(completion_tokens, dtype=torch.long, device=self.agent.device)
         completion_embeds = self.agent.model.get_input_embeddings()(completion_tensor)
         
         # Concatenate prompt embeddings + completion embeddings
@@ -847,19 +856,19 @@ class LengthPolicyOptimizer:
         
         return target_log_probs.sum()
     
-    def _embeddings_to_tokens(self, embeddings: torch.Tensor) -> List[int]:
+    def _embeddings_to_tokens(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Convert embeddings back to discrete tokens by finding nearest neighbors"""
         # Get all vocabulary embeddings
         vocab_embeds = self.agent.model.get_input_embeddings().weight  # [vocab_size, emb_dim]
         
-        tokens = []
+        tokens_list = []
         for emb in embeddings:
             # Find closest token embedding
             distances = torch.norm(vocab_embeds - emb.unsqueeze(0), dim=1)
             closest_token = int(torch.argmin(distances).item())
-            tokens.append(closest_token)
+            tokens_list.append(closest_token)
         
-        return tokens
+        return torch.tensor(tokens_list, dtype=torch.long, device=embeddings.device)
 
     # ---------------- Batched continuous-mode optimizer ----------------
     def _get_likelihoods_from_embeddings_batch(self, prompt_embeds_batch: torch.Tensor,
@@ -1433,8 +1442,8 @@ class LengthPolicyOptimizer:
                 if 'prompt_params' in locals() and idx < len(prompt_params):
                     suffix_tokens = self._embeddings_to_tokens(prompt_params[idx].detach())
                 else:
-                    suffix_tokens = []
-                final_prompts.append(suffix_tokens)
+                    suffix_tokens = torch.tensor([], dtype=torch.long, device=self.agent.device)
+                final_prompts.append(suffix_tokens.tolist() if isinstance(suffix_tokens, torch.Tensor) else suffix_tokens)
 
         return final_prompts, best_rewards, traces
 

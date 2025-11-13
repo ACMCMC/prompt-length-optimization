@@ -13,4 +13,11 @@ This document is to keep track of things to do.
     - Add token info in your RL Agent (Skip it for now).
     - Which token to remove - first one or last one or one with least attention??
     - Let's use absolute value of likelihood for now : So reward = a*log_likelihood - (1-a)*log(n)
-    
+### Discussion on Nov 11
+    - Tried to implement parallel processing for the prompt optimization, still not there yet.
+### Discussion on Nov 12
+    - Lots of code changes to have + parallel processing.
+    - GCG for optimizing the prompt.
+    - PPO for optimizing the policy.
+    - Next priority: get this to minimize length of the prompt.
+    - Idea: hyperparameter sweep for beta to see if that helps.
