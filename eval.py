@@ -14,14 +14,14 @@ from dataset_utils import ToxicChatDatasetManager
 from plot_utils import plot_eval_trace, save_trace_csv
 import pandas as pd
 
-def load_trained_model(model_path):
+def load_trained_model(model_path, reward_cfg=None):
     """Load a trained policy model from disk."""
     checkpoint = torch.load(model_path, map_location='cpu')
     model_name = checkpoint['model_name']
     
     # Initialize agent and optimizer  
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent)
+    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg)
     
     # Load the trained policy weights
     optimizer.policy_net.load_state_dict(checkpoint['policy_state_dict'])
@@ -77,14 +77,27 @@ def evaluate_prompt(cfg, agent, optimizer):
     # Calculate reward (negative of the combined loss)
     alpha = cfg.get('train', {}).get('alpha', 1.0)
     beta = cfg.get('train', {}).get('beta', 0.1)
-    reward = alpha * best_likelihood - beta * len(best_prompt)
+    completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
+    if isinstance(best_prompt, torch.Tensor):
+        best_prompt_tokens = best_prompt.detach().tolist()
+    elif isinstance(best_prompt, list):
+        best_prompt_tokens = best_prompt
+    else:
+        best_prompt_tokens = []
+    reward, _ = optimizer._compute_total_reward(
+        teacher_ll=best_likelihood,
+        combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
+        completion_tokens=completion_tokens,
+        current_length=len(best_prompt_tokens),
+        alpha=alpha,
+        beta=beta
+    )
     
     # Decode the compressed prompt for display
     try:
-        tokens = agent.tokenizer.encode(test_prompt)[:len(best_prompt)]
-        compressed_prompt = agent.tokenizer.decode(tokens)
-    except:
-        compressed_prompt = str(best_prompt)  # Fallback if decoding fails
+        compressed_prompt = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True) if best_prompt_tokens else ''
+    except Exception:
+        compressed_prompt = str(best_prompt_tokens)  # Fallback if decoding fails
     
     return {
         'length': len(best_prompt),
@@ -181,7 +194,9 @@ def evaluate_on_dataset(cfg, model_path):
         raise ValueError("No test prompts found")
     
     # Load trained model
-    agent, optimizer, checkpoint = load_trained_model(model_path)
+    global_reward_cfg = cfg.get('reward', {})
+    eval_reward_cfg = eval_cfg.get('reward', cfg.get('train', {}).get('reward', global_reward_cfg))
+    agent, optimizer, checkpoint = load_trained_model(model_path, reward_cfg=eval_reward_cfg)
     
     print(f"Loaded model with {len(checkpoint.get('training_rewards', []))} training examples")
     best_reward_val = checkpoint.get('best_reward', None)
@@ -371,19 +386,33 @@ def evaluate_on_dataset(cfg, model_path):
                 final_likelihood = _extract_final_likelihood(trace, idx_in_batch)
                 completion_tokens = agent.tokenizer.encode(target_completion_text, add_special_tokens=False)
                 avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1) if completion_tokens else float('nan')
-                final_reward = alpha * final_likelihood - beta * (len(best_prompt) if isinstance(best_prompt, list) else 0)
+                if isinstance(best_prompt, torch.Tensor):
+                    best_prompt_tokens = best_prompt.detach().tolist()
+                elif isinstance(best_prompt, list):
+                    best_prompt_tokens = best_prompt
+                else:
+                    best_prompt_tokens = []
+                reward_value, _ = optimizer._compute_total_reward(
+                    teacher_ll=final_likelihood,
+                    combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
+                    completion_tokens=completion_tokens,
+                    current_length=len(best_prompt_tokens),
+                    alpha=alpha,
+                    beta=beta
+                )
+                final_reward = float(reward_value)
 
                 try:
-                    optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
+                    optimized_full_text = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True) if best_prompt_tokens else ''
                 except Exception:
-                    optimized_full_text = str(best_prompt)
+                    optimized_full_text = str(best_prompt_tokens)
 
                 optimized_suffix_text = ''
                 try:
-                    if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
+                    if best_prompt_tokens and isinstance(input_prompt_text, str) and input_prompt_text:
                         base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
-                        if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
-                            suffix_ids = best_prompt[len(base_ids):]
+                        if len(best_prompt_tokens) >= len(base_ids) and best_prompt_tokens[:len(base_ids)] == base_ids:
+                            suffix_ids = best_prompt_tokens[len(base_ids):]
                             optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
                         else:
                             optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
@@ -397,8 +426,8 @@ def evaluate_on_dataset(cfg, model_path):
                     'prompt_text': input_prompt_text,
                     'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
                     'initial_tokens': init_len,
-                    'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
-                    'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
+                    'final_tokens': len(best_prompt_tokens),
+                    'compression_ratio': (init_len - len(best_prompt_tokens)) / init_len * 100,
                     'final_likelihood': float(final_likelihood),
                     'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
                     'final_reward': float(final_reward),

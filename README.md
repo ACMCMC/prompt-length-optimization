@@ -91,6 +91,7 @@ Edit `config.yaml` to adjust:### 1. RL-Based Prompt Length Optimization
 - **Training**: Episodes per prompt, steps per episode, learning rates
 
 - **Dataset**: Number of prompts, length filters  - **Dataset**: Uses `lmsys/toxic-chat` model outputs as training data
+- **Reward modes**: Use `train.reward.mode` to choose `teacher_forced`, `generation`, or `hybrid`. Hybrid blends the teacher-forced log-likelihood with a generation-based hit score (substring/prefix/exact/ratio). `train.reward.generation.*` mirrors the `generate` call (temperature, top_p, max_new_tokens, etc.) so you can tune how strict the free-generation check should be.
 
 - **Reward**: α (likelihood weight) and β (compression penalty)
 

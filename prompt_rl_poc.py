@@ -17,6 +17,7 @@ import argparse
 import os
 import csv
 import matplotlib.pyplot as plt
+from difflib import SequenceMatcher
 
 class PromptRLAgent:
     def __init__(self, model_name="EleutherAI/pythia-410m"):
@@ -103,9 +104,10 @@ class PromptRLAgent:
                 return token
 
 class LengthPolicyOptimizer:
-    def __init__(self, agent: PromptRLAgent):
+    def __init__(self, agent: PromptRLAgent, reward_cfg: Optional[Dict] = None):
         self.agent = agent
         self.emb_dim = self.agent.model.get_input_embeddings().weight.shape[1]
+        self.reward_cfg = reward_cfg or {}
         
     # Policy network that decides length changes based on current state
     # Actions: 0=REMOVE, 1=KEEP, 2=ADD (append a data-driven token)
@@ -351,12 +353,19 @@ class LengthPolicyOptimizer:
 
                 current_length = new_length
 
+                base_ids = self.current_base_tokens if getattr(self, 'current_base_tokens', None) is not None else []
                 if use_continuous:
                     with torch.no_grad():
-                        combined_embeds = self.prompt_embeddings.detach()
+                        if getattr(self, 'current_base_embeds', None) is not None and self.current_base_embeds.numel() > 0:
+                            combined_embeds = torch.cat([self.current_base_embeds, self.prompt_embeddings.detach()], dim=0)
+                        else:
+                            combined_embeds = self.prompt_embeddings.detach()
                         final_likelihood = float(self._get_likelihood_from_embeddings(combined_embeds, completion_tokens))
+                    suffix_ids = self._embeddings_to_tokens(self.prompt_embeddings.detach())
                 else:
-                    final_likelihood = self.agent.get_completion_likelihood(prompt_tokens, completion_tokens)
+                    combined_tokens = base_ids + prompt_tokens.detach().tolist()
+                    final_likelihood = self.agent.get_completion_likelihood(combined_tokens, completion_tokens_list)
+                    suffix_ids = prompt_tokens.detach().tolist()
                 final_likelihood_last = float(final_likelihood)
                 if final_likelihood_last > best_episode_likelihood:
                     best_episode_likelihood = final_likelihood_last
@@ -365,7 +374,16 @@ class LengthPolicyOptimizer:
                     else:
                         best_episode_prompt_tokens = prompt_tokens.clone()
 
-                base_reward = alpha * final_likelihood - beta * current_length
+                base_ids = self.current_base_tokens if getattr(self, 'current_base_tokens', None) is not None else []
+                combined_token_ids = base_ids + suffix_ids
+                reward_value, _ = self._compute_total_reward(
+                    teacher_ll=final_likelihood,
+                    combined_tokens=combined_token_ids,
+                    completion_tokens=completion_tokens_list,
+                    current_length=current_length,
+                    alpha=alpha,
+                    beta=beta
+                )
                 # print("final likelihood:", final_likelihood)
                 # print("current length:", current_length)
                 # print("base reward:", base_reward)
@@ -376,7 +394,7 @@ class LengthPolicyOptimizer:
                 if current_length < initial_prompt_length and final_likelihood > -1.0:
                     discovery_bonus += (initial_prompt_length - current_length) * 0.05
 
-                reward = base_reward + discovery_bonus
+                reward = reward_value + discovery_bonus
 
                 episode_rewards = torch.cat([episode_rewards, torch.tensor([reward], dtype=torch.float32, device=self.agent.device)])
                 episode_log_probs.append(log_prob)
@@ -608,6 +626,109 @@ class LengthPolicyOptimizer:
             updated_tokens, likelihood = self._gcg_step(updated_tokens, completion_tokens, top_k=top_k, batch_size=batch_size)
             likelihoods = torch.cat([likelihoods, torch.tensor([likelihood], dtype=torch.float32, device=self.agent.device)])
         return updated_tokens, likelihoods
+    
+    # ----- Reward helpers -----
+    def _reward_mode(self) -> str:
+        mode = self.reward_cfg.get('mode', 'teacher_forced')
+        return str(mode).lower()
+
+    def _uses_teacher_reward(self) -> bool:
+        return self._reward_mode() in {'teacher_forced', 'hybrid'}
+
+    def _uses_generation_reward(self) -> bool:
+        return self._reward_mode() in {'generation', 'hybrid'}
+
+    def _tokens_to_text(self, tokens: List[int]) -> str:
+        if not tokens:
+            return ""
+        try:
+            return self.agent.tokenizer.decode(tokens, skip_special_tokens=True)
+        except Exception:
+            return ""
+
+    def _generate_free_response(self, full_prompt_tokens: List[int], generation_cfg: Dict) -> str:
+        if not full_prompt_tokens:
+            return ""
+        max_new_tokens = generation_cfg.get('max_new_tokens', 64)
+        temperature = generation_cfg.get('temperature', 0.8)
+        top_p = generation_cfg.get('top_p', 0.9)
+        top_k = generation_cfg.get('top_k', 0)
+        num_beams = generation_cfg.get('num_beams', 1)
+        repetition_penalty = generation_cfg.get('repetition_penalty', 1.0)
+        do_sample = generation_cfg.get('do_sample', num_beams == 1)
+
+        input_ids = torch.tensor([full_prompt_tokens], dtype=torch.long, device=self.agent.device)
+        with torch.no_grad():
+            output_ids = self.agent.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                num_beams=num_beams,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+                pad_token_id=self.agent.tokenizer.pad_token_id,
+                eos_token_id=self.agent.tokenizer.eos_token_id
+            )
+        gen_ids = output_ids[0, len(full_prompt_tokens):]
+        return self._tokens_to_text(gen_ids.tolist())
+
+    def _match_generation(self, generated: str, target_text: str, match_mode: str) -> float:
+        gen = generated.strip()
+        tgt = target_text.strip()
+        if not tgt:
+            return 0.0
+        mode = match_mode.lower()
+        if mode == 'substring':
+            return 1.0 if tgt in gen else 0.0
+        if mode == 'prefix':
+            return 1.0 if gen.startswith(tgt) else 0.0
+        if mode == 'exact':
+            return 1.0 if gen == tgt else 0.0
+        return float(SequenceMatcher(None, tgt, gen).ratio())
+
+    def _compute_total_reward(
+        self,
+        *,
+        teacher_ll: Optional[float],
+        combined_tokens: Optional[List[int]],
+        completion_tokens: List[int],
+        current_length: int,
+        alpha: float,
+        beta: float
+    ) -> Tuple[float, Dict[str, float]]:
+        """Blend teacher-forced and generation rewards according to config."""
+        details: Dict[str, float] = {}
+        total_reward = 0.0
+        mode = self._reward_mode()
+
+        if self._uses_teacher_reward():
+            if teacher_ll is None:
+                if combined_tokens is None:
+                    raise ValueError("combined_tokens required for teacher-forced reward computation.")
+                teacher_ll = self.agent.get_completion_likelihood(combined_tokens, completion_tokens)
+            teacher_weight = self.reward_cfg.get('teacher_weight', alpha)
+            total_reward += teacher_weight * float(teacher_ll)
+            details['teacher_ll'] = float(teacher_ll)
+
+        if self._uses_generation_reward():
+            if combined_tokens is None:
+                raise ValueError("combined_tokens required for generation-based reward computation.")
+            generation_cfg = self.reward_cfg.get('generation', {})
+            gen_response = self._generate_free_response(combined_tokens, generation_cfg)
+            target_text = self._tokens_to_text(completion_tokens)
+            match_mode = generation_cfg.get('match_mode', 'substring')
+            match_score = self._match_generation(gen_response, target_text, match_mode)
+            generation_weight = self.reward_cfg.get('generation_weight', 1.0)
+            total_reward += generation_weight * match_score
+            details['generation_match'] = float(match_score)
+
+        length_penalty = beta * current_length
+        total_reward -= length_penalty
+        details['length_penalty'] = float(length_penalty)
+        details['reward'] = float(total_reward)
+        return total_reward, details
 
     def _compute_importance_stats(self, *, use_continuous: bool, completion_tokens: torch.Tensor,
                                    prompt_embeddings: Optional[torch.Tensor] = None,
@@ -987,14 +1108,21 @@ class LengthPolicyOptimizer:
                 likelihoods = self._get_likelihoods_from_embeddings_batch(prompt_embeds, completion_tokens_list)
                 for i in range(B):
                     length = L
-                    reward = alpha * float(likelihoods[i].item()) - beta * length
-                    if reward > best_rewards[i]:
-                        best_rewards[i] = float(reward)
-                        combined = prompt_embeds[i].detach()
-                        try:
-                            best_prompts[i] = self._embeddings_to_tokens(combined)
-                        except Exception:
-                            best_prompts[i] = []
+                    try:
+                        suffix_tokens = self._embeddings_to_tokens(prompt_embeds[i].detach())
+                    except Exception:
+                        suffix_tokens = []
+                    reward_value, _ = self._compute_total_reward(
+                        teacher_ll=float(likelihoods[i].item()),
+                        combined_tokens=suffix_tokens,
+                        completion_tokens=completion_tokens_list[i],
+                        current_length=length,
+                        alpha=alpha,
+                        beta=beta
+                    )
+                    if reward_value > best_rewards[i]:
+                        best_rewards[i] = float(reward_value)
+                        best_prompts[i] = suffix_tokens
 
                 # add a simple trace entry per episode (aggregated)
                 traces.append({
@@ -1034,6 +1162,7 @@ class LengthPolicyOptimizer:
             prompt_tokens_list.append(toks)
 
         best_prompts = [p.copy() for p in prompt_tokens_list]
+        best_rewards = [float('-inf')] * B
         # initial scoring
         with torch.no_grad():
             # build prompt_embeds batch
@@ -1041,7 +1170,16 @@ class LengthPolicyOptimizer:
             prompt_embeds_batch = embedding_layer(prompt_ids)  # [B, L, D]
             likelihoods = self._get_likelihoods_from_embeddings_batch(prompt_embeds_batch, completion_tokens_list)
             best_likelihoods = [float(l.item()) for l in likelihoods]
-            best_rewards = [alpha * bl - beta * L for bl in best_likelihoods]
+            for i, ll in enumerate(best_likelihoods):
+                reward_val, _ = self._compute_total_reward(
+                    teacher_ll=ll,
+                    combined_tokens=prompt_tokens_list[i],
+                    completion_tokens=completion_tokens_list[i],
+                    current_length=L,
+                    alpha=alpha,
+                    beta=beta
+                )
+                best_rewards[i] = float(reward_val)
 
         traces: List[dict] = []
 
@@ -1137,20 +1275,28 @@ class LengthPolicyOptimizer:
                     cand_likelihoods = torch.empty(0, device=device)
 
                 # For each example, find best improving candidate among its block
-                # Map owner -> list of (candidate_idx_in_flat, likelihood)
-                per_owner_best: Dict[int, Tuple[int, float]] = {}
+                # Map owner -> (candidate_idx_in_flat, reward, likelihood)
+                per_owner_best: Dict[int, Tuple[int, float, float]] = {}
                 for idx_cand, owner in enumerate(owner_idx):
                     ll = float(cand_likelihoods[idx_cand].item())
-                    if owner not in per_owner_best or ll > per_owner_best[owner][1]:
-                        per_owner_best[owner] = (idx_cand, ll)
+                    reward_val, _ = self._compute_total_reward(
+                        teacher_ll=ll,
+                        combined_tokens=candidates_flat[idx_cand],
+                        completion_tokens=completion_tokens_list[owner],
+                        current_length=L,
+                        alpha=alpha,
+                        beta=beta
+                    )
+                    if owner not in per_owner_best or reward_val > per_owner_best[owner][1]:
+                        per_owner_best[owner] = (idx_cand, reward_val, ll)
 
                 # Apply improvements
-                for owner, (cand_idx_flat, ll) in per_owner_best.items():
-                    if ll > best_likelihoods[owner]:
-                        # accept candidate
+                for owner, (cand_idx_flat, reward_val, ll) in per_owner_best.items():
+                    if reward_val > best_rewards[owner]:
                         prompt_tokens_list[owner] = candidates_flat[cand_idx_flat]
                         best_likelihoods[owner] = ll
-                        best_rewards[owner] = alpha * ll - beta * L
+                        best_rewards[owner] = float(reward_val)
+                        best_prompts[owner] = candidates_flat[cand_idx_flat].copy()
 
                 traces.append({
                     'episode': ep,
@@ -1317,8 +1463,15 @@ class LengthPolicyOptimizer:
                         new_length = lengths[i] - 1
                     elif action_val == 2:
                         current_embeds = prompt_params[i].detach()
+                        if base_embeds_list[i] is not None and base_embeds_list[i].numel() > 0:
+                            if current_embeds.numel() > 0:
+                                append_base = torch.cat([base_embeds_list[i], current_embeds], dim=0)
+                            else:
+                                append_base = base_embeds_list[i]
+                        else:
+                            append_base = current_embeds if current_embeds.numel() > 0 else None
                         new_token_embed = self._initialize_continuous_append(
-                            base_embeds=current_embeds if current_embeds.numel() > 0 else None,
+                            base_embeds=append_base,
                             completion_tokens=completion_tokens_list[i]
                         )
                         append_embed = new_token_embed.unsqueeze(0)
@@ -1329,24 +1482,35 @@ class LengthPolicyOptimizer:
 
                     lengths[i] = new_length
 
-                    combined = prompt_params[i].detach()
+                    if base_embeds_list[i] is not None and base_embeds_list[i].numel() > 0:
+                        combined = torch.cat([base_embeds_list[i], prompt_params[i].detach()], dim=0)
+                    else:
+                        combined = prompt_params[i].detach()
                     final_ll = float(self._get_likelihood_from_embeddings(combined, completion_tokens_list[i]))
                     final_ll_snapshot = torch.cat([final_ll_snapshot, torch.tensor([final_ll], dtype=torch.float32, device=device)])
 
-                    base_reward = alpha * final_ll - beta * lengths[i]
+                    suffix_tokens = self._embeddings_to_tokens(prompt_params[i].detach())
+                    combined_tokens = base_tokens_list[i] + suffix_tokens if base_tokens_list[i] else suffix_tokens
+                    reward_value, _ = self._compute_total_reward(
+                        teacher_ll=final_ll,
+                        combined_tokens=combined_tokens,
+                        completion_tokens=completion_tokens_list[i],
+                        current_length=lengths[i],
+                        alpha=alpha,
+                        beta=beta
+                    )
                     discovery_bonus = 0.0
                     if action_val == 0:
                         discovery_bonus += 0.1
                     if lengths[i] < initial_prompt_length and final_ll > -1.0:
                         discovery_bonus += (initial_prompt_length - lengths[i]) * 0.05
 
-                    total_reward = base_reward + discovery_bonus
+                    total_reward = reward_value + discovery_bonus
                     batch_rewards[i] = total_reward
 
                     if total_reward > best_rewards[i]:
                         best_rewards[i] = float(total_reward)
-                        suffix_tokens = self._embeddings_to_tokens(prompt_params[i].detach())
-                        best_prompts[i] = suffix_tokens
+                        best_prompts[i] = combined_tokens
 
                 episode_rewards.append(batch_rewards)
                 traces.append({

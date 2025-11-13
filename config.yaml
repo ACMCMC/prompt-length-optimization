@@ -46,6 +46,18 @@ train:
     gae_lambda: 0.95
     value_coef: 0.5
     entropy_coef: 0.01
+  reward:
+    mode: teacher_forced            # teacher_forced | generation | hybrid
+    teacher_weight: 1.0
+    generation_weight: 1.0
+    generation:
+      max_new_tokens: 64
+      temperature: 0.8
+      top_p: 0.9
+      top_k: 0
+      num_beams: 1
+      match_mode: substring         # substring | prefix | exact | ratio
+      do_sample: true
 
 eval:
   # Test dataset parameters
@@ -66,3 +78,15 @@ eval:
   no_plots: false                     # Don't create individual plots
   plots_prefix: eval
   plots_format: pdf                  # png|pdf (for when plots are enabled)
+  reward:
+    mode: teacher_forced
+    teacher_weight: 1.0
+    generation_weight: 1.0
+    generation:
+      max_new_tokens: 64
+      temperature: 0.8
+      top_p: 0.9
+      top_k: 0
+      num_beams: 1
+      match_mode: substring
+      do_sample: true
