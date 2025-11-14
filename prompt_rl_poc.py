@@ -1249,87 +1249,54 @@ class LengthPolicyOptimizer:
 
                 grads = prompt_embeds.grad.detach()  # [B, L, D]
 
-                # Build candidate sets per example per position (top_k)
-                candidate_sets: List[List[List[int]]] = []  # [B][pos] -> list of tokens
-                for i in range(B):
-                    sets_for_example: List[List[int]] = []
-                    for pos in range(L):
-                        grad_i = grads[i, pos]  # [D]
-                        scores = torch.matmul(vocab_embeds, -grad_i)  # [V]
-                        k = min(gcg_top_k, scores.shape[0])
-                        topk_idx = torch.topk(scores, k=k, largest=True).indices
-                        filtered = [int(tok.item()) for tok in topk_idx if int(tok.item()) not in self.agent.special_token_ids]
-                        if not filtered:
-                            filtered = [int(topk_idx[0].item())]
-                        sets_for_example.append(filtered)
-                    candidate_sets.append(sets_for_example)
+                # Vectorized candidate proposal
+                top_k = min(gcg_top_k, vocab_size)
+                grads_flat = (-grads).reshape(B * L, -1)
+                scores = torch.matmul(grads_flat, vocab_embeds.t()).reshape(B, L, vocab_size)
+                if self.agent.special_token_ids:
+                    mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+                    mask[list(self.agent.special_token_ids)] = True
+                    scores[..., mask] = float('-inf')
+                topk_vals, topk_idx = torch.topk(scores, k=top_k, dim=-1)
 
-                # Sample candidate swaps per example and score them in a single batched forward
-                candidates_flat: List[List[int]] = []  # list of prompt token lists
-                owner_idx: List[int] = []  # which example each candidate belongs to
-                for i in range(B):
-                    for _ in range(max(1, gcg_batch_size)):
-                        # choose a random position to modify
-                        pos = random.randrange(0, L)
-                        cands = candidate_sets[i][pos]
-                        if not cands:
-                            continue
-                        cand_token = random.choice(cands)
-                        if cand_token == prompt_tokens_list[i][pos]:
-                            continue
-                        cand_prompt = prompt_tokens_list[i].copy()
-                        cand_prompt[pos] = cand_token
-                        candidates_flat.append(cand_prompt)
-                        owner_idx.append(i)
+                G = max(1, gcg_batch_size)
+                batch_arange = torch.arange(B, device=device).unsqueeze(1).expand(-1, G)
+                pos_choices = torch.randint(0, L, (B, G), device=device)
+                rank_choices = torch.randint(0, top_k, (B, G), device=device)
+                candidate_tokens = topk_idx[batch_arange, pos_choices, rank_choices]
+                orig_tokens = prompt_ids[batch_arange, pos_choices]
+                same_mask = candidate_tokens == orig_tokens
+                if same_mask.any():
+                    alt_rank = (rank_choices + 1) % top_k
+                    candidate_tokens = torch.where(
+                        same_mask,
+                        topk_idx[batch_arange, pos_choices, alt_rank],
+                        candidate_tokens
+                    )
 
-                if not candidates_flat:
-                    # nothing to try
-                    continue
+                candidates_tensor = prompt_ids.unsqueeze(1).repeat(1, G, 1)
+                flat_candidates = candidates_tensor.reshape(B * G, L)
+                flat_positions = pos_choices.reshape(-1)
+                flat_tokens = candidate_tokens.reshape(-1)
+                idx_range = torch.arange(B * G, device=device)
+                flat_candidates[idx_range, flat_positions] = flat_tokens
 
-                # Score all candidates in smaller chunks to avoid OOM
-                cand_completion_lists = [completion_tokens_list[owner_idx[j]] for j in range(len(owner_idx))]
-                cand_base_embeds = [base_embeds_list[owner_idx[j]] for j in range(len(owner_idx))]
+                cand_completion_lists = [completion_tokens_list[i] for i in range(B) for _ in range(G)]
+                cand_base_embeds = [base_embeds_list[i] for i in range(B) for _ in range(G)]
+                with torch.no_grad():
+                    cand_embeds = embedding_layer(flat_candidates)
+                    cand_likelihoods = self._get_likelihoods_from_embeddings_batch(cand_embeds, cand_completion_lists, cand_base_embeds)
 
-                cand_likelihoods_list: List[torch.Tensor] = []
-                # start with a moderate chunk size and reduce on OOM
-                chunk_size = 32
-                if len(candidates_flat) < chunk_size:
-                    chunk_size = len(candidates_flat)
-
-                start_idx = 0
-                while start_idx < len(candidates_flat):
-                    end_idx = min(start_idx + chunk_size, len(candidates_flat))
-                    try:
-                        chunk_ids = torch.tensor(candidates_flat[start_idx:end_idx], dtype=torch.long, device=device)
-                        chunk_embeds_batch = embedding_layer(chunk_ids)
-                        chunk_comp_lists = cand_completion_lists[start_idx:end_idx]
-                        chunk_base_embeds = cand_base_embeds[start_idx:end_idx]
-                        with torch.no_grad():
-                            chunk_ll = self._get_likelihoods_from_embeddings_batch(chunk_embeds_batch, chunk_comp_lists, chunk_base_embeds)
-                        cand_likelihoods_list.append(chunk_ll)
-                        # cleanup
-                        del chunk_ids, chunk_embeds_batch, chunk_comp_lists, chunk_base_embeds, chunk_ll
-                        start_idx = end_idx
-                    except RuntimeError as e:
-                        # likely OOM; try reducing chunk size
-                        if 'out of memory' in str(e).lower() and chunk_size > 1:
-                            chunk_size = max(1, chunk_size // 2)
-                            torch.cuda.empty_cache()
-                            continue
-                        else:
-                            raise
-
-                if cand_likelihoods_list:
-                    cand_likelihoods = torch.cat(cand_likelihoods_list)
-                else:
-                    cand_likelihoods = torch.empty(0, device=device)
-
-                # For each example, find best improving candidate among its block
-                # Map owner -> (candidate_idx_in_flat, reward, likelihood)
                 per_owner_best: Dict[int, Tuple[int, float, float]] = {}
-                for idx_cand, owner in enumerate(owner_idx):
+                flat_candidates_list = flat_candidates.cpu().tolist()
+                for idx_cand in range(B * G):
+                    owner = idx_cand // G
                     ll = float(cand_likelihoods[idx_cand].item())
-                    combined_tokens = (base_tokens_list[owner] + candidates_flat[idx_cand]) if base_tokens_list[owner] else candidates_flat[idx_cand]
+                    candidate_tokens_list = flat_candidates_list[idx_cand]
+                    if base_tokens_list[owner]:
+                        combined_tokens = base_tokens_list[owner] + candidate_tokens_list
+                    else:
+                        combined_tokens = candidate_tokens_list.copy()
                     reward_val, _ = self._compute_total_reward(
                         teacher_ll=ll,
                         combined_tokens=combined_tokens,
@@ -1344,10 +1311,13 @@ class LengthPolicyOptimizer:
                 # Apply improvements
                 for owner, (cand_idx_flat, reward_val, ll) in per_owner_best.items():
                     if reward_val > best_rewards[owner]:
-                        prompt_tokens_list[owner] = candidates_flat[cand_idx_flat]
+                        prompt_tokens_list[owner] = flat_candidates_list[cand_idx_flat].copy()
                         best_likelihoods[owner] = ll
                         best_rewards[owner] = float(reward_val)
-                        best_prompts[owner] = ((base_tokens_list[owner] + candidates_flat[cand_idx_flat]) if base_tokens_list[owner] else candidates_flat[cand_idx_flat].copy())
+                        if base_tokens_list[owner]:
+                            best_prompts[owner] = base_tokens_list[owner] + flat_candidates_list[cand_idx_flat]
+                        else:
+                            best_prompts[owner] = flat_candidates_list[cand_idx_flat].copy()
 
                 traces.append({
                     'episode': ep,
