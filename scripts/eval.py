@@ -40,17 +40,18 @@ def evaluate_prompt(cfg, agent, optimizer):
     gcg_steps = eval_cfg.get('gcg_steps', cfg.get('train', {}).get('gcg_steps', 5))
     opt_mode = optimization_mode.lower()
     if 'ppo' in opt_mode:
-        # PPO method removed during refactoring, fall back to standard optimization
-        print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch(
+        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch_ppo(
             target_completions=[test_prompt],
             episodes=1,
             steps_per_episode=max_policy_steps,
             initial_prompt_length=init_len,
             lr_embeddings=0.01,
+            lr_policy=0.0003,
             alpha=cfg.get('train', {}).get('alpha', 1.0),
             beta=cfg.get('train', {}).get('beta', 0.1),
-            mode='continuous' if 'continuous' in opt_mode else 'discrete'
+            base_prompts=[None],
+            optimization_mode='continuous',
+            inner_steps=5
         )
         best_prompt = best_prompts_batch[0] if best_prompts_batch else []
         completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
@@ -193,15 +194,6 @@ def evaluate_on_dataset(cfg, model_path):
     alpha = cfg.get('train', {}).get('alpha', 1.0)
     beta = cfg.get('train', {}).get('beta', 0.1)
     
-    # Get PPO parameters from config (for backward compatibility, though PPO is removed)
-    ppo_cfg = cfg.get('train', {}).get('ppo', {})
-    ppo_epochs = ppo_cfg.get('epochs', 1)
-    ppo_clip = ppo_cfg.get('clip', 0.2)
-    ppo_gamma = ppo_cfg.get('gamma', 0.99)
-    ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
-    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
-    ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
-    
     # Check if we should save plots
     save_plots = not eval_cfg.get('no_plots', True)
     plots_format = eval_cfg.get('plots_format', 'pdf')
@@ -273,17 +265,27 @@ def evaluate_on_dataset(cfg, model_path):
         opt_mode = optimization_mode.lower()
         try:
             if 'ppo' in opt_mode:
-                # PPO method removed during refactoring, fall back to standard optimization
-                print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                if 'discrete' in opt_mode:
+                    raise NotImplementedError("Parallel PPO evaluation currently supports continuous mode only.")
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_ppo(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
                     initial_prompt_length=init_len,
                     lr_embeddings=0.01,
+                    lr_policy=0.0003,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous' if 'continuous' in opt_mode else 'discrete'
+                    base_prompts=bases,
+                    optimization_mode='continuous',
+                    inner_steps=5,
+                    use_ppo=True,
+                    ppo_epochs=ppo_epochs,
+                    ppo_clip=ppo_clip,
+                    gamma=ppo_gamma,
+                    gae_lambda=ppo_lambda,
+                    value_coef=ppo_value_coef,
+                    entropy_coef=ppo_entropy_coef
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
@@ -294,18 +296,21 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous'
+                    base_prompts=bases,
+                    inner_steps=5
                 )
             elif opt_mode == 'discrete':
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_discrete(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
                     initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
+                    gcg_top_k=gcg_top_k,
+                    gcg_batch_size=gcg_batch_size,
+                    gcg_steps=gcg_steps,
                     alpha=alpha,
                     beta=beta,
-                    mode='discrete'
+                    base_prompts=bases
                 )
             else:
                 # fallback: run sequentially

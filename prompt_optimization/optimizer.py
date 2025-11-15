@@ -1,0 +1,169 @@
+"""
+RL Policy Optimizer: manages the policy network and coordinates optimization
+"""
+
+import torch
+import torch.nn.functional as F
+from tqdm import trange
+from typing import List, Tuple, Optional
+import torch.nn as nn
+import torch.optim as optim
+from prompt_optimization.agent import PromptRLAgent
+from prompt_optimization.interface import BasePromptOptimizer
+from prompt_optimization.continuous import ContinuousPromptOptimizer
+from prompt_optimization.discrete import DiscretePromptOptimizer
+
+class LengthPolicyOptimizer:
+    """RL optimizer that learns prompt length policy using REINFORCE."""
+    
+    def __init__(self, agent: PromptRLAgent):
+        self.agent = agent
+        self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
+        
+        # Simple policy network: state -> action probs
+        self.state_dim = 4  # [length, likelihood, step_ratio, improvement]
+        self.policy_net = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 3)  # Actions: 0=remove, 1=keep, 2=add
+        ).to(agent.device)
+        
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
+    
+    def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare completion tokens as batched tensors"""
+        completion_tokens_list = [self.agent.tokenizer.encode(t, add_special_tokens=False) for t in target_completions]
+        max_comp_len = max(len(ct) for ct in completion_tokens_list) if completion_tokens_list else 0
+        pad_id = getattr(self.agent.tokenizer, 'pad_token_id', 0)
+        completion_tokens_batch = torch.tensor([
+            ct + [pad_id] * (max_comp_len - len(ct)) for ct in completion_tokens_list
+        ], dtype=torch.long, device=self.agent.device)
+        completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=self.agent.device)
+        return completion_tokens_batch, completion_lengths
+    
+    def optimize_prompts_batch(self, target_completions: List[str], episodes: int = 3,
+                               steps_per_episode: int = 50, initial_prompt_length: int = 32,
+                               lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
+                               mode: str = "continuous") -> Tuple[List[torch.Tensor], List[float], List[dict]]:
+        """Unified batch optimization using pluggable optimizer interface"""
+        device = self.agent.device
+        B = len(target_completions)
+        if B == 0:
+            return [], [], []
+        
+        completion_tokens_batch, completion_lengths = self._prepare_completions(target_completions)
+        
+        # Create optimizer based on mode
+        max_prompt_len = initial_prompt_length * 2  # Allow growth
+        if mode == "continuous":
+            optimizer: BasePromptOptimizer = ContinuousPromptOptimizer(
+                self.agent, initial_prompt_length, max_prompt_len, B, lr_embeddings
+            )
+        else:  # discrete
+            optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
+                self.agent, initial_prompt_length, max_prompt_len, B, lr_embeddings
+            )
+        
+        # Initialize prompts
+        prompt_data, lengths = optimizer.initialize_prompts()
+        
+        best_rewards = torch.full((B,), float('-inf'), dtype=torch.float32, device=device)
+        best_prompts: List[Optional[torch.Tensor]] = [None] * B
+        
+        traces = []
+        
+        for episode in trange(episodes, desc="Episodes"):
+            episode_rewards = []
+            episode_log_probs = []
+            episode_states = []
+            
+            step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
+            for step in step_bar:
+                # Inner optimization step (e.g., gradient updates, GCG replacements)
+                prompt_data, likelihoods = optimizer.inner_optimization_step(
+                    prompt_data, lengths, completion_tokens_batch, completion_lengths, step
+                )
+                
+                # Compute states for policy
+                step_ratio = step / steps_per_episode
+                states = torch.stack([
+                    lengths.float() / initial_prompt_length,  # normalized length
+                    likelihoods,  # current likelihood
+                    torch.full((B,), step_ratio, device=device),  # step ratio
+                    torch.zeros(B, device=device)  # improvement (simplified)
+                ], dim=1)  # [B, 4]
+                
+                # Policy forward pass
+                action_logits = self.policy_net(states)  # [B, 3]
+                action_probs = F.softmax(action_logits, dim=-1)
+                actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [B]
+                if B == 1:
+                    log_probs = F.log_softmax(action_logits, dim=-1)[0, actions].unsqueeze(0)
+                else:
+                    log_probs = F.log_softmax(action_logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(-1)
+                
+                # Apply length actions
+                prompt_data, lengths = optimizer.apply_length_action(prompt_data, lengths, actions)
+                
+                # Compute rewards
+                rewards = alpha * likelihoods - beta * lengths.float()
+                
+                # Update best
+                for i in range(B):
+                    if rewards[i] > best_rewards[i]:
+                        best_rewards[i] = rewards[i]
+                        best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
+                
+                episode_rewards.append(rewards)
+                episode_log_probs.append(log_probs)
+                episode_states.append(states)
+            
+            # Policy update (REINFORCE)
+            rewards_tensor = torch.stack(episode_rewards)  # [T, B]
+            log_probs_tensor = torch.stack(episode_log_probs)  # [T, B]
+            
+            # Compute returns
+            returns = torch.zeros_like(rewards_tensor)
+            next_return = torch.zeros(B, device=device)
+            for t in reversed(range(steps_per_episode)):
+                next_return = rewards_tensor[t] + 0.99 * next_return
+                returns[t] = next_return
+            
+            # Normalize returns
+            returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            
+            # Policy loss
+            policy_loss = -(log_probs_tensor * returns.detach()).mean()
+            self.policy_optimizer.zero_grad()
+            policy_loss.backward()
+            self.policy_optimizer.step()
+            
+            traces.append({
+                'episode': episode,
+                'rewards': [float(r) for r in rewards_tensor[-1]],
+                'lengths': [int(l) for l in lengths]
+            })
+        
+        # Convert best prompts to tokens
+        final_prompts = []
+        for i in range(B):
+            if best_prompts[i] is not None:
+                # For continuous mode, best_prompts are embeddings; convert to tokens
+                if mode == "continuous":
+                    embedding_layer = self.agent.model.get_input_embeddings()
+                    vocab_embeds = embedding_layer.weight.detach()
+                    embeds = best_prompts[i]  # [length, D]
+                    if embeds.shape[0] > 0:
+                        distances = torch.cdist(embeds, vocab_embeds)
+                        token_ids = distances.argmin(dim=-1)
+                        final_prompts.append(token_ids)
+                    else:
+                        final_prompts.append(torch.tensor([], dtype=torch.long, device=device))
+                else:
+                    # For discrete mode, best_prompts are already tokens
+                    final_prompts.append(best_prompts[i])
+            else:
+                final_prompts.append(torch.tensor([], dtype=torch.long, device=device))
+        
+        return final_prompts, [float(r) for r in best_rewards], traces
+
