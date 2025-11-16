@@ -10,8 +10,11 @@ import torch.nn as nn
 import torch.optim as optim
 from prompt_optimization.agent import PromptRLAgent
 from prompt_optimization.interface import BasePromptOptimizer
-from prompt_optimization.continuous import ContinuousPromptOptimizer
-from prompt_optimization.discrete import DiscretePromptOptimizer
+from prompt_optimization.optimizers import (
+    ContinuousPromptOptimizer,
+    ContinuousPromptOptimizerWithProjection,
+    DiscretePromptOptimizer
+)
 
 class LengthPolicyOptimizer:
     """RL optimizer that learns prompt length policy using REINFORCE."""
@@ -58,6 +61,14 @@ class LengthPolicyOptimizer:
         if mode == "continuous":
             optimizer: BasePromptOptimizer = ContinuousPromptOptimizer(
                 self.agent, initial_prompt_length, max_prompt_len, B, lr_embeddings
+            )
+        elif mode == "continuous_proj":
+            # Continuous with projection regularization
+            projection_weight = getattr(self, 'projection_weight', 0.1)
+            distance_metric = getattr(self, 'distance_metric', 'l2')
+            optimizer: BasePromptOptimizer = ContinuousPromptOptimizerWithProjection(
+                self.agent, initial_prompt_length, max_prompt_len, B, lr_embeddings,
+                projection_weight=projection_weight, distance_metric=distance_metric
             )
         else:  # discrete
             optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
@@ -144,26 +155,70 @@ class LengthPolicyOptimizer:
                 'lengths': [int(l) for l in lengths]
             })
         
-        # Convert best prompts to tokens
+        # Convert best prompts to tokens using optimizer's to_tokens method
+        # This is mode-agnostic - each optimizer handles its own conversion
         final_prompts = []
-        for i in range(B):
-            if best_prompts[i] is not None:
-                # For continuous mode, best_prompts are embeddings; convert to tokens
-                if mode == "continuous":
-                    embedding_layer = self.agent.model.get_input_embeddings()
-                    vocab_embeds = embedding_layer.weight.detach()
-                    embeds = best_prompts[i]  # [length, D]
-                    if embeds.shape[0] > 0:
-                        distances = torch.cdist(embeds, vocab_embeds)
-                        token_ids = distances.argmin(dim=-1)
-                        final_prompts.append(token_ids)
-                    else:
-                        final_prompts.append(torch.tensor([], dtype=torch.long, device=device))
-                else:
-                    # For discrete mode, best_prompts are already tokens
-                    final_prompts.append(best_prompts[i])
+        projection_losses = []
+        
+        # Prepare batch data for to_tokens
+        # Check if we have embeddings (2D) or tokens (1D) by inspecting first non-None prompt
+        is_embeddings = None
+        max_len = 0
+        for bp in best_prompts:
+            if bp is not None and bp.numel() > 0:
+                max_len = max(max_len, bp.shape[0])
+                if is_embeddings is None:
+                    is_embeddings = len(bp.shape) > 1
+        
+        if max_len > 0:
+            # Create batch tensor - shape depends on whether we have embeddings or tokens
+            if is_embeddings:
+                prompt_data_batch = torch.zeros(B, max_len, optimizer.emb_dim, device=device)
             else:
+                prompt_data_batch = torch.zeros(B, max_len, dtype=torch.long, device=device)
+            lengths_batch = torch.zeros(B, dtype=torch.long, device=device)
+            
+            for i in range(B):
+                if best_prompts[i] is not None:
+                    length = best_prompts[i].shape[0]
+                    if length > 0:
+                        prompt_data_batch[i, :length] = best_prompts[i]
+                        lengths_batch[i] = length
+            
+            # Use optimizer's to_tokens method (mode-agnostic)
+            tokens_batch = optimizer.to_tokens(prompt_data_batch, lengths_batch)
+            
+            # Extract individual prompts and compute projection loss if applicable
+            for i in range(B):
+                length = lengths_batch[i].item()
+                if length > 0:
+                    final_prompts.append(tokens_batch[i, :length])
+                    # Compute projection loss for continuous modes (embeddings -> tokens)
+                    if is_embeddings and best_prompts[i] is not None:
+                        # Use optimizer's method if available, otherwise compute directly
+                        if hasattr(optimizer, '_compute_projection_loss'):
+                            proj_loss = optimizer._compute_projection_loss(best_prompts[i])
+                        else:
+                            # Compute projection loss directly for continuous mode
+                            embedding_layer = self.agent.model.get_input_embeddings()
+                            vocab_embeds = embedding_layer.weight.detach()
+                            distances = torch.cdist(best_prompts[i], vocab_embeds)
+                            proj_loss = distances.min(dim=-1)[0].mean()
+                        projection_losses.append(proj_loss.item() if isinstance(proj_loss, torch.Tensor) else proj_loss)
+                    else:
+                        projection_losses.append(0.0)  # No projection for discrete (already tokens)
+                else:
+                    final_prompts.append(torch.tensor([], dtype=torch.long, device=device))
+                    projection_losses.append(float('inf'))
+        else:
+            for i in range(B):
                 final_prompts.append(torch.tensor([], dtype=torch.long, device=device))
+                projection_losses.append(float('inf'))
+        
+        # Store projection losses in traces for analysis
+        if projection_losses:
+            for trace in traces:
+                trace['projection_loss'] = projection_losses[0] if projection_losses else 0.0
         
         return final_prompts, [float(r) for r in best_rewards], traces
 

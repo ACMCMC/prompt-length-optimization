@@ -42,7 +42,6 @@ ENV/
 Thumbs.db
 
 # Experiment outputs
-experiments/
 outputs/
 logs/
 wandb/

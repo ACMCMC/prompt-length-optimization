@@ -6,7 +6,7 @@ Your research colleague will implement this.
 import torch
 import random
 from typing import Tuple
-from prompt_optimization.interface import BasePromptOptimizer
+from ..interface import BasePromptOptimizer
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
     """

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from typing import Tuple
-from prompt_optimization.interface import BasePromptOptimizer
+from ..interface import BasePromptOptimizer
 
 class ContinuousPromptOptimizer(BasePromptOptimizer):
     """Optimizes prompts in continuous embedding space, then projects to tokens."""
@@ -64,7 +64,7 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
         This avoids CUDA memory issues from gradient computation.
         """
         max_active_len = lengths.max().item()
-        active_embeds = prompt_data[:, :max_active_len]
+        active_embeds = prompt_data[:, :max_active_len].clone()  # Clone to avoid view issues
         
         # Get baseline likelihoods
         with torch.no_grad():
@@ -83,8 +83,11 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
             # Accept improvements
             for i in range(self.batch_size):
                 if test_likelihoods[i] > base_likelihoods[i]:
-                    prompt_data.data[i, :max_active_len] = test_embeds[i]
+                    active_embeds[i] = test_embeds[i]
                     base_likelihoods[i] = test_likelihoods[i]
+        
+        # Copy back to prompt_data
+        prompt_data.data[:, :max_active_len] = active_embeds
         
         return prompt_data, base_likelihoods
     

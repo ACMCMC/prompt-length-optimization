@@ -1,0 +1,21 @@
+program: experiments/run_sweep.py
+method: grid
+metric:
+  name: final_mean_reward
+  goal: maximize
+parameters:
+  mode:
+    values: ["discrete", "continuous", "continuous_proj"]
+  projection_weight:
+    values: [0.05, 0.1, 0.2, 0.5]
+  distance_metric:
+    values: ["l2", "dot"]
+  episodes_per_prompt:
+    values: [10, 20, 30]
+  steps_per_episode:
+    values: [50, 100, 150]
+  lr_embeddings:
+    values: [0.005, 0.01, 0.02]
+  beta:
+    values: [0.1, 0.2, 0.3]
+
