@@ -19,45 +19,59 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
         self.embedding_layer = agent.model.get_input_embeddings()
         
-        # Initialize with random tokens
-        self.prompt_tokens = torch.tensor([
-            [agent.get_random_token() for _ in range(max_prompt_len)] 
-            for _ in range(batch_size)
-        ], dtype=torch.long, device=self.device)
+        # Initialize with BOS tokens
+        bos_token_id = agent.tokenizer.bos_token_id if agent.tokenizer.bos_token_id is not None else agent.tokenizer.eos_token_id
+        self.prompt_tokens = torch.full(
+            (batch_size, max_prompt_len), bos_token_id, dtype=torch.long, device=self.device
+        )
     
     def initialize_prompts(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Initialize with random tokens."""
+        """Initialize with BOS tokens."""
         lengths = torch.full((self.batch_size,), self.initial_prompt_length,
                            dtype=torch.long, device=self.device)
+        # Reset to BOS tokens
+        bos_token_id = self.agent.tokenizer.bos_token_id if self.agent.tokenizer.bos_token_id is not None else self.agent.tokenizer.eos_token_id
+        self.prompt_tokens.fill_(bos_token_id)
         return self.prompt_tokens, lengths
     
     def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                        completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                       requires_grad: bool = False) -> torch.Tensor:
+                       requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
+                       prefix_lengths: torch.Tensor = None) -> torch.Tensor:
         """Compute likelihoods from tokens."""
         max_active_len = lengths.max().item()
         active_tokens = prompt_data[:, :max_active_len]
         prompt_embeds = self.embedding_layer(active_tokens)
         return self.agent.get_likelihoods_batch(
-            prompt_embeds, completion_tokens, completion_lengths, requires_grad=requires_grad
+            prompt_embeds, completion_tokens, completion_lengths, requires_grad=requires_grad,
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
         )
     
     def apply_length_action(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                            actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add/remove tokens."""
-        updated_lengths = lengths.clone()
-        for i in range(self.batch_size):
-            action = actions[i].item()
-            if action == 0 and lengths[i] > 0:  # remove
-                updated_lengths[i] -= 1
-            elif action == 2 and lengths[i] < self.max_prompt_len:  # add
-                prompt_data[i, lengths[i]] = self.agent.get_random_token()
-                updated_lengths[i] += 1
+        # Vectorized length updates: remove (action=0) and add (action=2)
+        remove_mask = (actions == 0) & (lengths > 0)
+        add_mask = (actions == 2) & (lengths < self.max_prompt_len)
+        
+        updated_lengths = lengths - remove_mask.long() + add_mask.long()
+        
+        # Vectorized initialization of new positions
+        if add_mask.any():
+            add_indices = torch.nonzero(add_mask, as_tuple=False).squeeze(-1)
+            add_positions = lengths[add_indices]
+            new_tokens = torch.tensor(
+                [self.agent.get_random_token() for _ in range(len(add_indices))],
+                dtype=torch.long, device=self.device
+            )
+            prompt_data[add_indices, add_positions] = new_tokens
+        
         return prompt_data, updated_lengths
     
     def inner_optimization_step(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                                completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                               step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                               step: int, prefix_tokens: torch.Tensor = None,
+                               prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         TODO: Implement GCG optimization here.
         This is a placeholder that does minimal token replacement.
@@ -68,7 +82,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         active_tokens = prompt_data[:, :max_active_len]
         prompt_embeds = self.embedding_layer(active_tokens)
         likelihoods = self.agent.get_likelihoods_batch(
-            prompt_embeds, completion_tokens, completion_lengths, requires_grad=False
+            prompt_embeds, completion_tokens, completion_lengths, requires_grad=False,
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
         )
         
         # Minimal optimization: only every 3rd step, limited items
@@ -87,7 +102,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                         test_embeds = self.embedding_layer(test_tokens).unsqueeze(0)
                         test_ll = self.agent.get_likelihoods_batch(
                             test_embeds, completion_tokens[i:i+1], 
-                            completion_lengths[i:i+1], requires_grad=False
+                            completion_lengths[i:i+1], requires_grad=False,
+                            prefix_tokens=prefix_tokens[i:i+1] if prefix_tokens is not None else None,
+                            prefix_lengths=prefix_lengths[i:i+1] if prefix_lengths is not None else None
                         )[0]
                         if test_ll.item() > best_ll:
                             best_ll = test_ll.item()
@@ -98,14 +115,20 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         return prompt_data, likelihoods
     
     def to_tokens(self, prompt_data: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """Tokens are already token IDs, just pad/trim to max length."""
+        """Tokens are already token IDs, just pad/trim to max length (vectorized)."""
         B = prompt_data.shape[0]
         max_len = lengths.max().item()
-        tokens = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
-        for i in range(B):
-            length = lengths[i].item()
-            if length > 0:
-                tokens[i, :length] = prompt_data[i, :length]
+        
+        if max_len == 0:
+            return torch.zeros(B, 0, dtype=torch.long, device=self.device)
+        
+        # Extract active tokens and pad with zeros
+        tokens = prompt_data[:, :max_len].clone()  # [B, max_len]
+        
+        # Mask invalid positions (beyond actual length)
+        length_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < lengths.unsqueeze(-1)
+        tokens = torch.where(length_mask, tokens, torch.zeros_like(tokens))
+        
         return tokens
     
     def clone_prompt(self, prompt_data: torch.Tensor, idx: int, length: int) -> torch.Tensor:

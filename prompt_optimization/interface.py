@@ -42,7 +42,8 @@ class BasePromptOptimizer(ABC):
     @abstractmethod
     def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                        completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                       requires_grad: bool = False) -> torch.Tensor:
+                       requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
+                       prefix_lengths: torch.Tensor = None) -> torch.Tensor:
         """
         Compute likelihoods for current prompts.
         
@@ -78,7 +79,8 @@ class BasePromptOptimizer(ABC):
     @abstractmethod
     def inner_optimization_step(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                                completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                               step: int) -> Tuple[torch.Tensor, torch.Tensor]:
+                               step: int, prefix_tokens: torch.Tensor = None,
+                               prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Perform one step of inner optimization (e.g., gradient updates, GCG replacements).
         This is called before policy actions are applied.

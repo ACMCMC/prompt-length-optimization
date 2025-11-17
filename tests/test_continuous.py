@@ -3,7 +3,7 @@
 import torch
 import pytest
 from prompt_optimization.agent import PromptRLAgent
-from prompt_optimization.continuous import ContinuousPromptOptimizer
+from prompt_optimization.optimizers import ContinuousPromptOptimizer
 
 @pytest.fixture
 def agent():

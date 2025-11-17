@@ -3,12 +3,17 @@ Run experiments comparing different optimization modes.
 Supports wandb integration for tracking and hyperparameter sweeps.
 """
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import yaml
 import torch
 import random
 import numpy as np
 import wandb
-from pathlib import Path
 from typing import Dict, List, Optional
 from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
 from prompt_optimization.datasets import ToxicChatDatasetManager
@@ -173,40 +178,56 @@ def run_single_experiment(
     print(f"Running experiment: {mode}")
     print(f"{'='*60}")
     
-    # Train on prompts
-    for i, pair in enumerate(prompt_completion_pairs):
-        if i % 10 == 0:
-            print(f"Processing prompt {i+1}/{len(prompt_completion_pairs)}")
+    # Train on prompts in batches of 64
+    batch_size = 64
+    for batch_start in range(0, len(prompt_completion_pairs), batch_size):
+        batch_end = min(batch_start + batch_size, len(prompt_completion_pairs))
+        batch_pairs = prompt_completion_pairs[batch_start:batch_end]
         
-        # Get completion (target)
-        completion = pair.get('target', '')
-        base_prompt = pair.get('base', '')
-        if not completion:
+        print(f"Processing batch {batch_start//batch_size + 1} (prompts {batch_start+1}-{batch_end}/{len(prompt_completion_pairs)})")
+        
+        # Collect completions for this batch
+        batch_completions = []
+        batch_base_prompts = []
+        batch_indices = []
+        
+        for i, pair in enumerate(batch_pairs):
+            completion = pair.get('target', '')
+            base_prompt = pair.get('base', '')
+            if completion:
+                batch_completions.append(completion)
+                batch_base_prompts.append(base_prompt)
+                batch_indices.append(batch_start + i)
+        
+        if not batch_completions:
             continue
         
-        # Optimize
+        # Optimize all prompts in batch in parallel
         optimized_prompts, rewards, traces = optimizer.optimize_prompts_batch(
-            target_completions=[completion],
+            target_completions=batch_completions,
             episodes=episodes_per_prompt,
             steps_per_episode=steps_per_episode,
             initial_prompt_length=init_len,
             lr_embeddings=lr_embeddings,
             alpha=alpha,
             beta=beta,
-            mode=mode
+            mode=mode,
+            batch_size=batch_size
         )
         
-        if optimized_prompts and len(optimized_prompts) > 0:
-            final_reward = rewards[0] if rewards else 0.0
-            final_length = len(optimized_prompts[0]) if optimized_prompts[0].numel() > 0 else 0
-            
-            # Decode optimized prompt
-            optimized_prompt_text = agent.tokenizer.decode(optimized_prompts[0], skip_special_tokens=True)
-            
-            # Compute likelihood for final prompt
-            if final_length > 0:
-                completion_tokens = agent.tokenizer.encode(completion, return_tensors='pt').to(agent.device)[0]
-                prompt_tokens = optimized_prompts[0]
+        # Process results for each prompt in the batch
+        for batch_idx, (global_idx, completion, base_prompt) in enumerate(zip(batch_indices, batch_completions, batch_base_prompts)):
+            if batch_idx < len(optimized_prompts) and optimized_prompts[batch_idx].numel() > 0:
+                final_reward = rewards[batch_idx] if batch_idx < len(rewards) else 0.0
+                final_length = len(optimized_prompts[batch_idx]) if optimized_prompts[batch_idx].numel() > 0 else 0
+                
+                # Decode optimized prompt
+                optimized_prompt_text = agent.tokenizer.decode(optimized_prompts[batch_idx], skip_special_tokens=True)
+                
+                # Compute likelihood for final prompt
+                if final_length > 0:
+                    completion_tokens = agent.tokenizer.encode(completion, return_tensors='pt').to(agent.device)[0]
+                    prompt_tokens = optimized_prompts[batch_idx]
                 
                 with torch.no_grad():
                     # Use get_likelihoods_batch which expects embeddings or tokens
@@ -242,12 +263,15 @@ def run_single_experiment(
             all_lengths.append(final_length)
             
             # Extract projection loss from traces (if available)
-            projection_loss = traces[0].get('projection_loss', None) if traces else None
+            # Traces is a list of episode traces, get projection loss from last episode if available
+            projection_loss = None
+            if traces and len(traces) > 0:
+                projection_loss = traces[-1].get('projection_loss', None)
             if projection_loss is not None:
                 all_projection_losses.append(projection_loss)
             
             # Save example (first few, evenly spaced, and best/worst)
-            if len(examples) < num_examples_to_save or i % (len(prompt_completion_pairs) // num_examples_to_save) == 0:
+            if len(examples) < num_examples_to_save or global_idx % (len(prompt_completion_pairs) // num_examples_to_save) == 0:
                 example = {
                     'base_prompt': base_prompt,
                     'optimized_prompt': optimized_prompt_text,
@@ -268,7 +292,7 @@ def run_single_experiment(
                     'reward': final_reward,
                     'prompt_length': final_length,
                     'likelihood': all_likelihoods[-1] if all_likelihoods else 0.0,
-                    'prompt_idx': i
+                    'prompt_idx': global_idx
                 }
                 if projection_loss is not None:
                     log_dict['projection_loss'] = projection_loss
