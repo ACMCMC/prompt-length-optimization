@@ -1,0 +1,64 @@
+/home/acreomarino/.local/lib/python3.11/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/home/acreomarino/.local/lib/python3.11/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/opt/conda/lib/python3.11/site-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: `clean_up_tokenization_spaces` was not set. It will be set to `True` by default. This behavior will be depracted in transformers v4.45, and will be then set to `False` by default. For more details check this issue: https://github.com/huggingface/transformers/issues/31884
+  warnings.warn(
+
+============================================================
+Comparing optimization modes
+============================================================
+
+Loading AdvBench dataset...
+Loaded 3 AdvBench examples
+
+============================================================
+Running experiment: discrete
+============================================================
+Processing batch 1 (prompts 1-3/3)
+Episodes (batch 1):   0%|          | 0/2 [00:00<?, ?it/s]
+Episode 1:   0%|          | 0/5 [00:00<?, ?it/s][A
+Episode 1:  20%|██        | 1/5 [00:00<00:01,  2.21it/s][A
+                                                        [AEpisodes (batch 1):  50%|█████     | 1/2 [00:00<00:00,  1.72it/s]
+Episode 2:   0%|          | 0/5 [00:00<?, ?it/s][A
+Episode 2:  80%|████████  | 4/5 [00:00<00:00, 39.50it/s][A
+                                                        [AEpisodes (batch 1): 100%|██████████| 2/2 [00:00<00:00,  3.27it/s]Episodes (batch 1): 100%|██████████| 2/2 [00:00<00:00,  2.88it/s]
+/opt/conda/lib/python3.11/site-packages/transformers/tokenization_utils_base.py:1601: FutureWarning: `clean_up_tokenization_spaces` was not set. It will be set to `True` by default. This behavior will be depracted in transformers v4.45, and will be then set to `False` by default. For more details check this issue: https://github.com/huggingface/transformers/issues/31884
+  warnings.warn(
+Saved 3 examples to experiments/results/examples_discrete_discrete_comparison.txt
+
+DISCRETE Results:
+  Mean Reward: -74.679 ± 23.836
+  Mean Length: 9.0 ± 0.0
+  Mean Likelihood: -78.881 ± 23.600
+  Mean Projection Loss: 0.0000 ± 0.0000
+Loading AdvBench dataset...
+Loaded 3 AdvBench examples
+
+============================================================
+Running experiment: continuous
+============================================================
+Processing batch 1 (prompts 1-3/3)
+Episodes (batch 1):   0%|          | 0/2 [00:00<?, ?it/s]
+Episode 1:   0%|          | 0/5 [00:00<?, ?it/s][A
+                                                [AEpisodes (batch 1):   0%|          | 0/2 [00:00<?, ?it/s]
+
+Error running continuous: The size of tensor a (3) must match the size of tensor b (8) at non-singleton dimension 1
+Loading AdvBench dataset...
+Loaded 3 AdvBench examples
+
+============================================================
+Running experiment: continuous_proj
+============================================================
+Processing batch 1 (prompts 1-3/3)
+Episodes (batch 1):   0%|          | 0/2 [00:00<?, ?it/s]
+Episode 1:   0%|          | 0/5 [00:00<?, ?it/s][A
+                                                [AEpisodes (batch 1):   0%|          | 0/2 [00:00<?, ?it/s]
+
+Error running continuous_proj: The size of tensor a (3) must match the size of tensor b (8) at non-singleton dimension 1
+
+============================================================
+COMPARISON SUMMARY
+============================================================
+
+✓ Experiments completed!

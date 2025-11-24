@@ -9,10 +9,15 @@ import yaml
 import random
 import time
 import csv
+import logging
 from datetime import datetime
 from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
 from prompt_optimization.datasets import ToxicChatDatasetManager
 import numpy as np
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
@@ -30,9 +35,10 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     alpha = train_cfg.get('alpha', 1.0)
     beta = train_cfg.get('beta', 0.2)
     optimization_mode = train_cfg.get('optimization_mode', 'continuous')
-    gcg_top_k = train_cfg.get('gcg_top_k', 16)
-    gcg_batch_size = train_cfg.get('gcg_batch_size', 32)
-    gcg_steps = train_cfg.get('gcg_steps', 5)
+    gcg_cfg = train_cfg.get('gcg', {})
+    gcg_top_k = gcg_cfg.get('top_k', 16)
+    gcg_batch_size = gcg_cfg.get('batch_size', 32)
+    gcg_steps = gcg_cfg.get('steps', 5)
     save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
     ppo_cfg = train_cfg.get('ppo', {})
     ppo_epochs = ppo_cfg.get('epochs', 4)
@@ -141,7 +147,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     
     # Initialize agent and optimizer
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent)
+    epsilon = train_cfg.get('epsilon', 0.1)
+    epsilon_decay = train_cfg.get('epsilon_decay', 0.995)
+    epsilon_min = train_cfg.get('epsilon_min', 0.01)
+    entropy_coef = train_cfg.get('entropy_coef', 0.01)
+    temperature = train_cfg.get('temperature', 1.0)
+    optimizer = LengthPolicyOptimizer(agent, epsilon=epsilon, epsilon_decay=epsilon_decay, epsilon_min=epsilon_min,
+                                     entropy_coef=entropy_coef, temperature=temperature)
     # Prepare metrics output
     metrics_dir = "results"
     os.makedirs(metrics_dir, exist_ok=True)
@@ -256,7 +268,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
 
-                print(f"PPO metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+                logger.debug(f"PPO metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
                 try:
                     with open(metrics_path, 'a', newline='') as fh:
@@ -274,15 +286,15 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception as _:
-                    print("Warning: failed to write training metrics to CSV")
+                    logger.warning("Failed to write training metrics to CSV")
 
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
-                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
-                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+                logger.debug(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
+                logger.debug(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                logger.debug(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                logger.debug(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
-                    print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest PPO reward: {best_reward:.3f}")
+                    logger.debug(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest PPO reward: {best_reward:.3f}")
 
         elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
@@ -301,24 +313,24 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             # --- batch-level trace logging ---
             try:
                 if traces:
-                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    logger.debug(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
                     # If many trace entries, show head/tail to avoid huge logs
                     show_all = len(traces) <= 50
                     entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
                     for t in entries_to_show:
                         if 'likelihoods' in t:
                             ll = t['likelihoods']
-                            print(f"  Ep {t.get('episode', '?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                            logger.debug(f"  Ep {t.get('episode', '?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
                         elif 'best_likelihoods' in t:
                             bl = t['best_likelihoods']
-                            print(f"  Ep {t.get('episode', '?')} step {t.get('step', '?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                            logger.debug(f"  Ep {t.get('episode', '?')} step {t.get('step', '?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
                         else:
                             # generic trace dump
-                            print(f"  trace entry: {t}")
+                            logger.debug(f"  trace entry: {t}")
                     if not show_all:
-                        print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
+                        logger.debug(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
             except Exception as _:
-                print("  (could not pretty-print traces)")
+                logger.debug("  (could not pretty-print traces)")
             
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
@@ -343,7 +355,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
 
                 # Print per-prompt episode metrics
-                print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+                logger.debug(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
                 # Append to CSV for later reference
                 try:
@@ -362,17 +374,17 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception as _:
-                    print("Warning: failed to write training metrics to CSV")
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
-                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
-                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+                    logger.warning("Failed to write training metrics to CSV")
+                logger.debug(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
+                logger.debug(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                logger.debug(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                logger.debug(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
-                    print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+                    logger.debug(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
         elif optimization_mode.lower() == 'discrete':
             # Use the batched discrete (GCG) optimizer for this whole batch
-            print(f"Running batched discrete optimizer on batch size={len(batch_prompts)}")
+            logger.debug(f"Running batched discrete optimizer on batch size={len(batch_prompts)}")
             targets = [p.get('target', '') for p in batch_prompts]
             best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
                 target_completions=targets,
@@ -405,7 +417,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
 
-                print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
+                logger.debug(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
                 # Append to CSV for later reference
                 try:
@@ -424,34 +436,34 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception:
-                    print("Warning: failed to write training metrics to CSV")
+                    logger.warning("Failed to write training metrics to CSV")
 
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
-                print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
-                print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+                logger.debug(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
+                logger.debug(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                logger.debug(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                logger.debug(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
-                    print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+                    logger.debug(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
             # --- batch-level trace logging for discrete optimizer ---
             try:
                 if traces:
-                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    logger.debug(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
                     show_all = len(traces) <= 50
                     entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
                     for t in entries_to_show:
                         if 'best_likelihoods' in t:
                             bl = t['best_likelihoods']
-                            print(f"  Ep {t.get('episode','?')} step {t.get('step','?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                            logger.debug(f"  Ep {t.get('episode','?')} step {t.get('step','?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
                         elif 'likelihoods' in t:
                             ll = t['likelihoods']
-                            print(f"  Ep {t.get('episode','?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                            logger.debug(f"  Ep {t.get('episode','?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
                         else:
-                            print(f"  trace entry: {t}")
+                            logger.debug(f"  trace entry: {t}")
                     if not show_all:
-                        print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
+                        logger.debug(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
             except Exception:
-                print("  (could not pretty-print discrete traces)")
+                logger.debug("  (could not pretty-print discrete traces)")
 
         else:
             # Fallback to per-prompt sequential processing for other/unknown modes
@@ -508,17 +520,17 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     except Exception:
                         optimized_suffix_text = optimized_text
 
-                    print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
-                    print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
-                    print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
-                    print(f"Target completion: {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
+                    logger.debug(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                    logger.debug(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                    logger.debug(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
+                    logger.debug(f"Target completion: {target_text[:200]}{'...' if len(target_text) > 200 else ''}")
 
                     # Quick progress update
                     if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
-                        print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
+                        logger.debug(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest reward: {best_reward:.3f}")
 
                 except Exception as e:
-                    print(f"  Error on prompt {global_idx+1}: {e}")
+                    logger.warning(f"  Error on prompt {global_idx+1}: {e}")
                     continue
         
         batch_time = time.time() - batch_start_time

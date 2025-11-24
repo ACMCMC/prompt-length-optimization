@@ -19,7 +19,8 @@ from prompt_optimization.optimizers import (
 class LengthPolicyOptimizer:
     """RL optimizer that learns prompt length policy using REINFORCE."""
     
-    def __init__(self, agent: PromptRLAgent):
+    def __init__(self, agent: PromptRLAgent, epsilon: float = 0.1, epsilon_decay: float = 0.995, epsilon_min: float = 0.01,
+                 entropy_coef: float = 0.01, temperature: float = 1.0):
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
@@ -32,6 +33,18 @@ class LengthPolicyOptimizer:
         ).to(agent.device)
         
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        
+        # Epsilon-greedy exploration parameters
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.current_epsilon = epsilon
+        
+        # Entropy bonus for exploration (encourages diverse action distributions)
+        self.entropy_coef = entropy_coef
+        
+        # Temperature for softmax (higher = more exploration)
+        self.temperature = temperature
     
     def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare completion tokens as batched tensors"""
@@ -121,8 +134,12 @@ class LengthPolicyOptimizer:
                 )
             elif mode == "continuous_proj":
                 # Continuous with projection regularization
-                projection_weight = getattr(self, 'projection_weight', 0.1)
-                distance_metric = getattr(self, 'distance_metric', 'l2')
+                projection_weight = getattr(self, 'projection_weight', None)
+                if projection_weight is None:
+                    projection_weight = 0.1  # Default if not set
+                distance_metric = getattr(self, 'distance_metric', None)
+                if distance_metric is None:
+                    distance_metric = 'l2'  # Default if not set
                 optimizer: BasePromptOptimizer = ContinuousPromptOptimizerWithProjection(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
                     projection_weight=projection_weight, distance_metric=distance_metric
@@ -146,14 +163,17 @@ class LengthPolicyOptimizer:
             attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)
             
             best_rewards = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
+            best_likelihoods = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
             best_prompts: List[Optional[torch.Tensor]] = [None] * batch_B
             
             traces = []
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
                 episode_rewards = []
+                episode_likelihoods = []
                 episode_log_probs = []
                 episode_states = []
+                episode_action_probs = []  # Store for entropy computation
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
@@ -173,14 +193,30 @@ class LengthPolicyOptimizer:
                         torch.zeros(batch_B, device=device)  # improvement (simplified)
                     ], dim=1)  # [batch_B, 4]
                     
-                    # Policy forward pass
+                    # Policy forward pass with temperature
                     action_logits = self.policy_net(states)  # [batch_B, 3]
-                    action_probs = F.softmax(action_logits, dim=-1)
-                    actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    action_probs = F.softmax(action_logits / self.temperature, dim=-1)
+                    
+                    # Epsilon-greedy action selection (batched)
+                    explore_mask = torch.rand(batch_B, device=device) < self.current_epsilon
+                    # Random exploration: uniform over 3 actions
+                    random_actions = torch.randint(0, 3, (batch_B,), device=device)
+                    # Exploitation: sample from policy
+                    policy_actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    # Combine: use random actions where explore_mask is True, policy actions otherwise
+                    actions = torch.where(explore_mask, random_actions, policy_actions)
+                    
+                    # Compute log_probs: uniform for random actions, policy log_probs for exploitation
+                    uniform_log_prob = torch.log(torch.tensor(1.0 / 3.0, device=device))
+                    policy_log_probs = F.log_softmax(action_logits / self.temperature, dim=-1)
                     if batch_B == 1:
-                        log_probs = F.log_softmax(action_logits, dim=-1)[0, actions].unsqueeze(0)
+                        policy_log_probs_selected = policy_log_probs[0, actions].unsqueeze(0)
                     else:
-                        log_probs = F.log_softmax(action_logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(-1)
+                        policy_log_probs_selected = policy_log_probs.gather(1, actions.unsqueeze(1)).squeeze(-1)
+                    # Use uniform log_prob for exploration, policy log_prob for exploitation
+                    log_probs = torch.where(explore_mask, 
+                                           torch.full((batch_B,), uniform_log_prob, device=device),
+                                           policy_log_probs_selected)
                     
                     # Apply length actions and handle prefix shifting
                     prompt_data, lengths, prefix_tokens, prefix_lengths, attention_mask_offset = self._apply_length_action_with_prefix(
@@ -188,20 +224,35 @@ class LengthPolicyOptimizer:
                         attention_mask_offset, max_prefix_size, pad_id
                     )
                 
-                    # Compute rewards
-                    rewards = alpha * likelihoods - beta * lengths.float()
+                    # Compute rewards with logarithmic length penalty
+                    # Using log(1 + lengths) for logarithmic scaling, more penalizing for longer prompts
+                    rewards = alpha * likelihoods - beta * torch.log1p(lengths.float())
                     
                     # Vectorized best update: only update where reward improved
                     improve_mask = rewards > best_rewards
                     if improve_mask.any():
                         best_rewards = torch.where(improve_mask, rewards, best_rewards)
+                        best_likelihoods = torch.where(improve_mask, likelihoods, best_likelihoods)
                         # Update best prompts for improved items
                         for i in torch.nonzero(improve_mask, as_tuple=False).squeeze(-1).tolist():
                             best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
                     
                     episode_rewards.append(rewards)
+                    episode_likelihoods.append(likelihoods)
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
+                    episode_action_probs.append(action_probs)  # Store for entropy
+                    
+                    # Store step-level trace for plotting
+                    global_step = episode * steps_per_episode + step
+                    traces.append({
+                        'episode': episode,
+                        'step': global_step,  # Global step across all episodes
+                        'rewards': [float(r) for r in rewards],
+                        'likelihoods': [float(l) for l in likelihoods],
+                        'best_likelihoods': [float(l) for l in best_likelihoods],
+                        'lengths': [int(l) for l in lengths]
+                    })
                 
                 # Policy update (REINFORCE)
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
@@ -217,17 +268,20 @@ class LengthPolicyOptimizer:
                 # Normalize returns
                 returns = (returns - returns.mean()) / (returns.std() + 1e-8)
                 
-                # Policy loss
-                policy_loss = -(log_probs_tensor * returns.detach()).mean()
+                # Compute entropy bonus (encourages exploration)
+                action_probs_tensor = torch.stack(episode_action_probs)  # [T, batch_B, 3]
+                # Entropy: -sum(p * log(p)) for each action distribution
+                entropy = -(action_probs_tensor * torch.log(action_probs_tensor + 1e-8)).sum(dim=-1)  # [T, batch_B]
+                entropy_bonus = entropy.mean() * self.entropy_coef
+                
+                # Policy loss with entropy bonus
+                policy_loss = -(log_probs_tensor * returns.detach()).mean() - entropy_bonus
                 self.policy_optimizer.zero_grad()
                 policy_loss.backward()
                 self.policy_optimizer.step()
                 
-                traces.append({
-                    'episode': episode,
-                    'rewards': [float(r) for r in rewards_tensor[-1]],
-                    'lengths': [int(l) for l in lengths]
-                })
+                # Decay epsilon after each episode
+                self.current_epsilon = max(self.epsilon_min, self.current_epsilon * self.epsilon_decay)
             
             # Convert best prompts to tokens using optimizer's to_tokens method
             # This is mode-agnostic - each optimizer handles its own conversion
@@ -304,7 +358,8 @@ class LengthPolicyOptimizer:
             # Accumulate results from this batch
             all_final_prompts.extend(batch_final_prompts)
             all_rewards.extend([float(r) for r in best_rewards])
-            all_traces.extend(traces)
+            # Extend traces once per prompt in the batch (traces has batch-level data, so we need one copy per prompt)
+            all_traces.extend([traces] * batch_B)
         
         return all_final_prompts, all_rewards, all_traces
 

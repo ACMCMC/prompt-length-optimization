@@ -15,15 +15,20 @@ train:
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 30             # Episodes to train on each prompt
-  steps_per_episode: 150            # Steps per episode (increased for better RL learning)
+  episodes_per_prompt: 3             # Episodes to train on each prompt
+  steps_per_episode: 100            # Steps per episode (increased for better RL learning)
   init_len: 32                       # Initial prompt length in tokens
   
   # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
+  epsilon: 0.3                    # Epsilon for epsilon-greedy exploration (higher = more random exploration)
+  epsilon_decay: 0.998            # Epsilon decay per episode (higher = slower decay, more exploration)
+  epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
+  entropy_coef: 0.05              # Entropy bonus coefficient (encourages diverse action distributions)
+  temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
   alpha: 1.0                         # Likelihood weight
-  beta: 0.2                          # Length penalty (higher = more compression)
+  beta: 5.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
   projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
@@ -37,17 +42,21 @@ train:
   plots_format: pdf                  # png|pdf (default: pdf)
 
   optimization_mode: discrete
-  gcg_top_k: 32
-  gcg_batch_size: 64
-  gcg_steps: 10
-  # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
-  ppo:
-    epochs: 1
-    clip: 0.2
-    gamma: 0.99
-    gae_lambda: 0.95
-    value_coef: 0.5
-    entropy_coef: 0.01
+  
+  # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
+  gcg:
+    top_k: 32
+    batch_size: 64
+    steps: 10
+  
+  # PPO parameters (currently not used - kept for backward compatibility)
+  # ppo:
+  #   epochs: 1
+  #   clip: 0.2
+  #   gamma: 0.99
+  #   gae_lambda: 0.95
+  #   value_coef: 0.5
+  #   entropy_coef: 0.01
 
 eval:
   # Test dataset parameters

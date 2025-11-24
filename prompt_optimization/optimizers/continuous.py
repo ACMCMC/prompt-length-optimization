@@ -78,6 +78,9 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
         This avoids CUDA memory issues from gradient computation.
         """
         max_active_len = lengths.max().item()
+        if max_active_len == 0:
+            return prompt_data, torch.zeros(prompt_data.shape[0], dtype=torch.float32, device=prompt_data.device)
+        
         active_embeds = prompt_data[:, :max_active_len].clone()  # Clone to avoid view issues
         
         # Get baseline likelihoods
@@ -98,11 +101,24 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
                 )
             # Vectorized acceptance: update where test is better
             improve_mask = test_likelihoods > base_likelihoods
-            active_embeds = torch.where(improve_mask.unsqueeze(-1), test_embeds, active_embeds)
+            # Ensure shapes match before torch.where
+            if test_embeds.shape != active_embeds.shape:
+                # Shapes don't match - skip this iteration
+                continue
+            # Ensure improve_mask broadcasts correctly
+            if improve_mask.shape[0] != active_embeds.shape[0]:
+                continue
+            # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
+            improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+            active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
             base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
         
-        # Copy back to prompt_data
-        prompt_data.data[:, :max_active_len] = active_embeds
+        # Copy back to prompt_data (only up to max_active_len)
+        if active_embeds.shape[1] <= prompt_data.shape[1]:
+            prompt_data.data[:, :active_embeds.shape[1]] = active_embeds
+        else:
+            # This shouldn't happen, but handle it gracefully
+            prompt_data.data[:, :max_active_len] = active_embeds[:, :max_active_len]
         
         return prompt_data, base_likelihoods
     

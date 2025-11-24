@@ -63,11 +63,23 @@ class PromptRLAgent:
         if prefix_tokens is None:
             prefix_tokens = torch.empty(B, 0, dtype=torch.long, device=device)
             prefix_lengths = torch.zeros(B, dtype=torch.long, device=device)
-        elif prefix_lengths is None:
-            prefix_lengths = torch.full((B,), prefix_tokens.shape[1], dtype=torch.long, device=device)
+        else:
+            # Ensure batch size matches
+            if prefix_tokens.shape[0] != B:
+                raise ValueError(f"prefix_tokens batch size {prefix_tokens.shape[0]} doesn't match prompt_embeds batch size {B}")
+            if prefix_lengths is None:
+                prefix_lengths = torch.full((B,), prefix_tokens.shape[1], dtype=torch.long, device=device)
+            elif prefix_lengths.shape[0] != B:
+                raise ValueError(f"prefix_lengths batch size {prefix_lengths.shape[0]} doesn't match prompt_embeds batch size {B}")
         
         max_prefix = prefix_tokens.shape[1] if prefix_tokens.numel() > 0 else 0
         max_comp = completion_tokens.shape[1]
+        
+        # Ensure completion_tokens batch size matches
+        if completion_tokens.shape[0] != B:
+            raise ValueError(f"completion_tokens batch size {completion_tokens.shape[0]} doesn't match prompt_embeds batch size {B}")
+        if completion_lengths.shape[0] != B:
+            raise ValueError(f"completion_lengths batch size {completion_lengths.shape[0]} doesn't match prompt_embeds batch size {B}")
         
         # Padding sizes: 32 on left, variable on right
         padding_left = 32
@@ -90,6 +102,10 @@ class PromptRLAgent:
             prefix_embeds = embedding_layer(prefix_tokens)  # [B, max_prefix, D]
             prefix_mask = torch.arange(max_prefix, device=device).unsqueeze(0) < prefix_lengths.unsqueeze(-1)  # [B, max_prefix]
             prefix_mask_expanded = prefix_mask.unsqueeze(-1).expand(-1, -1, D)
+            # Ensure slice size matches prefix_embeds size
+            slice_size = pos_prefix_end - pos_pad_left
+            if slice_size != max_prefix:
+                raise ValueError(f"Prefix slice size {slice_size} doesn't match max_prefix {max_prefix} (pos_pad_left={pos_pad_left}, pos_prefix_end={pos_prefix_end})")
             inputs_embeds[:, pos_pad_left:pos_prefix_end, :] = torch.where(
                 prefix_mask_expanded,
                 prefix_embeds,
@@ -97,12 +113,19 @@ class PromptRLAgent:
             )
         
         # Fill suffix (prompt_embeds)
+        suffix_slice_size = pos_suffix_end - pos_prefix_end
+        if suffix_slice_size != L_suffix:
+            raise ValueError(f"Suffix slice size {suffix_slice_size} doesn't match L_suffix {L_suffix} (pos_prefix_end={pos_prefix_end}, pos_suffix_end={pos_suffix_end})")
         inputs_embeds[:, pos_prefix_end:pos_suffix_end, :] = prompt_embeds
         
         # Fill completion
         comp_embeds = embedding_layer(completion_tokens)  # [B, max_comp, D]
         comp_mask = torch.arange(max_comp, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)  # [B, max_comp]
         comp_mask_expanded = comp_mask.unsqueeze(-1).expand(-1, -1, D)
+        # Ensure slice size matches completion size
+        comp_slice_size = pos_comp_end - pos_suffix_end
+        if comp_slice_size != max_comp:
+            raise ValueError(f"Completion slice size {comp_slice_size} doesn't match max_comp {max_comp} (pos_suffix_end={pos_suffix_end}, pos_comp_end={pos_comp_end})")
         inputs_embeds[:, pos_suffix_end:pos_comp_end, :] = torch.where(
             comp_mask_expanded,
             comp_embeds,

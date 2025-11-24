@@ -32,8 +32,14 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
         self.embedding_layer = agent.model.get_input_embeddings()
         self.D = self.emb_dim
-        self.projection_weight = projection_weight
-        self.distance_metric = distance_metric
+        # Ensure projection_weight is never None
+        if projection_weight is None:
+            projection_weight = 0.1
+        self.projection_weight = float(projection_weight)
+        # Ensure distance_metric is never None
+        if distance_metric is None:
+            distance_metric = 'l2'
+        self.distance_metric = str(distance_metric)
         
         # Pre-compute vocabulary embeddings for efficiency
         with torch.no_grad():
@@ -177,6 +183,9 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         Uses gradient-free random walk with acceptance, considering both objectives.
         """
         max_active_len = lengths.max().item()
+        if max_active_len == 0:
+            return prompt_data, torch.zeros(prompt_data.shape[0], dtype=torch.float32, device=prompt_data.device)
+        
         active_embeds = prompt_data[:, :max_active_len].clone()  # Clone to avoid view issues
         
         # Get baseline likelihoods and per-prompt projection losses
@@ -203,12 +212,20 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             test_objectives = test_likelihoods - self.projection_weight * test_proj_losses
             
             improve_mask = test_objectives > base_objectives
-            active_embeds = torch.where(improve_mask.unsqueeze(-1), test_embeds, active_embeds)
-            base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
-            base_proj_losses = torch.where(improve_mask, test_proj_losses, base_proj_losses)
+            # Ensure shapes match before torch.where
+            if test_embeds.shape == active_embeds.shape:
+                # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
+                improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+                active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
+                base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
+                base_proj_losses = torch.where(improve_mask, test_proj_losses, base_proj_losses)
         
-        # Copy back to prompt_data
-        prompt_data.data[:, :max_active_len] = active_embeds
+        # Copy back to prompt_data (only up to max_active_len)
+        if active_embeds.shape[1] <= prompt_data.shape[1]:
+            prompt_data.data[:, :active_embeds.shape[1]] = active_embeds
+        else:
+            # This shouldn't happen, but handle it gracefully
+            prompt_data.data[:, :max_active_len] = active_embeds[:, :max_active_len]
         
         return prompt_data, base_likelihoods
     
