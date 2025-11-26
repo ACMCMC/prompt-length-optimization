@@ -39,6 +39,31 @@ def _decode_tokens(tokenizer, tokens):
         return str(tokens)
     except Exception:
         return str(tokens)
+
+
+def _compute_likelihood(agent, prompt_tokens, target_text):
+    """Compute log P(target | prompt_tokens) using the agent."""
+    if not target_text or prompt_tokens is None:
+        return 0.0
+    try:
+        completion_tokens_list = agent.tokenizer.encode(target_text, add_special_tokens=False)
+        if len(completion_tokens_list) == 0:
+            return 0.0
+        pad_id = getattr(agent.tokenizer, 'pad_token_id', 0)
+        completion_tokens = torch.tensor([completion_tokens_list], dtype=torch.long, device=agent.device)
+        completion_lengths = torch.tensor([len(completion_tokens_list)], dtype=torch.long, device=agent.device)
+        if isinstance(prompt_tokens, torch.Tensor):
+            toks = prompt_tokens
+            if toks.dim() == 1:
+                toks = toks.unsqueeze(0)
+        else:
+            toks = torch.tensor([prompt_tokens], dtype=torch.long, device=agent.device)
+        embedding_layer = agent.model.get_input_embeddings()
+        prompt_embeds = embedding_layer(toks)  # [1, L, D]
+        ll = agent.get_likelihoods_batch(prompt_embeds, completion_tokens, completion_lengths, requires_grad=False)
+        return float(ll[0].item()) if ll.numel() > 0 else 0.0
+    except Exception:
+        return 0.0
 def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_wandb: bool = None, wandb_project: str = None):
     """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
 
@@ -341,6 +366,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+                # Recompute likelihood directly for reliability
+                recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
+                if recomputed_ll is not None:
+                    final_ll = recomputed_ll
+                    best_ll = max(best_ll, recomputed_ll)
 
                 print(f"PPO metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
@@ -457,6 +487,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+                # Recompute likelihood directly for reliability
+                recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
+                if recomputed_ll is not None:
+                    final_ll = recomputed_ll
+                    best_ll = max(best_ll, recomputed_ll)
 
                 # Print per-prompt episode metrics
                 print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
@@ -531,6 +566,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
+                # Recompute likelihood directly for reliability
+                recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
+                if recomputed_ll is not None:
+                    final_ll = recomputed_ll
+                    best_ll = max(best_ll, recomputed_ll)
 
                 print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
