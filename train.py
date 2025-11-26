@@ -48,6 +48,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     base_episodes = train_cfg.get('episodes_per_prompt', 3)
     base_steps = train_cfg.get('steps_per_episode', 100)
     init_len = train_cfg.get('init_len', 32)
+    max_suffix_len = train_cfg.get('max_suffix_len', 64)
     base_lr_embeddings = train_cfg.get('lr_embeddings', 0.01)
     base_lr_policy = train_cfg.get('lr_policy', 3e-4)
     alpha = train_cfg.get('alpha', 1.0)
@@ -494,10 +495,10 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         except Exception:
             logger.debug(f"  (could not pretty-print {mode_name} traces)")
     
-    def run_batch_optimization(batch_prompts, mode, batch_idx):
-        """Run batch optimization for a given mode. Returns (results, rewards, traces, policy_metrics)."""
+    def run_batch_optimization(batch_prompts, mode, batch_idx, episode_idx, num_batches):
+        """Run batch optimization for a given mode and episode. Returns (results, rewards, traces, policy_metrics)."""
         targets = [p.get('target', '') for p in batch_prompts]
-        logger.debug(f"Running batched {mode} optimizer on batch size={len(batch_prompts)}")
+        logger.debug(f"Running batched {mode} optimizer on batch size={len(batch_prompts)}, episode {episode_idx+1}")
         
         # Create wandb logging function if wandb is initialized
         wandb_log_fn = None
@@ -510,16 +511,20 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             wandb_log_fn = log_to_wandb
             logger.info(f"Wandb logging enabled for batch optimization")
         
-        # Compute global step offset for this batch to ensure monotonic step numbers
-        # Each batch has episodes_per_prompt episodes, each with steps_per_episode steps
-        global_step_offset = batch_idx * episodes_per_prompt * steps_per_episode
+        # Compute global step offset for this batch and episode to ensure monotonic step numbers
+        # Structure: Episode 0 (all batches), then Episode 1 (all batches), etc.
+        # Formula: episode * num_batches * steps_per_episode + batch_idx * steps_per_episode
+        global_step_offset = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
         
+        # Run only ONE episode for this batch (we cycle through episodes in the outer loop)
         best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
             target_completions=targets,
-            episodes=episodes_per_prompt,
+            episodes=1,  # Only one episode per call
             steps_per_episode=steps_per_episode,
             initial_prompt_length=init_len,
             lr_embeddings=lr_embeddings,
+            max_suffix_len=max_suffix_len,
+            init_len=init_len,
             alpha=alpha,
             beta=beta,
             mode=mode,
@@ -540,124 +545,140 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     if 'ppo' in optimization_mode_lower:
         mode_map['ppo'] = 'continuous'
     
-    # Process prompts in batches for better progress tracking
-    for batch_start in range(0, len(prompts), batch_size):
-        batch_end = min(batch_start + batch_size, len(prompts))
-        batch_prompts = prompts[batch_start:batch_end]
+    # Calculate number of batches
+    num_batches = (len(prompts) - 1) // batch_size + 1
+    
+    # NEW STRUCTURE: Cycle through episodes, processing all batches per episode
+    # This provides more diverse experience per policy update
+    # Episode 0: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
+    # Episode 1: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
+    # etc.
+    for episode_idx in range(episodes_per_prompt):
+        print(f"\n{'='*60}")
+        print(f"EPISODE {episode_idx + 1}/{episodes_per_prompt}")
+        print(f"{'='*60}")
         
-        print(f"\n[Batch {batch_start//batch_size + 1}/{(len(prompts)-1)//batch_size + 1}] Processing prompts {batch_start+1}-{batch_end}")
-        
-        batch_start_time = time.time()
-        
-        # Determine which mode to use
-        opt_mode = optimization_mode_lower
-        if opt_mode in mode_map:
-            # Run batch optimization with the mapped mode
-            mode = mode_map[opt_mode]
+        # Process all batches for this episode
+        for batch_start in range(0, len(prompts), batch_size):
+            batch_end = min(batch_start + batch_size, len(prompts))
+            batch_prompts = prompts[batch_start:batch_end]
             batch_idx = batch_start // batch_size
-            best_results, best_rewards_batch, traces, policy_metrics = run_batch_optimization(batch_prompts, mode, batch_idx)
             
-            # Log traces
-            log_traces(traces, mode)
+            print(f"\n[Episode {episode_idx+1}/{episodes_per_prompt}, Batch {batch_idx+1}/{num_batches}] Processing prompts {batch_start+1}-{batch_end}")
             
-            # Save policy training metrics
-            try:
-                with open(policy_metrics_path, 'a', newline='') as fh:
-                    writer = csv.writer(fh)
-                    for pm in policy_metrics:
-                        writer.writerow([
-                            datetime.utcnow().isoformat(),
-                            pm.get('batch_idx', batch_start // batch_size),
-                            pm.get('episode', 0),
-                            pm.get('avg_reward', 0.0),
-                            pm.get('avg_return', 0.0),
-                            pm.get('avg_advantage', 0.0),
-                            pm.get('policy_loss', 0.0),
-                            pm.get('value_loss', 0.0),
-                            pm.get('entropy', 0.0),
-                            pm.get('epsilon', 0.0)
-                        ])
+            batch_start_time = time.time()
+            
+            # Determine which mode to use
+            opt_mode = optimization_mode_lower
+            if opt_mode in mode_map:
+                # Run batch optimization with the mapped mode (only 1 episode)
+                mode = mode_map[opt_mode]
+                best_results, best_rewards_batch, traces, policy_metrics = run_batch_optimization(
+                    batch_prompts, mode, batch_idx, episode_idx, num_batches
+                )
                 
-                # Log policy metrics to wandb
-                if wandb_initialized and policy_metrics:
-                    for pm in policy_metrics:
-                        log_dict = {
-                            'policy/avg_reward': pm.get('avg_reward', 0.0),
-                            'policy/avg_return': pm.get('avg_return', 0.0),
-                            'policy/policy_loss': pm.get('policy_loss', 0.0),
-                            'policy/entropy': pm.get('entropy', 0.0),
-                            'policy/epsilon': pm.get('epsilon', 0.0),
-                            'batch': pm.get('batch_idx', batch_start // batch_size),
-                            'episode': pm.get('episode', 0)
-                        }
-                        if pm.get('avg_advantage', 0.0) != 0.0:  # PPO only
-                            log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
-                            log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
-                        # Use same global step calculation as step-level metrics for consistency
-                        batch_idx_for_step = pm.get('batch_idx', batch_start // batch_size)
-                        episode_for_step = pm.get('episode', 0)
-                        policy_step = batch_idx_for_step * episodes_per_prompt * steps_per_episode + episode_for_step * steps_per_episode
-                        wandb.log(log_dict, step=policy_step, commit=True)
+                # Log traces
+                log_traces(traces, mode)
                 
-                # Log policy metrics summary to console
-                if policy_metrics:
-                    latest = policy_metrics[-1]
-                    logger.info(
-                        f"Policy metrics (Episode {latest.get('episode', 0)+1}, Batch {batch_start//batch_size + 1}): "
-                        f"avg_reward={latest.get('avg_reward', 0.0):.3f}, "
-                        f"policy_loss={latest.get('policy_loss', 0.0):.4f}, "
-                        f"entropy={latest.get('entropy', 0.0):.4f}, "
-                        f"epsilon={latest.get('epsilon', 0.0):.3f}"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to save policy metrics: {e}")
-            
-            # Log batch-level summary to wandb
-            if wandb_initialized and best_rewards_batch:
-                batch_avg_reward = np.mean(best_rewards_batch)
-                batch_max_reward = np.max(best_rewards_batch)
-                batch_min_reward = np.min(best_rewards_batch)
+                # Save policy training metrics
                 try:
-                    # Use same global step calculation for consistency
-                    batch_idx_for_step = batch_start // batch_size
-                    batch_step = batch_idx_for_step * episodes_per_prompt * steps_per_episode
-                    wandb.log({
-                        'batch/avg_reward': batch_avg_reward,
-                        'batch/max_reward': batch_max_reward,
-                        'batch/min_reward': batch_min_reward,
-                        'batch/prompts_processed': len(best_rewards_batch),
-                        'batch/batch_idx': batch_idx_for_step
-                    }, step=batch_step, commit=True)
+                    with open(policy_metrics_path, 'a', newline='') as fh:
+                        writer = csv.writer(fh)
+                        for pm in policy_metrics:
+                            writer.writerow([
+                                datetime.utcnow().isoformat(),
+                                pm.get('batch_idx', batch_idx),
+                                pm.get('episode', episode_idx),
+                                pm.get('avg_reward', 0.0),
+                                pm.get('avg_return', 0.0),
+                                pm.get('avg_advantage', 0.0),
+                                pm.get('policy_loss', 0.0),
+                                pm.get('value_loss', 0.0),
+                                pm.get('entropy', 0.0),
+                                pm.get('epsilon', 0.0)
+                            ])
+                    
+                    # Log policy metrics to wandb
+                    if wandb_initialized and policy_metrics:
+                        for pm in policy_metrics:
+                            log_dict = {
+                                'policy/avg_reward': pm.get('avg_reward', 0.0),
+                                'policy/avg_return': pm.get('avg_return', 0.0),
+                                'policy/policy_loss': pm.get('policy_loss', 0.0),
+                                'policy/entropy': pm.get('entropy', 0.0),
+                                'policy/epsilon': pm.get('epsilon', 0.0),
+                                'batch': pm.get('batch_idx', batch_idx),
+                                'episode': pm.get('episode', episode_idx)
+                            }
+                            if pm.get('avg_advantage', 0.0) != 0.0:  # PPO only
+                                log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
+                                log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
+                            # Use same global step calculation as step-level metrics for consistency
+                            batch_idx_for_step = pm.get('batch_idx', batch_idx)
+                            episode_for_step = pm.get('episode', episode_idx)
+                            policy_step = episode_for_step * num_batches * steps_per_episode + batch_idx_for_step * steps_per_episode
+                            wandb.log(log_dict, step=policy_step, commit=True)
+                    
+                    # Log policy metrics summary to console
+                    if policy_metrics:
+                        latest = policy_metrics[-1]
+                        logger.info(
+                            f"Policy metrics (Episode {episode_idx+1}, Batch {batch_idx+1}): "
+                            f"avg_reward={latest.get('avg_reward', 0.0):.3f}, "
+                            f"policy_loss={latest.get('policy_loss', 0.0):.4f}, "
+                            f"entropy={latest.get('entropy', 0.0):.4f}, "
+                            f"epsilon={latest.get('epsilon', 0.0):.3f}"
+                        )
                 except Exception as e:
-                    logger.warning(f"Failed to log batch metrics to wandb: {e}")
+                    logger.warning(f"Failed to save policy metrics: {e}")
+                
+                # Log batch-level summary to wandb
+                if wandb_initialized and best_rewards_batch:
+                    batch_avg_reward = np.mean(best_rewards_batch)
+                    batch_max_reward = np.max(best_rewards_batch)
+                    batch_min_reward = np.min(best_rewards_batch)
+                    try:
+                        # Use same global step calculation for consistency
+                        batch_step = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
+                        wandb.log({
+                            'batch/avg_reward': batch_avg_reward,
+                            'batch/max_reward': batch_max_reward,
+                            'batch/min_reward': batch_min_reward,
+                            'batch/prompts_processed': len(best_rewards_batch),
+                            'batch/batch_idx': batch_idx,
+                            'batch/episode': episode_idx
+                        }, step=batch_step, commit=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to log batch metrics to wandb: {e}")
+                
+                # Process results
+                process_batch_results(
+                    best_results, best_rewards_batch, traces, batch_prompts,
+                    batch_start, batch_size, metrics_path, episodes_per_prompt
+                )
+            else:
+                # Unknown mode - log error and skip batch
+                logger.error(
+                    f"Unknown optimization mode: '{optimization_mode}'. "
+                    f"Supported modes: {list(mode_map.keys())}. Skipping batch."
+                )
+                # Add placeholder rewards to maintain indexing
+                for _ in batch_prompts:
+                    all_rewards.append(float('-inf'))
             
-            # Process results
-            process_batch_results(
-                best_results, best_rewards_batch, traces, batch_prompts,
-                batch_start, batch_size, metrics_path, episodes_per_prompt
-            )
-        else:
-            # Unknown mode - log error and skip batch
-            logger.error(
-                f"Unknown optimization mode: '{optimization_mode}'. "
-                f"Supported modes: {list(mode_map.keys())}. Skipping batch."
-            )
-            # Add placeholder rewards to maintain indexing
-            for _ in batch_prompts:
-                all_rewards.append(float('-inf'))
-        
-        batch_time = time.time() - batch_start_time
-        avg_time_per_prompt = batch_time / len(batch_prompts)
-        
-        print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
-        print(f"  Best batch reward: {max(all_rewards[-len(batch_prompts):]) if all_rewards else 'N/A'}")
-        print(f"  Overall best so far: {best_overall_reward:.3f}")
-        
-        # Progress estimate
-        completed = len(all_rewards)
-        remaining = len(prompts) - completed
-        estimated_time_left = remaining * avg_time_per_prompt
-        print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
+            batch_time = time.time() - batch_start_time
+            avg_time_per_prompt = batch_time / len(batch_prompts)
+            
+            print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
+            if best_rewards_batch:
+                print(f"  Best batch reward: {max(best_rewards_batch):.3f}")
+            print(f"  Overall best so far: {best_overall_reward:.3f}")
+            
+            # Progress estimate
+            completed = len(all_rewards)
+            remaining = len(prompts) - completed
+            estimated_time_left = remaining * avg_time_per_prompt
+            print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
     
     training_time = time.time() - start_time
     

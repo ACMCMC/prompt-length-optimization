@@ -78,8 +78,8 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
         ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2, marker='o', markersize=8)
         ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2, marker='s', markersize=8)
     else:
-        ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
-        ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
+    ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
+    ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
     ax1.set_ylabel('Log Likelihood', fontsize=11)
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
@@ -90,7 +90,7 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
         if len(steps) <= 3:
             ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2, marker='o', markersize=8)
         else:
-            ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2)
+        ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2)
         ax2.set_ylabel('Prompt Length (tokens)', fontsize=11)
         ax2.legend(loc='best')
         ax2.grid(True, alpha=0.3)
@@ -102,8 +102,8 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
             ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2, marker='o', markersize=8)
             ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2, marker='s', markersize=8)
         else:
-            ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2)
-            ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2)
+        ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2)
+        ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2)
         ax3.set_xlabel('Step', fontsize=11)
         ax3.set_ylabel(f'Reward (α={alpha}, β={beta})', fontsize=11)
         ax3.legend(loc='best')

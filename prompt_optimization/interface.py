@@ -11,18 +11,22 @@ class BasePromptOptimizer(ABC):
     """Abstract base class for prompt optimization methods."""
     
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int, 
-                 batch_size: int, lr_embeddings: float):
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int = 64, init_len: int = 32):
         """
         Args:
             agent: PromptRLAgent instance
             initial_prompt_length: Starting length for prompts
-            max_prompt_len: Maximum allowed prompt length
+            max_prompt_len: Maximum allowed prompt length (for suffix, should equal max_suffix_len)
             batch_size: Number of prompts to optimize in parallel
             lr_embeddings: Learning rate for embedding optimization (if applicable)
+            max_suffix_len: Maximum suffix length from config (fixed size for batched suffix embeddings)
+            init_len: Initial number of suffix positions with attention mask = 1 from config
         """
         self.agent = agent
         self.initial_prompt_length = initial_prompt_length
         self.max_prompt_len = max_prompt_len
+        self.max_suffix_len = max_suffix_len
+        self.init_len = init_len
         self.batch_size = batch_size
         self.lr_embeddings = lr_embeddings
         self.device = agent.device

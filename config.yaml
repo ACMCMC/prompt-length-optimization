@@ -17,7 +17,8 @@ train:
   # Training parameters per prompt
   episodes_per_prompt: 3             # Episodes to train on each prompt
   steps_per_episode: 100            # Steps per episode (increased for better RL learning)
-  init_len: 32                       # Initial prompt length in tokens
+  init_len: 32                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 64                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
@@ -70,7 +71,8 @@ eval:
   max_prompt_length: 150             # Max test prompt length
   
   # Evaluation parameters
-  init_len: 32                       # Initial prompt length
+  init_len: 32                       # Initial prompt length (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 64                 # Maximum suffix length (fixed size for batched suffix embeddings)
   max_policy_steps: 150               # Max policy steps per prompt
   opt_steps: 15                      # Optimization steps (fewer for dataset eval)
   log_every_opt: 1                 # Reduce logging

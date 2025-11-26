@@ -36,20 +36,24 @@ class PromptRLAgent:
     def get_likelihoods_batch(self, prompt_embeds: torch.Tensor, completion_tokens: torch.Tensor, 
                              completion_lengths: torch.Tensor, requires_grad: bool = False,
                              prefix_tokens: torch.Tensor = None, prefix_lengths: torch.Tensor = None,
-                             attention_mask: torch.Tensor = None) -> torch.Tensor:
+                             attention_mask: torch.Tensor = None, suffix_attention_mask: torch.Tensor = None,
+                             max_suffix_len: int = 64, init_len: int = 32) -> torch.Tensor:
         """
         Batched likelihood computation with prefix + suffix structure.
         
-        Structure: [padding_left] + [prefix] + [suffix] + [completion] + [padding_right]
+        Structure: [prefix (max_len, padded left)] + [suffix (max_suffix_len, all BOS)] + [completion (max_len, padded right)]
         
         Args:
-            prompt_embeds: Suffix embeddings [B, L_suffix, D]
+            prompt_embeds: Suffix embeddings [B, max_suffix_len, D] (fixed size, all positions initialized to BOS)
             completion_tokens: Completion tokens [B, max_comp]
             completion_lengths: Actual completion lengths [B]
             prefix_tokens: Prefix tokens [B, max_prefix] (optional, defaults to empty)
             prefix_lengths: Actual prefix lengths [B] (optional)
             attention_mask: Attention mask [B, max_seq] (optional, auto-generated if None)
+            suffix_attention_mask: Suffix attention mask [B, max_suffix_len] (optional, auto-generated if None)
             requires_grad: Whether to enable gradients
+            max_suffix_len: Maximum suffix length from config (default: 64)
+            init_len: Initial number of suffix positions with attention mask = 1 from config (default: 32)
         """
         B, L_suffix, D = prompt_embeds.shape
         device = self.device
@@ -58,6 +62,10 @@ class PromptRLAgent:
         pad_embed = embedding_layer.weight[pad_id] if pad_id is not None else torch.zeros(D, device=device)
         if not requires_grad:
             pad_embed = pad_embed.detach()
+        
+        # Validate suffix size matches config
+        if L_suffix != max_suffix_len:
+            raise ValueError(f"Suffix size must be {max_suffix_len} (from config), got {L_suffix}")
         
         # Handle prefix: default to empty
         if prefix_tokens is None:
@@ -81,73 +89,74 @@ class PromptRLAgent:
         if completion_lengths.shape[0] != B:
             raise ValueError(f"completion_lengths batch size {completion_lengths.shape[0]} doesn't match prompt_embeds batch size {B}")
         
-        # Padding sizes: 32 on left, variable on right
-        padding_left = 32
-        padding_right = max(32, max_comp)  # At least 32, or max completion length
+        # max_len is the maximum of prefix and completion sizes (tokenizer will pad to this)
+        max_len = max(max_prefix, max_comp) if (max_prefix > 0 or max_comp > 0) else max_suffix_len
         
-        # Build full sequence structure
-        max_seq = padding_left + max_prefix + L_suffix + max_comp + padding_right
+        # ===== CONSTRUCT THREE SEPARATE TENSORS =====
         
-        # Initialize with padding
-        inputs_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_seq, 1).to(device)
+        # 1. Prefix: [B, max_len, D] (tokenizer handles left padding)
+        prefix_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_len, 1).to(device)
+        prefix_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
         
-        # Position offsets
-        pos_pad_left = padding_left
-        pos_prefix_end = pos_pad_left + max_prefix
-        pos_suffix_end = pos_prefix_end + L_suffix
-        pos_comp_end = pos_suffix_end + max_comp
-        
-        # Fill prefix (if exists)
         if max_prefix > 0:
-            prefix_embeds = embedding_layer(prefix_tokens)  # [B, max_prefix, D]
-            prefix_mask = torch.arange(max_prefix, device=device).unsqueeze(0) < prefix_lengths.unsqueeze(-1)  # [B, max_prefix]
-            prefix_mask_expanded = prefix_mask.unsqueeze(-1).expand(-1, -1, D)
-            # Ensure slice size matches prefix_embeds size
-            slice_size = pos_prefix_end - pos_pad_left
-            if slice_size != max_prefix:
-                raise ValueError(f"Prefix slice size {slice_size} doesn't match max_prefix {max_prefix} (pos_pad_left={pos_pad_left}, pos_prefix_end={pos_prefix_end})")
-            inputs_embeds[:, pos_pad_left:pos_prefix_end, :] = torch.where(
-                prefix_mask_expanded,
-                prefix_embeds,
-                pad_embed.unsqueeze(0).unsqueeze(0).expand(B, max_prefix, -1)
-            )
-        
-        # Fill suffix (prompt_embeds)
-        suffix_slice_size = pos_suffix_end - pos_prefix_end
-        if suffix_slice_size != L_suffix:
-            raise ValueError(f"Suffix slice size {suffix_slice_size} doesn't match L_suffix {L_suffix} (pos_prefix_end={pos_prefix_end}, pos_suffix_end={pos_suffix_end})")
-        inputs_embeds[:, pos_prefix_end:pos_suffix_end, :] = prompt_embeds
-        
-        # Fill completion
-        comp_embeds = embedding_layer(completion_tokens)  # [B, max_comp, D]
-        comp_mask = torch.arange(max_comp, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)  # [B, max_comp]
-        comp_mask_expanded = comp_mask.unsqueeze(-1).expand(-1, -1, D)
-        # Ensure slice size matches completion size
-        comp_slice_size = pos_comp_end - pos_suffix_end
-        if comp_slice_size != max_comp:
-            raise ValueError(f"Completion slice size {comp_slice_size} doesn't match max_comp {max_comp} (pos_suffix_end={pos_suffix_end}, pos_comp_end={pos_comp_end})")
-        inputs_embeds[:, pos_suffix_end:pos_comp_end, :] = torch.where(
-            comp_mask_expanded,
-            comp_embeds,
-            pad_embed.unsqueeze(0).unsqueeze(0).expand(B, max_comp, -1)
-        )
-        
-        # Build attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.zeros(B, max_seq, dtype=torch.long, device=device)
-            # Mask: 1 for valid tokens, 0 for padding
+            # Pad prefix tokens to max_len (left padding)
+            padded_prefix_tokens = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
             for i in range(B):
-                # Left padding: all 0 (masked)
-                # Prefix: 1 for valid prefix tokens
-                prefix_start = pos_pad_left
-                prefix_end = prefix_start + prefix_lengths[i].item()
-                attention_mask[i, prefix_start:prefix_end] = 1
-                # Suffix: all 1 (all valid)
-                attention_mask[i, pos_prefix_end:pos_suffix_end] = 1
-                # Completion: 1 for valid completion tokens
-                comp_start = pos_suffix_end
-                comp_end = comp_start + completion_lengths[i].item()
-                attention_mask[i, comp_start:comp_end] = 1
+                prefix_len = prefix_lengths[i].item()
+                if prefix_len > 0:
+                    # Left padding: pad tokens go on the left, actual tokens on the right
+                    padded_prefix_tokens[i, max_len - prefix_len:] = prefix_tokens[i, :prefix_len]
+                    # Attention mask: 1 for actual tokens (right side), 0 for padding (left side)
+                    prefix_attention_mask[i, max_len - prefix_len:] = 1
+            
+            # Embed padded tokens
+            prefix_embeds = embedding_layer(padded_prefix_tokens)  # [B, max_len, D]
+        else:
+            # No prefix, all padding
+            prefix_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        
+        # 2. Suffix: [B, max_suffix_len, D] (fixed size from config, all positions initialized to BOS, learnable)
+        # prompt_embeds is already [B, max_suffix_len, D] with all BOS
+        suffix_embeds = prompt_embeds  # [B, max_suffix_len, D]
+        suffix_size = max_suffix_len
+        
+        # Suffix attention mask: use provided mask or create default (first init_len positions active)
+        if suffix_attention_mask is not None:
+            suffix_attention_mask_tensor = suffix_attention_mask  # [B, max_suffix_len]
+        else:
+            # Default: first init_len positions active (from YAML config)
+            suffix_attention_mask_tensor = torch.zeros(B, max_suffix_len, dtype=torch.long, device=device)
+            suffix_attention_mask_tensor[:, :init_len] = 1  # First init_len positions enabled
+        
+        # 3. Completion: [B, max_len, D] (tokenizer handles right padding)
+        completion_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_len, 1).to(device)
+        completion_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        
+        if max_comp > 0:
+            # Pad completion tokens to max_len (right padding)
+            padded_completion_tokens = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+            for i in range(B):
+                comp_len = completion_lengths[i].item()
+                if comp_len > 0:
+                    # Right padding: actual tokens go on the left, pad tokens on the right
+                    padded_completion_tokens[i, :comp_len] = completion_tokens[i, :comp_len]
+                    # Attention mask: 1 for actual tokens (left side), 0 for padding (right side)
+                    completion_attention_mask[i, :comp_len] = 1
+            
+            # Embed padded tokens
+            completion_embeds = embedding_layer(padded_completion_tokens)  # [B, max_len, D]
+        else:
+            # No completion, all padding
+            completion_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        
+        # ===== CONCATENATE ALL THREE TENSORS =====
+        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, completion_embeds], dim=1)  # [B, prefix_size + suffix_size + completion_size, D]
+        attention_mask = torch.cat([prefix_attention_mask, suffix_attention_mask_tensor, completion_attention_mask], dim=1)  # [B, prefix_size + suffix_size + completion_size]
+        
+        # Position offsets for likelihood computation
+        pos_prefix_end = max_len
+        pos_suffix_end = pos_prefix_end + suffix_size  # max_len + 64
+        pos_comp_end = pos_suffix_end + max_len  # max_len + 64 + max_len
         
         # Forward pass with attention mask
         context = torch.enable_grad() if requires_grad else torch.no_grad()
@@ -157,24 +166,26 @@ class PromptRLAgent:
             logits = self.model.embed_out(hidden_states)  # [B, max_seq, vocab]
         
         # Vectorized likelihood computation
-        max_comp = completion_lengths.max().item()
-        if max_comp == 0:
+        max_comp_actual = completion_lengths.max().item()
+        if max_comp_actual == 0:
             return torch.zeros(B, dtype=torch.float32, device=device, requires_grad=requires_grad)
         
         # Extract logits for completion positions (before each completion token)
-        comp_logits = logits[:, pos_suffix_end-1:pos_suffix_end-1+max_comp, :]  # [B, max_comp, vocab]
+        # We need to extract logits at positions corresponding to actual completion tokens
+        # Completion starts at pos_suffix_end, so we extract from pos_suffix_end-1 to pos_suffix_end-1+max_comp_actual
+        comp_logits = logits[:, pos_suffix_end-1:pos_suffix_end-1+max_comp_actual, :]  # [B, max_comp_actual, vocab]
         
-        # Extract completion tokens
-        comp_tokens = completion_tokens[:, :max_comp]
+        # Extract completion tokens (only actual tokens, not padded)
+        comp_tokens = completion_tokens[:, :max_comp_actual]
         
         # Compute log probabilities
         log_probs = F.log_softmax(comp_logits, dim=-1)
         
         # Gather token log probs
-        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)  # [B, max_comp]
+        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)  # [B, max_comp_actual]
         
         # Mask invalid positions
-        comp_mask = torch.arange(max_comp, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)
+        comp_mask = torch.arange(max_comp_actual, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)
         masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
         
         # Sum over completion length

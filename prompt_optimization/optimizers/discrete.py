@@ -15,8 +15,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     """
     
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
-                 batch_size: int, lr_embeddings: float):
-        super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int = 64, init_len: int = 32):
+        super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings, max_suffix_len, init_len)
         self.embedding_layer = agent.model.get_input_embeddings()
         
         # Initialize with BOS tokens
@@ -44,7 +44,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         prompt_embeds = self.embedding_layer(active_tokens)
         return self.agent.get_likelihoods_batch(
             prompt_embeds, completion_tokens, completion_lengths, requires_grad=requires_grad,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
+            max_suffix_len=self.max_suffix_len, init_len=self.init_len
         )
     
     def apply_length_action(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
@@ -83,7 +84,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         prompt_embeds = self.embedding_layer(active_tokens)
         likelihoods = self.agent.get_likelihoods_batch(
             prompt_embeds, completion_tokens, completion_lengths, requires_grad=False,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
+            max_suffix_len=self.max_suffix_len, init_len=self.init_len
         )
         
         # Minimal optimization: only every 3rd step, limited items
@@ -104,7 +106,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                             test_embeds, completion_tokens[i:i+1], 
                             completion_lengths[i:i+1], requires_grad=False,
                             prefix_tokens=prefix_tokens[i:i+1] if prefix_tokens is not None else None,
-                            prefix_lengths=prefix_lengths[i:i+1] if prefix_lengths is not None else None
+                            prefix_lengths=prefix_lengths[i:i+1] if prefix_lengths is not None else None,
+                            max_suffix_len=self.max_suffix_len, init_len=self.init_len
                         )[0]
                         if test_ll.item() > best_ll:
                             best_ll = test_ll.item()

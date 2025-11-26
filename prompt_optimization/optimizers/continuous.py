@@ -12,19 +12,20 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
     """Optimizes prompts in continuous embedding space, then projects to tokens."""
     
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
-                 batch_size: int, lr_embeddings: float):
-        super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int = 64, init_len: int = 32):
+        super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings, max_suffix_len, init_len)
         self.embedding_layer = agent.model.get_input_embeddings()
         self.D = self.emb_dim
         
         # Get BOS token embedding for initialization
         bos_token_id = agent.tokenizer.bos_token_id if agent.tokenizer.bos_token_id is not None else agent.tokenizer.eos_token_id
         with torch.no_grad():
-            bos_embed = self.embedding_layer(torch.tensor([bos_token_id], device=self.device)).squeeze(0)
+            self.bos_embed = self.embedding_layer(torch.tensor([bos_token_id], device=self.device)).squeeze(0)
         
         # Initialize prompt embeddings as learnable parameters (all BOS)
+        # Suffix size is fixed to max_suffix_len from config
         self.prompt_embeds = nn.Parameter(
-            bos_embed.unsqueeze(0).unsqueeze(0).expand(batch_size, max_prompt_len, -1).clone()
+            self.bos_embed.unsqueeze(0).unsqueeze(0).expand(batch_size, self.max_suffix_len, -1).clone()
         )
         self.prompt_optimizer = optim.Adam([self.prompt_embeds], lr=lr_embeddings)
     
@@ -34,21 +35,28 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
                            dtype=torch.long, device=self.device)
         # Reset embeddings to BOS token embedding
         with torch.no_grad():
-            bos_token_id = self.agent.tokenizer.bos_token_id if self.agent.tokenizer.bos_token_id is not None else self.agent.tokenizer.eos_token_id
-            bos_embed = self.embedding_layer(torch.tensor([bos_token_id], device=self.device)).squeeze(0)
-            self.prompt_embeds.data = bos_embed.unsqueeze(0).unsqueeze(0).expand(self.batch_size, self.max_prompt_len, -1).clone()
+            self.prompt_embeds.data = self.bos_embed.unsqueeze(0).unsqueeze(0).expand(self.batch_size, self.max_suffix_len, -1).clone()
         return self.prompt_embeds, lengths
     
     def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                        completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
                        requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
                        prefix_lengths: torch.Tensor = None) -> torch.Tensor:
-        """Compute likelihoods from embeddings."""
-        max_active_len = lengths.max().item()
-        active_embeds = prompt_data[:, :max_active_len]
+        """Compute likelihoods from embeddings using attention masks for inactive positions."""
+        B, max_len, D = prompt_data.shape
+        
+        # Create attention mask for suffix: 1 for active positions (0 to length[i]), 0 for inactive
+        suffix_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+        for i in range(B):
+            if lengths[i] > 0:
+                suffix_attention_mask[i, :lengths[i]] = 1
+        
+        # Pass full embeddings with attention mask
         return self.agent.get_likelihoods_batch(
-            active_embeds, completion_tokens, completion_lengths, requires_grad=requires_grad,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            prompt_data, completion_tokens, completion_lengths, requires_grad=requires_grad,
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
+            suffix_attention_mask=suffix_attention_mask,
+            max_suffix_len=self.max_suffix_len, init_len=self.init_len
         )
     
     def apply_length_action(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
@@ -56,15 +64,16 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
         """Add/remove tokens by modifying lengths and initializing new positions."""
         # Vectorized length updates: remove (action=0) and add (action=2)
         remove_mask = (actions == 0) & (lengths > 0)
-        add_mask = (actions == 2) & (lengths < self.max_prompt_len)
+        add_mask = (actions == 2) & (lengths < self.max_suffix_len)
         
         updated_lengths = lengths - remove_mask.long() + add_mask.long()
         
-        # Vectorized initialization of new positions
+        # Vectorized initialization of new positions with BOS token embedding
         if add_mask.any():
             add_indices = torch.nonzero(add_mask, as_tuple=False).squeeze(-1)
             add_positions = lengths[add_indices]
-            new_embeds = torch.randn(len(add_indices), self.D, device=self.device) * 0.1
+            # Use BOS token embedding for new tokens (expand to match batch size)
+            new_embeds = self.bos_embed.unsqueeze(0).expand(len(add_indices), -1).clone()
             prompt_data.data[add_indices, add_positions] = new_embeds
         
         return prompt_data, updated_lengths
@@ -74,45 +83,54 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
                                step: int, prefix_tokens: torch.Tensor = None,
                                prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Gradient-free random walk with acceptance.
-        This avoids CUDA memory issues from gradient computation.
+        Gradient descent optimization step to maximize likelihood.
         """
-        max_active_len = lengths.max().item()
-        if max_active_len == 0:
-            return prompt_data, torch.zeros(prompt_data.shape[0], dtype=torch.float32, device=prompt_data.device)
+        # Ensure embeddings require gradients
+        if not prompt_data.requires_grad:
+            prompt_data.requires_grad_(True)
         
-        active_embeds = prompt_data[:, :max_active_len].clone()  # Clone to avoid view issues
+        # Use full embeddings (all positions initialized to BOS)
+        # Attention mask will handle inactive positions
+        B, max_len, D = prompt_data.shape
         
-        # Get baseline likelihoods
+        # Create attention mask for suffix: 1 for active positions, 0 for inactive
+        B, max_len, D = prompt_data.shape
+        suffix_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+        for i in range(B):
+            if lengths[i] > 0:
+                suffix_attention_mask[i, :lengths[i]] = 1
+        
+        # Compute likelihoods with gradients enabled, using full embeddings
+        likelihoods = self.agent.get_likelihoods_batch(
+            prompt_data, completion_tokens, completion_lengths, requires_grad=True,
+            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
+            suffix_attention_mask=suffix_attention_mask,
+            max_suffix_len=self.max_suffix_len, init_len=self.init_len
+        )
+        
+        # Loss: negative likelihood (we want to maximize likelihood = minimize negative likelihood)
+        loss = -likelihoods.mean()
+        
+        # Gradient descent step
+        self.prompt_optimizer.zero_grad()
+        loss.backward()
+        self.prompt_optimizer.step()
+        
+        # Get final likelihoods (detached for return)
         with torch.no_grad():
-            base_likelihoods = self.agent.get_likelihoods_batch(
-                active_embeds, completion_tokens, completion_lengths, requires_grad=False,
-                prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            B, max_len, D = prompt_data.shape
+            suffix_attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+            for i in range(B):
+                if lengths[i] > 0:
+                    suffix_attention_mask[i, :lengths[i]] = 1
+            final_likelihoods = self.agent.get_likelihoods_batch(
+                prompt_data, completion_tokens, completion_lengths, requires_grad=False,
+                prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
+                suffix_attention_mask=suffix_attention_mask,
+                max_suffix_len=self.max_suffix_len, init_len=self.init_len
             )
         
-        # Single random perturbation step (if more steps needed, increase noise magnitude)
-        noise = torch.randn_like(active_embeds) * 0.01
-        test_embeds = active_embeds + noise
-        with torch.no_grad():
-            test_likelihoods = self.agent.get_likelihoods_batch(
-                test_embeds, completion_tokens, completion_lengths, requires_grad=False,
-                prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
-            )
-        # Vectorized acceptance: update where test is better
-        improve_mask = test_likelihoods > base_likelihoods
-        # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
-        improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
-        active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
-        base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
-        
-        # Copy back to prompt_data (only up to max_active_len)
-        if active_embeds.shape[1] <= prompt_data.shape[1]:
-            prompt_data.data[:, :active_embeds.shape[1]] = active_embeds
-        else:
-            # This shouldn't happen, but handle it gracefully
-            prompt_data.data[:, :max_active_len] = active_embeds[:, :max_active_len]
-        
-        return prompt_data, base_likelihoods
+        return prompt_data, final_likelihoods
     
     def to_tokens(self, prompt_data: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """Project embeddings to nearest token IDs (vectorized)."""

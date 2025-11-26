@@ -38,6 +38,7 @@ def evaluate_prompt(cfg, agent, optimizer):
     eval_cfg = cfg['eval']
     test_prompt = eval_cfg['test_prompt']
     init_len = eval_cfg['init_len']
+    max_suffix_len = eval_cfg.get('max_suffix_len', 64)
     max_policy_steps = eval_cfg['max_policy_steps']
     optimization_mode = eval_cfg.get('optimization_mode', cfg.get('train', {}).get('optimization_mode', 'continuous'))
     # Get GCG config from eval or fall back to train config
@@ -59,7 +60,9 @@ def evaluate_prompt(cfg, agent, optimizer):
             lr_embeddings=0.01,
             alpha=cfg.get('train', {}).get('alpha', 1.0),
             beta=cfg.get('train', {}).get('beta', 0.1),
-            mode='continuous' if 'continuous' in opt_mode else 'discrete'
+            mode='continuous' if 'continuous' in opt_mode else 'discrete',
+            max_suffix_len=max_suffix_len,
+            init_len=init_len
         )
         best_prompt = best_prompts_batch[0] if best_prompts_batch else []
         completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
@@ -305,7 +308,9 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous' if 'continuous' in opt_mode else 'discrete'
+                    mode='continuous' if 'continuous' in opt_mode else 'discrete',
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -316,7 +321,9 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous'
+                    mode='continuous',
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -327,7 +334,9 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='discrete'
+                    mode='discrete',
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             else:
                 # fallback: run sequentially

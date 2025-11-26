@@ -30,7 +30,7 @@ class LengthPolicyOptimizer:
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
         # Simple policy network: state -> action probs
-        self.state_dim = 4  # [length, likelihood, step_ratio, improvement]
+        self.state_dim = 2  # [length, likelihood]
         self.policy_net = nn.Sequential(
             nn.Linear(self.state_dim, 64),
             nn.ReLU(),
@@ -181,7 +181,8 @@ class LengthPolicyOptimizer:
                                steps_per_episode: int = 50, initial_prompt_length: int = 32,
                                lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
                                mode: str = "continuous", batch_size: int = 64,
-                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               wandb_log_fn=None, global_step_offset: int = 0,
+                               max_suffix_len: int = 64, init_len: int = 32) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -205,10 +206,11 @@ class LengthPolicyOptimizer:
             completion_tokens_batch, completion_lengths = self._prepare_completions(batch_completions)
             
             # Create optimizer based on mode
-            max_prompt_len = initial_prompt_length * 2  # Allow growth
+            max_prompt_len = max_suffix_len  # Suffix size is fixed to max_suffix_len from config
             if mode == "continuous":
                 optimizer: BasePromptOptimizer = ContinuousPromptOptimizer(
-                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings
+                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
+                    max_suffix_len=max_suffix_len, init_len=init_len
                 )
             elif mode == "continuous_proj":
                 # Continuous with projection regularization
@@ -220,11 +222,13 @@ class LengthPolicyOptimizer:
                     distance_metric = 'l2'  # Default if not set
                 optimizer: BasePromptOptimizer = ContinuousPromptOptimizerWithProjection(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
-                    projection_weight=projection_weight, distance_metric=distance_metric
+                    projection_weight=projection_weight, distance_metric=distance_metric,
+                    max_suffix_len=max_suffix_len, init_len=init_len
                 )
             else:  # discrete
                 optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
-                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings
+                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
+                    max_suffix_len=max_suffix_len, init_len=init_len
                 )
             
             # Initialize prompts (suffix)
@@ -248,6 +252,14 @@ class LengthPolicyOptimizer:
             batch_policy_metrics = []  # Track policy metrics for this batch
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
+                # Reset prompts to initial state at the start of each episode
+                # This ensures episodes are independent from each other
+                prompt_data, lengths = optimizer.initialize_prompts()
+                # Reset prefix tracking (no tokens moved to prefix yet)
+                prefix_tokens.fill_(pad_id)
+                prefix_lengths.zero_()
+                attention_mask_offset.zero_()
+                
                 episode_rewards = []
                 episode_likelihoods = []
                 episode_log_probs = []
@@ -275,13 +287,10 @@ class LengthPolicyOptimizer:
                     )
                     
                     # Compute states for policy (inference only, no gradients)
-                    step_ratio = step / steps_per_episode
                     states = torch.stack([
                         lengths.float() / initial_prompt_length,  # normalized length
                         likelihoods,  # current likelihood
-                        torch.full((batch_B,), step_ratio, device=device),  # step ratio
-                        torch.zeros(batch_B, device=device)  # improvement (simplified)
-                    ], dim=1)  # [batch_B, 4]
+                    ], dim=1)  # [batch_B, 2]
                     
                     # Policy forward pass (INFERENCE ONLY - no gradients, no updates)
                     # Policy network is in eval mode and we're only collecting data
