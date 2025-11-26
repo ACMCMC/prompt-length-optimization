@@ -41,7 +41,7 @@ train:
   no_plots: false
   plots_format: pdf                  # png|pdf (default: pdf)
 
-  optimization_mode: discrete
+  optimization_mode: continuous_proj
   
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:
@@ -49,14 +49,15 @@ train:
     batch_size: 64
     steps: 10
   
-  # PPO parameters (currently not used - kept for backward compatibility)
-  # ppo:
-  #   epochs: 1
-  #   clip: 0.2
-  #   gamma: 0.99
-  #   gae_lambda: 0.95
-  #   value_coef: 0.5
-  #   entropy_coef: 0.01
+  # PPO parameters
+  use_ppo: true                    # Enable PPO (false for REINFORCE)
+  ppo:
+    epochs: 4                      # Number of PPO update epochs per episode
+    clip: 0.2                       # PPO clipping epsilon
+    gamma: 0.99                     # Discount factor
+    gae_lambda: 0.95                # GAE lambda parameter
+    value_coef: 0.5                 # Value loss coefficient
+    entropy_coef: 0.01              # Entropy bonus coefficient (overrides train.entropy_coef if set)
 
 eval:
   # Test dataset parameters
@@ -68,7 +69,7 @@ eval:
   init_len: 32                       # Initial prompt length
   max_policy_steps: 150               # Max policy steps per prompt
   opt_steps: 15                      # Optimization steps (fewer for dataset eval)
-  log_every_opt: 999                 # Reduce logging
+  log_every_opt: 1                 # Reduce logging
   
   # Output
   results_file: results/eval_results.csv

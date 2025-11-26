@@ -196,29 +196,25 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             )
             base_proj_losses = self._compute_projection_loss_per_prompt(active_embeds, lengths)
         
-        # Try small random perturbations (accept if combined objective improves)
-        for _ in range(3):
-            noise = torch.randn_like(active_embeds) * 0.01
-            test_embeds = active_embeds + noise
-            with torch.no_grad():
-                test_likelihoods = self.agent.get_likelihoods_batch(
-                    test_embeds, completion_tokens, completion_lengths, requires_grad=False,
-                    prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
-                )
-                test_proj_losses = self._compute_projection_loss_per_prompt(test_embeds, lengths)
-            
-            # Vectorized acceptance: compute per-prompt objectives and update where better
-            base_objectives = base_likelihoods - self.projection_weight * base_proj_losses
-            test_objectives = test_likelihoods - self.projection_weight * test_proj_losses
-            
-            improve_mask = test_objectives > base_objectives
-            # Ensure shapes match before torch.where
-            if test_embeds.shape == active_embeds.shape:
-                # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
-                improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
-                active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
-                base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
-                base_proj_losses = torch.where(improve_mask, test_proj_losses, base_proj_losses)
+        # Single random perturbation step (if more steps needed, increase noise magnitude)
+        noise = torch.randn_like(active_embeds) * 0.01
+        test_embeds = active_embeds + noise
+        with torch.no_grad():
+            test_likelihoods = self.agent.get_likelihoods_batch(
+                test_embeds, completion_tokens, completion_lengths, requires_grad=False,
+                prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            )
+            test_proj_losses = self._compute_projection_loss_per_prompt(test_embeds, lengths)
+        
+        # Vectorized acceptance: compute per-prompt objectives and update where better
+        base_objectives = base_likelihoods - self.projection_weight * base_proj_losses
+        test_objectives = test_likelihoods - self.projection_weight * test_proj_losses
+        
+        improve_mask = test_objectives > base_objectives
+        # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
+        improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+        active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
+        base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
         
         # Copy back to prompt_data (only up to max_active_len)
         if active_embeds.shape[1] <= prompt_data.shape[1]:
@@ -230,7 +226,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         return prompt_data, base_likelihoods
     
     def to_tokens(self, prompt_data: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """Project embeddings to nearest token IDs (vectorized)."""
+        """Project embeddings to nearest token IDs (vectorized, memory-efficient)."""
         B = prompt_data.shape[0]
         max_len = lengths.max().item()
         
@@ -239,12 +235,27 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         
         # Extract active embeddings only (masked by lengths)
         active_embeds = prompt_data[:, :max_len].detach()  # [B, max_len, D]
+        D = active_embeds.shape[-1]
         
-        # Batched distance computation: [B, max_len, vocab_size]
-        distances = torch.cdist(active_embeds, self.vocab_embeds)
+        # Flatten for memory-efficient batch processing: [B*max_len, D]
+        flat_embeds = active_embeds.view(B * max_len, D)
         
-        # Batched argmin: [B, max_len]
-        tokens = distances.argmin(dim=-1)
+        # Compute distances: [B*max_len, vocab_size]
+        # This is more memory-efficient than [B, max_len, vocab_size]
+        if self.distance_metric == "l2":
+            distances = torch.cdist(flat_embeds, self.vocab_embeds)  # [B*max_len, vocab_size]
+        else:  # dot product
+            flat_embeds_norm = torch.nn.functional.normalize(flat_embeds, p=2, dim=-1)
+            vocab_embeds_norm = torch.nn.functional.normalize(self.vocab_embeds, p=2, dim=-1)
+            similarities = torch.matmul(flat_embeds_norm, vocab_embeds_norm.t())  # [B*max_len, vocab_size]
+            # Convert similarity to distance (negate since we want to minimize distance = maximize similarity)
+            distances = -similarities
+        
+        # Find nearest token: [B*max_len]
+        tokens_flat = distances.argmin(dim=-1)
+        
+        # Reshape back to [B, max_len]
+        tokens = tokens_flat.view(B, max_len)
         
         # Mask invalid positions (beyond actual length)
         length_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < lengths.unsqueeze(-1)

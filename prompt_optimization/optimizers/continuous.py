@@ -90,28 +90,20 @@ class ContinuousPromptOptimizer(BasePromptOptimizer):
                 prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
             )
         
-        # Try small random perturbations (accept if better)
-        for _ in range(3):
-            noise = torch.randn_like(active_embeds) * 0.01
-            test_embeds = active_embeds + noise
-            with torch.no_grad():
-                test_likelihoods = self.agent.get_likelihoods_batch(
-                    test_embeds, completion_tokens, completion_lengths, requires_grad=False,
-                    prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
-                )
-            # Vectorized acceptance: update where test is better
-            improve_mask = test_likelihoods > base_likelihoods
-            # Ensure shapes match before torch.where
-            if test_embeds.shape != active_embeds.shape:
-                # Shapes don't match - skip this iteration
-                continue
-            # Ensure improve_mask broadcasts correctly
-            if improve_mask.shape[0] != active_embeds.shape[0]:
-                continue
-            # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
-            improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
-            active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
-            base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
+        # Single random perturbation step (if more steps needed, increase noise magnitude)
+        noise = torch.randn_like(active_embeds) * 0.01
+        test_embeds = active_embeds + noise
+        with torch.no_grad():
+            test_likelihoods = self.agent.get_likelihoods_batch(
+                test_embeds, completion_tokens, completion_lengths, requires_grad=False,
+                prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+            )
+        # Vectorized acceptance: update where test is better
+        improve_mask = test_likelihoods > base_likelihoods
+        # Broadcast improve_mask to match active_embeds dimensions: [B] -> [B, 1, 1] for [B, L, D]
+        improve_mask_expanded = improve_mask.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
+        active_embeds = torch.where(improve_mask_expanded, test_embeds, active_embeds)
+        base_likelihoods = torch.where(improve_mask, test_likelihoods, base_likelihoods)
         
         # Copy back to prompt_data (only up to max_active_len)
         if active_embeds.shape[1] <= prompt_data.shape[1]:

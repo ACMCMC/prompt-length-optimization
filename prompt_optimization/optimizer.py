@@ -8,6 +8,7 @@ from tqdm import trange
 from typing import List, Tuple, Optional
 import torch.nn as nn
 import torch.optim as optim
+import logging
 from prompt_optimization.agent import PromptRLAgent
 from prompt_optimization.interface import BasePromptOptimizer
 from prompt_optimization.optimizers import (
@@ -16,11 +17,15 @@ from prompt_optimization.optimizers import (
     DiscretePromptOptimizer
 )
 
+logger = logging.getLogger(__name__)
+
 class LengthPolicyOptimizer:
-    """RL optimizer that learns prompt length policy using REINFORCE."""
+    """RL optimizer that learns prompt length policy using REINFORCE or PPO."""
     
     def __init__(self, agent: PromptRLAgent, epsilon: float = 0.1, epsilon_decay: float = 0.995, epsilon_min: float = 0.01,
-                 entropy_coef: float = 0.01, temperature: float = 1.0):
+                 entropy_coef: float = 0.01, temperature: float = 1.0,
+                 use_ppo: bool = False, ppo_clip: float = 0.2, ppo_epochs: int = 4,
+                 ppo_gamma: float = 0.99, ppo_gae_lambda: float = 0.95, ppo_value_coef: float = 0.5):
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
@@ -32,7 +37,24 @@ class LengthPolicyOptimizer:
             nn.Linear(64, 3)  # Actions: 0=remove, 1=keep, 2=add
         ).to(agent.device)
         
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        # Value network for PPO (estimates state values)
+        self.value_net = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)  # Single value output
+        ).to(agent.device)
+        
+        # Use shared optimizer for both networks (PPO) or separate (REINFORCE)
+        self.use_ppo = use_ppo
+        if use_ppo:
+            # Shared optimizer for policy and value networks
+            self.optimizer = optim.Adam(
+                list(self.policy_net.parameters()) + list(self.value_net.parameters()),
+                lr=3e-4
+            )
+        else:
+            # Separate optimizer for policy only (REINFORCE)
+            self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
         
         # Epsilon-greedy exploration parameters
         self.epsilon = epsilon
@@ -45,6 +67,47 @@ class LengthPolicyOptimizer:
         
         # Temperature for softmax (higher = more exploration)
         self.temperature = temperature
+        
+        # PPO-specific parameters
+        self.ppo_clip = ppo_clip
+        self.ppo_epochs = ppo_epochs
+        self.ppo_gamma = ppo_gamma
+        self.ppo_gae_lambda = ppo_gae_lambda
+        self.ppo_value_coef = ppo_value_coef
+    
+    def _compute_gae(self, rewards: torch.Tensor, values: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Generalized Advantage Estimation (GAE).
+        
+        Args:
+            rewards: [T, batch_B] tensor of rewards
+            values: [T, batch_B] tensor of value estimates
+            device: torch device
+            
+        Returns:
+            returns: [T, batch_B] tensor of returns (value targets)
+            advantages: [T, batch_B] tensor of advantages
+        """
+        T, batch_B = rewards.shape
+        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
+        
+        # Compute next values (for terminal state, next_value = 0)
+        next_values = torch.cat([values[1:], torch.zeros(1, batch_B, device=device)], dim=0)
+        
+        # Compute TD errors: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
+        deltas = rewards + self.ppo_gamma * next_values - values
+        
+        # Compute GAE advantages: A_t = δ_t + (γλ) * δ_{t+1} + (γλ)^2 * δ_{t+2} + ...
+        gae = 0.0
+        for t in reversed(range(T)):
+            gae = deltas[t] + self.ppo_gamma * self.ppo_gae_lambda * gae
+            advantages[t] = gae
+        
+        # Returns are advantages + values
+        returns = advantages + values
+        
+        return returns, advantages
     
     def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare completion tokens as batched tensors"""
@@ -173,12 +236,18 @@ class LengthPolicyOptimizer:
                 episode_likelihoods = []
                 episode_log_probs = []
                 episode_states = []
-                episode_action_probs = []  # Store for entropy computation
+                episode_action_probs = []  # Store for entropy
+                episode_actions = []  # Store actions for PPO importance sampling computation
+                
+                logger.info(f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_start//batch_size + 1}, {steps_per_episode} steps")
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
                     # Inner optimization step (e.g., gradient updates, GCG replacements)
                     # Pass prefix info for proper likelihood computation
+                    # Log every 10 steps or at key milestones to avoid spam
+                    if step == 0 or (step + 1) % 10 == 0 or step == steps_per_episode - 1:
+                        logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_start//batch_size + 1})")
                     prompt_data, likelihoods = optimizer.inner_optimization_step(
                         prompt_data, lengths, completion_tokens_batch, completion_lengths, step,
                         prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
@@ -224,9 +293,12 @@ class LengthPolicyOptimizer:
                         attention_mask_offset, max_prefix_size, pad_id
                     )
                 
-                    # Compute rewards with logarithmic length penalty
-                    # Using log(1 + lengths) for logarithmic scaling, more penalizing for longer prompts
-                    rewards = alpha * likelihoods - beta * torch.log1p(lengths.float())
+                    # Compute rewards: both likelihood and length are negative, less negative = better
+                    # Likelihoods are negative (log probabilities): less negative = better (e.g., -50 > -80)
+                    # Lengths are converted to negative: shorter = less negative = better (e.g., -20 > -60)
+                    # Reward = alpha * likelihood - beta * length
+                    # Both terms are negative, so higher (less negative) reward = better performance
+                    rewards = alpha * likelihoods - beta * lengths.float()
                     
                     # Vectorized best update: only update where reward improved
                     improve_mask = rewards > best_rewards
@@ -242,43 +314,117 @@ class LengthPolicyOptimizer:
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
                     episode_action_probs.append(action_probs)  # Store for entropy
+                    episode_actions.append(actions)  # Store actions for PPO
                     
                     # Store step-level trace for plotting
                     global_step = episode * steps_per_episode + step
+                    # Convert to Python floats, handling NaN/Inf
+                    likelihoods_list = []
+                    for l in likelihoods:
+                        l_val = float(l.item()) if torch.is_tensor(l) else float(l)
+                        # Check if value is NaN or Inf, if so set to 0.0
+                        if not (isinstance(l_val, (int, float)) and l_val == l_val and l_val != float('inf') and l_val != float('-inf')):
+                            l_val = 0.0
+                        likelihoods_list.append(l_val)
+                    
+                    best_likelihoods_list = []
+                    for l in best_likelihoods:
+                        l_val = float(l.item()) if torch.is_tensor(l) else float(l)
+                        # Check if value is NaN or Inf, if so set to 0.0
+                        if not (isinstance(l_val, (int, float)) and l_val == l_val and l_val != float('inf') and l_val != float('-inf')):
+                            l_val = 0.0
+                        best_likelihoods_list.append(l_val)
+                    
                     traces.append({
                         'episode': episode,
                         'step': global_step,  # Global step across all episodes
                         'rewards': [float(r) for r in rewards],
-                        'likelihoods': [float(l) for l in likelihoods],
-                        'best_likelihoods': [float(l) for l in best_likelihoods],
+                        'likelihoods': likelihoods_list,
+                        'best_likelihoods': best_likelihoods_list,
                         'lengths': [int(l) for l in lengths]
                     })
                 
-                # Policy update (REINFORCE)
+                # Policy update (REINFORCE or PPO)
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
-                
-                # Compute returns
-                returns = torch.zeros_like(rewards_tensor)
-                next_return = torch.zeros(batch_B, device=device)
-                for t in reversed(range(steps_per_episode)):
-                    next_return = rewards_tensor[t] + 0.99 * next_return
-                    returns[t] = next_return
-                
-                # Normalize returns
-                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-                
-                # Compute entropy bonus (encourages exploration)
+                states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
                 action_probs_tensor = torch.stack(episode_action_probs)  # [T, batch_B, 3]
-                # Entropy: -sum(p * log(p)) for each action distribution
-                entropy = -(action_probs_tensor * torch.log(action_probs_tensor + 1e-8)).sum(dim=-1)  # [T, batch_B]
-                entropy_bonus = entropy.mean() * self.entropy_coef
+                actions_tensor = torch.stack(episode_actions)  # [T, batch_B]
                 
-                # Policy loss with entropy bonus
-                policy_loss = -(log_probs_tensor * returns.detach()).mean() - entropy_bonus
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
+                if self.use_ppo:
+                    # PPO update with multiple epochs
+                    # Compute values for all states (old policy)
+                    with torch.no_grad():
+                        old_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                    
+                    # Compute returns and advantages using GAE
+                    returns, advantages = self._compute_gae(rewards_tensor, old_values, device)
+                    
+                    # Normalize advantages
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    
+                    # Store old log probs for importance sampling ratio
+                    old_log_probs = log_probs_tensor.detach()
+                    
+                    # Multiple PPO epochs
+                    for epoch in range(self.ppo_epochs):
+                        # Recompute log probs and values with current policy
+                        action_logits = self.policy_net(states_tensor)  # [T, batch_B, 3]
+                        new_action_probs = F.softmax(action_logits / self.temperature, dim=-1)
+                        new_log_probs = F.log_softmax(action_logits / self.temperature, dim=-1)
+                        
+                        # Get log probs for the actions that were actually taken
+                        new_log_probs_selected = new_log_probs.gather(2, actions_tensor.unsqueeze(-1)).squeeze(-1)  # [T, batch_B]
+                        
+                        # Compute importance sampling ratio
+                        ratio = torch.exp(new_log_probs_selected - old_log_probs)  # [T, batch_B]
+                        
+                        # Compute clipped policy loss
+                        policy_loss_1 = ratio * advantages
+                        policy_loss_2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages
+                        policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+                        
+                        # Value loss
+                        new_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                        value_loss = F.mse_loss(new_values, returns)
+                        
+                        # Entropy bonus
+                        entropy = -(new_action_probs * torch.log(new_action_probs + 1e-8)).sum(dim=-1).mean()
+                        entropy_bonus = entropy * self.entropy_coef
+                        
+                        # Total loss
+                        total_loss = policy_loss + self.ppo_value_coef * value_loss - entropy_bonus
+                        
+                        # Update
+                        self.optimizer.zero_grad()
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            list(self.policy_net.parameters()) + list(self.value_net.parameters()),
+                            max_norm=0.5
+                        )
+                        self.optimizer.step()
+                else:
+                    # REINFORCE update
+                    # Compute returns
+                    returns = torch.zeros_like(rewards_tensor)
+                    next_return = torch.zeros(batch_B, device=device)
+                    for t in reversed(range(steps_per_episode)):
+                        next_return = rewards_tensor[t] + 0.99 * next_return
+                        returns[t] = next_return
+                    
+                    # Normalize returns
+                    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+                    
+                    # Compute entropy bonus (encourages exploration)
+                    # Entropy: -sum(p * log(p)) for each action distribution
+                    entropy = -(action_probs_tensor * torch.log(action_probs_tensor + 1e-8)).sum(dim=-1)  # [T, batch_B]
+                    entropy_bonus = entropy.mean() * self.entropy_coef
+                    
+                    # Policy loss with entropy bonus
+                    policy_loss = -(log_probs_tensor * returns.detach()).mean() - entropy_bonus
+                    self.policy_optimizer.zero_grad()
+                    policy_loss.backward()
+                    self.policy_optimizer.step()
                 
                 # Decay epsilon after each episode
                 self.current_epsilon = max(self.epsilon_min, self.current_epsilon * self.epsilon_decay)
