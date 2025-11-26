@@ -43,6 +43,22 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
     rl_algo = str(train_cfg.get('rl_algo', 'ppo')).lower()
     use_ppo = rl_algo == 'ppo'
+    one_batch = bool(train_cfg.get('one_batch', False))
+
+    # Optional W&B logging
+    wandb_cfg = cfg.get('wandb', train_cfg.get('wandb', {})) if isinstance(train_cfg, dict) else {}
+    use_wandb = bool(wandb_cfg.get('enable', False))
+    if use_wandb:
+        try:
+            import wandb  # type: ignore
+            wandb.init(
+                project=wandb_cfg.get('project', 'prompt-length-optimization'),
+                name=wandb_cfg.get('run_name', f"{mode_name.lower()}_{dataset_name}_{rl_algo}"),
+                config=cfg
+            )
+        except Exception as e:
+            print(f"Warning: failed to initialize wandb ({e}), disabling wandb logging.")
+            use_wandb = False
     global_reward_cfg = cfg.get('reward', {})
     reward_cfg = train_cfg.get('reward', global_reward_cfg)
 
@@ -216,6 +232,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     for batch_start in range(0, len(prompts), batch_size):
         batch_end = min(batch_start + batch_size, len(prompts))
         batch_prompts = prompts[batch_start:batch_end]
+        batch_summaries = []
         
         print(f"\n[Batch {batch_start//batch_size + 1}/{(len(prompts)-1)//batch_size + 1}] Processing prompts {batch_start+1}-{batch_end}")
         
@@ -291,6 +308,24 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
                 print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
                 print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
+                batch_summaries.append({
+                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
+                    'optimized_full': optimized_text,
+                    'optimized_suffix': optimized_suffix_text,
+                    'target': batch_prompts[prompt_idx].get('target', '')
+                })
+                batch_summaries.append({
+                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
+                    'optimized_full': optimized_text,
+                    'optimized_suffix': optimized_suffix_text,
+                    'target': batch_prompts[prompt_idx].get('target', '')
+                })
+                batch_summaries.append({
+                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
+                    'optimized_full': optimized_text,
+                    'optimized_suffix': optimized_suffix_text,
+                    'target': batch_prompts[prompt_idx].get('target', '')
+                })
 
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                     print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest PPO reward: {best_reward:.3f}")
@@ -552,12 +587,33 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
         print(f"  Best batch reward: {max(all_rewards[-len(batch_prompts):]) if all_rewards else 'N/A'}")
         print(f"  Overall best so far: {best_overall_reward:.3f}")
+        # Print concise per-prompt summary at end of batch
+        for idx, summary in enumerate(batch_summaries):
+            print(f"[Batch summary] Prompt {batch_start + idx + 1}:")
+            print(f"  Input: {summary['input'][:180]}{'...' if len(summary['input']) > 180 else ''}")
+            print(f"  Optimized suffix: {summary['optimized_suffix'][:180]}{'...' if len(summary['optimized_suffix']) > 180 else ''}")
+            print(f"  Target completion: {summary['target'][:180]}{'...' if len(summary['target']) > 180 else ''}")
+        if use_wandb:
+            try:
+                import wandb  # type: ignore
+                wandb.log({
+                    "batch/index": batch_start // batch_size,
+                    "batch/mean_best_reward": float(np.mean(all_rewards[-len(batch_prompts):])) if batch_prompts else 0.0,
+                    "batch/best_reward": float(max(all_rewards[-len(batch_prompts):])) if batch_prompts else 0.0,
+                    "batch/time_sec": batch_time
+                })
+            except Exception as _:
+                print("Warning: failed to log to wandb for this batch.")
         
         # Progress estimate
         completed = len(all_rewards)
         remaining = len(prompts) - completed
         estimated_time_left = remaining * avg_time_per_prompt
         print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
+
+        if one_batch:
+            print("One-batch mode enabled; stopping after first batch.")
+            break
     
     training_time = time.time() - start_time
     
