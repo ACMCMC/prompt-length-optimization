@@ -10,8 +10,8 @@ import random
 import time
 import csv
 from datetime import datetime
-from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
-from dataset_utils import ToxicChatDatasetManager
+from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
+from prompt_optimization.datasets import ToxicChatDatasetManager
 import numpy as np
 
 def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):

@@ -9,9 +9,9 @@ import os
 import yaml
 import random
 import numpy as np
-from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
-from dataset_utils import ToxicChatDatasetManager
-from plot_utils import plot_eval_trace, save_trace_csv
+from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
+from prompt_optimization.datasets import ToxicChatDatasetManager
+from prompt_optimization.plotting import plot_eval_trace, save_trace_csv
 import pandas as pd
 
 def load_trained_model(model_path, reward_cfg=None):
