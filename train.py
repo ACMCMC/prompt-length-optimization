@@ -643,10 +643,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     "batch/time_sec": batch_time
                 })
                 if batch_summaries:
-                    table = wandb.Table(columns=["input", "optimized_suffix", "target", "reward", "length", "likelihood"])
+                    table = wandb.Table(columns=["input", "optimized_full", "optimized_suffix", "target", "reward", "length", "likelihood"])
                     for s in batch_summaries:
                         table.add_data(
                             s.get('input', ''),
+                            s.get('optimized_full', ''),
                             s.get('optimized_suffix', ''),
                             s.get('target', ''),
                             s.get('reward', float('nan')),
@@ -754,6 +755,17 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 
             except Exception as e:
                 print(f"Could not generate plot: {e}")
+        if use_wandb:
+            try:
+                wandb.log({
+                    "final/best_reward": float(best_overall_reward),
+                    "final/avg_reward": float(avg_reward),
+                    "final/std_reward": float(std_reward),
+                    "final/training_time_sec": float(training_time),
+                    "final/num_prompts": len(all_rewards)
+                })
+            except Exception:
+                print("Warning: failed to log final metrics to wandb.")
     
     else:
         print("No successful training results!")
