@@ -327,6 +327,16 @@ class LengthPolicyOptimizer:
                             'policy/episode': episode,
                             'policy/batch_idx': batch_start // batch_size
                         }, step=global_step_offset + episode * steps_per_episode)
+                        # Length histogram per episode for visibility
+                        try:
+                            import wandb as _wandb  # type: ignore
+                            wandb_log_fn({
+                                'episode/length_hist': _wandb.Histogram(lengths.detach().cpu().numpy()),
+                                'episode': episode,
+                                'batch_idx': batch_start // batch_size
+                            }, step=global_step_offset + episode * steps_per_episode)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
             

@@ -23,6 +23,22 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _decode_tokens(tokenizer, tokens):
+    """Decode a token container (tensor/list) to text for logging."""
+    try:
+        if hasattr(tokens, "detach"):
+            tokens = tokens.detach()
+        if hasattr(tokens, "cpu"):
+            tokens = tokens.cpu()
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
+        if isinstance(tokens, list):
+            return tokenizer.decode(tokens, skip_special_tokens=True)
+        return str(tokens)
+    except Exception:
+        return str(tokens)
 def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_wandb: bool = None, wandb_project: str = None):
     """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
 
@@ -203,15 +219,16 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     # Prepare metrics output
     metrics_dir = "results"
     os.makedirs(metrics_dir, exist_ok=True)
-    metrics_path = os.path.join(metrics_dir, "training_metrics.csv")
-    # write header if file doesn't exist
-    if not os.path.exists(metrics_path):
-        with open(metrics_path, 'w', newline='') as fh:
-            writer = csv.writer(fh)
-            writer.writerow([
-                'timestamp', 'batch_idx', 'global_prompt_idx', 'local_prompt_idx',
-                'episode_count', 'final_likelihood', 'best_likelihood', 'best_episode', 'best_reward', 'base_text'
-            ])
+    run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    metrics_path = os.path.join(metrics_dir, f"training_metrics_{run_ts}.csv")
+    # write header
+    with open(metrics_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            'timestamp', 'batch_idx', 'global_prompt_idx', 'local_prompt_idx',
+            'episode_count', 'final_likelihood', 'best_likelihood', 'best_episode',
+            'best_reward', 'best_length', 'base_text'
+        ])
 
     # Shared helper to extract per-prompt final and best likelihood from batched traces
     def _extract_metrics_from_traces(traces_list, idx):
@@ -285,6 +302,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         if 'ppo' in opt_mode:
             # PPO removed, use standard continuous mode
             targets = [p.get('target', '') for p in batch_prompts]
+            wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -300,7 +318,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 gamma=ppo_gamma,
                 gae_lambda=ppo_lambda,
                 value_coef=ppo_value_coef,
-                entropy_coef=ppo_entropy_coef
+                entropy_coef=ppo_entropy_coef,
+                max_suffix_len=max_suffix_len,
+                init_len=init_len,
+                wandb_log_fn=wandb_cb,
+                global_step_offset=(batch_start // batch_size) * steps_per_episode
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
@@ -311,10 +333,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt = best_prompt_result
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
-                try:
-                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
-                except Exception:
-                    optimized_text = str(best_prompt_result)
+                optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
 
                 optimized_suffix_text = optimized_text
                 try:
@@ -327,6 +346,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 try:
                     with open(metrics_path, 'a', newline='') as fh:
                         writer = csv.writer(fh)
+                        best_len_val = len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0
                         writer.writerow([
                             datetime.utcnow().isoformat(),
                             batch_start // batch_size,
@@ -337,6 +357,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                             best_ll,
                             best_ep,
                             best_reward_val if best_reward_val is not None else best_reward,
+                            best_len_val,
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception as _:
@@ -371,6 +392,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
         elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
+            wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -386,7 +408,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 gamma=ppo_gamma,
                 gae_lambda=ppo_lambda,
                 value_coef=ppo_value_coef,
-                entropy_coef=ppo_entropy_coef
+                entropy_coef=ppo_entropy_coef,
+                max_suffix_len=max_suffix_len,
+                init_len=init_len,
+                wandb_log_fn=wandb_cb,
+                global_step_offset=(batch_start // batch_size) * steps_per_episode
             )
 
             # unpack and report per-prompt
@@ -421,10 +447,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt = best_prompt_result
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
-                try:
-                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
-                except Exception:
-                    optimized_text = str(best_prompt_result)
+                optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
 
                 optimized_suffix_text = optimized_text
 
@@ -441,6 +464,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 try:
                     with open(metrics_path, 'a', newline='') as fh:
                         writer = csv.writer(fh)
+                        best_len_val = len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0
                         writer.writerow([
                             datetime.utcnow().isoformat(),
                             batch_start // batch_size,
@@ -451,6 +475,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                             best_ll,
                             best_ep,
                             best_reward_val if best_reward_val is not None else best_reward,
+                            best_len_val,
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception as _:
@@ -466,6 +491,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             # Use the batched discrete (GCG) optimizer for this whole batch
             print(f"Running batched discrete optimizer on batch size={len(batch_prompts)}")
             targets = [p.get('target', '') for p in batch_prompts]
+            wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -481,7 +507,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 gamma=ppo_gamma,
                 gae_lambda=ppo_lambda,
                 value_coef=ppo_value_coef,
-                entropy_coef=ppo_entropy_coef
+                entropy_coef=ppo_entropy_coef,
+                max_suffix_len=max_suffix_len,
+                init_len=init_len,
+                wandb_log_fn=wandb_cb,
+                global_step_offset=(batch_start // batch_size) * steps_per_episode
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
@@ -492,10 +522,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt = best_prompt_result
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
-                try:
-                    optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
-                except Exception:
-                    optimized_text = str(best_prompt_result)
+                    optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
 
                 optimized_suffix_text = optimized_text
                 # Extract final and best likelihoods from traces for this prompt (discrete)
@@ -508,6 +535,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
                 # Append to CSV for later reference
                 try:
+                    best_len_val = len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0
                     with open(metrics_path, 'a', newline='') as fh:
                         writer = csv.writer(fh)
                         writer.writerow([
@@ -520,6 +548,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                             best_ll,
                             best_ep,
                             best_reward_val if best_reward_val is not None else best_reward,
+                            best_len_val,
                             batch_prompts[prompt_idx].get('base', '')[:200]
                         ])
                 except Exception:
@@ -587,10 +616,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         best_prompt_text = base_text
 
                     # Print input, optimized suffix/full prompt, and target completion for transparency
-                    try:
-                        optimized_text = agent.tokenizer.decode(best_prompt_result, skip_special_tokens=True) if best_prompt_result else ''
-                    except Exception:
-                        optimized_text = str(best_prompt_result)
+                    optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
 
                     # Determine optimized suffix by removing base token ids if possible
                     optimized_suffix_text = ''
