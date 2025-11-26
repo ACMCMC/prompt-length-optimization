@@ -58,6 +58,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     base_episodes = train_cfg.get('episodes_per_prompt', 3)
     base_steps = train_cfg.get('steps_per_episode', 100)
     init_len = train_cfg.get('init_len', 32)
+    max_suffix_len = train_cfg.get('max_suffix_len', init_len * 2)
     base_lr_embeddings = train_cfg.get('lr_embeddings', 0.01)
     base_lr_policy = train_cfg.get('lr_policy', 3e-4)
     alpha = train_cfg.get('alpha', 1.0)

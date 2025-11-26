@@ -132,6 +132,7 @@ def evaluate_on_dataset(cfg, model_path):
     # Load test parameters
     max_test_prompts = eval_cfg.get('max_test_prompts', 20)
     init_len = eval_cfg.get('init_len', 32)
+    max_suffix_len = eval_cfg.get('max_suffix_len', init_len * 2)
     max_policy_steps = eval_cfg.get('max_policy_steps', 50)
     min_prompt_length = eval_cfg.get('min_prompt_length', 20)
     max_prompt_length = eval_cfg.get('max_prompt_length', 200)
@@ -300,7 +301,9 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous' if 'continuous' in opt_mode else 'discrete'
+                    mode='continuous' if 'continuous' in opt_mode else 'discrete',
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -318,7 +321,9 @@ def evaluate_on_dataset(cfg, model_path):
                     gamma=ppo_gamma,
                     gae_lambda=ppo_lambda,
                     value_coef=ppo_value_coef,
-                    entropy_coef=ppo_entropy_coef
+                    entropy_coef=ppo_entropy_coef,
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -336,7 +341,9 @@ def evaluate_on_dataset(cfg, model_path):
                     gamma=ppo_gamma,
                     gae_lambda=ppo_lambda,
                     value_coef=ppo_value_coef,
-                    entropy_coef=ppo_entropy_coef
+                    entropy_coef=ppo_entropy_coef,
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len
                 )
             else:
                 # fallback: run sequentially
