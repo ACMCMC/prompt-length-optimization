@@ -7,6 +7,7 @@ import torch
 import random
 from typing import Tuple
 from ..interface import BasePromptOptimizer
+from ..model_inputs import ModelBatchedInput
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
     """
@@ -15,38 +16,29 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     """
     
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
-                 batch_size: int, lr_embeddings: float, max_suffix_len: int = 64, init_len: int = 32):
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int, init_len: int):
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings, max_suffix_len, init_len)
         self.embedding_layer = agent.model.get_input_embeddings()
         
-        # Initialize with BOS tokens
-        bos_token_id = agent.tokenizer.bos_token_id if agent.tokenizer.bos_token_id is not None else agent.tokenizer.eos_token_id
-        self.prompt_tokens = torch.full(
-            (batch_size, max_prompt_len), bos_token_id, dtype=torch.long, device=self.device
+        # Initialize with zeros (will be initialized with BOS via ModelBatchedInput)
+        self.prompt_tokens = torch.zeros(
+            (batch_size, max_prompt_len), dtype=torch.long, device=self.device
         )
     
-    def initialize_prompts(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Initialize with BOS tokens."""
+    def initialize_prompts(self, model_input: ModelBatchedInput) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Initialize with BOS tokens from ModelBatchedInput."""
         lengths = torch.full((self.batch_size,), self.initial_prompt_length,
                            dtype=torch.long, device=self.device)
-        # Reset to BOS tokens
-        bos_token_id = self.agent.tokenizer.bos_token_id if self.agent.tokenizer.bos_token_id is not None else self.agent.tokenizer.eos_token_id
-        self.prompt_tokens.fill_(bos_token_id)
+        # Reset to BOS tokens from ModelBatchedInput
+        self.prompt_tokens = model_input.initialize_suffix_tokens()
         return self.prompt_tokens, lengths
     
     def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
-                       completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                       requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
-                       prefix_lengths: torch.Tensor = None) -> torch.Tensor:
-        """Compute likelihoods from tokens."""
-        max_active_len = lengths.max().item()
-        active_tokens = prompt_data[:, :max_active_len]
-        prompt_embeds = self.embedding_layer(active_tokens)
-        return self.agent.get_likelihoods_batch(
-            prompt_embeds, completion_tokens, completion_lengths, requires_grad=requires_grad,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
-            max_suffix_len=self.max_suffix_len, init_len=self.init_len
-        )
+                       model_input: ModelBatchedInput, requires_grad: bool = False) -> torch.Tensor:
+        """Compute likelihoods from tokens using ModelBatchedInput."""
+        # Update model_input with current suffix tokens
+        model_input.update_suffix_tokens(prompt_data)
+        return self.agent.get_likelihoods_batch(model_input, requires_grad=requires_grad)
     
     def apply_length_action(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
                            actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -70,28 +62,22 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         return prompt_data, updated_lengths
     
     def inner_optimization_step(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
-                               completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                               step: int, prefix_tokens: torch.Tensor = None,
-                               prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                               step: int, model_input: ModelBatchedInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         TODO: Implement GCG optimization here.
         This is a placeholder that does minimal token replacement.
         """
-        # Placeholder: simple random token replacement
-        # Replace with proper GCG implementation
-        max_active_len = lengths.max().item()
-        active_tokens = prompt_data[:, :max_active_len]
-        prompt_embeds = self.embedding_layer(active_tokens)
-        likelihoods = self.agent.get_likelihoods_batch(
-            prompt_embeds, completion_tokens, completion_lengths, requires_grad=False,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths,
-            max_suffix_len=self.max_suffix_len, init_len=self.init_len
-        )
+        # Update model_input with current suffix tokens
+        model_input.update_suffix_tokens(prompt_data)
+        likelihoods = self.agent.get_likelihoods_batch(model_input, requires_grad=False)
         
         # Minimal optimization: only every 3rd step, limited items
         if step % 3 == 0:
             num_to_optimize = min(8, self.batch_size)
             indices = random.sample(range(self.batch_size), num_to_optimize) if self.batch_size > num_to_optimize else list(range(self.batch_size))
+            max_active_len = lengths.max().item()
+            active_tokens = prompt_data[:, :max_active_len]
+            
             for i in indices:
                 if lengths[i] > 0:
                     best_ll = likelihoods[i].item()
@@ -101,21 +87,24 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                         candidate = self.agent.get_random_token()
                         test_tokens = best_tokens.clone()
                         test_tokens[pos] = candidate
-                        test_embeds = self.embedding_layer(test_tokens).unsqueeze(0)
-                        test_ll = self.agent.get_likelihoods_batch(
-                            test_embeds, completion_tokens[i:i+1], 
-                            completion_lengths[i:i+1], requires_grad=False,
-                            prefix_tokens=prefix_tokens[i:i+1] if prefix_tokens is not None else None,
-                            prefix_lengths=prefix_lengths[i:i+1] if prefix_lengths is not None else None,
-                            max_suffix_len=self.max_suffix_len, init_len=self.init_len
-                        )[0]
-                        if test_ll.item() > best_ll:
-                            best_ll = test_ll.item()
+                        # Create test prompt_data with updated token
+                        test_prompt_data = prompt_data.clone()
+                        test_prompt_data[i, pos] = candidate
+                        
+                        # Update model_input temporarily for test
+                        model_input.update_suffix_tokens(test_prompt_data)
+                        test_ll = self.agent.get_likelihoods_batch(model_input, requires_grad=False)[i].item()
+                        
+                        if test_ll > best_ll:
+                            best_ll = test_ll
                             best_tokens = test_tokens
-                    prompt_data[i, :max_active_len] = best_tokens
-                    likelihoods[i] = torch.tensor(best_ll, device=self.device)
+                            prompt_data[i, :lengths[i]] = best_tokens
         
-        return prompt_data, likelihoods
+        # Update model_input with final suffix tokens
+        model_input.update_suffix_tokens(prompt_data)
+        final_likelihoods = self.agent.get_likelihoods_batch(model_input, requires_grad=False)
+        
+        return prompt_data, final_likelihoods
     
     def to_tokens(self, prompt_data: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """Tokens are already token IDs, just pad/trim to max length (vectorized)."""

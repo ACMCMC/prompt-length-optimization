@@ -11,6 +11,7 @@ import torch.optim as optim
 import logging
 from prompt_optimization.agent import PromptRLAgent
 from prompt_optimization.interface import BasePromptOptimizer
+from prompt_optimization.model_inputs import ModelBatchedInput
 from prompt_optimization.optimizers import (
     ContinuousPromptOptimizer,
     ContinuousPromptOptimizerWithProjection,
@@ -22,40 +23,43 @@ logger = logging.getLogger(__name__)
 class LengthPolicyOptimizer:
     """RL optimizer that learns prompt length policy using REINFORCE or PPO."""
     
-    def __init__(self, agent: PromptRLAgent, epsilon: float = 0.1, epsilon_decay: float = 0.995, epsilon_min: float = 0.01,
-                 entropy_coef: float = 0.01, temperature: float = 1.0,
-                 use_ppo: bool = False, ppo_clip: float = 0.2, ppo_epochs: int = 4,
-                 ppo_gamma: float = 0.99, ppo_gae_lambda: float = 0.95, ppo_value_coef: float = 0.5):
+    def __init__(self, agent: PromptRLAgent, epsilon: float, epsilon_decay: float, epsilon_min: float,
+                 entropy_coef: float, temperature: float,
+                 use_ppo: bool, ppo_clip: float, ppo_epochs: int,
+                 ppo_gamma: float, ppo_gae_lambda: float, ppo_value_coef: float,
+                 policy_hidden_size: int, value_init_bias: float, value_init_gain: float,
+                 max_grad_norm: float):
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
         # Simple policy network: state -> action probs
         self.state_dim = 2  # [length, likelihood]
         self.policy_net = nn.Sequential(
-            nn.Linear(self.state_dim, 64),
+            nn.Linear(self.state_dim, policy_hidden_size),
             nn.ReLU(),
-            nn.Linear(64, 3)  # Actions: 0=remove, 1=keep, 2=add
+            nn.Linear(policy_hidden_size, 3)  # Actions: 0=remove, 1=keep, 2=add
         ).to(agent.device)
         
         # Value network for PPO (estimates state values)
-        # Initialize output layer to predict values around -1000 (typical return scale)
+        # Initialize output layer to predict values around typical return scale
         # This helps the network start in the right range
         self.value_net = nn.Sequential(
-            nn.Linear(self.state_dim, 64),
+            nn.Linear(self.state_dim, policy_hidden_size),
             nn.ReLU(),
-            nn.Linear(64, 1)  # Single value output
+            nn.Linear(policy_hidden_size, 1)  # Single value output
         ).to(agent.device)
         
         # Initialize value network output layer to predict values around typical return scale
         # This prevents initial value loss from being extremely large
         with torch.no_grad():
-            # Initialize last layer bias to a typical return value (e.g., -1000)
-            # and scale down weights to prevent large initial predictions
+            # Initialize last layer bias and weights from config
             if len(self.value_net) > 0:
                 last_layer = self.value_net[-1]
                 if isinstance(last_layer, nn.Linear):
-                    last_layer.bias.fill_(-1000.0)  # Initialize to typical return scale
-                    nn.init.xavier_uniform_(last_layer.weight, gain=0.1)  # Smaller weights
+                    last_layer.bias.fill_(value_init_bias)
+                    nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
+        
+        self.max_grad_norm = max_grad_norm
         
         # Use shared optimizer for both networks (PPO) or separate (REINFORCE)
         self.use_ppo = use_ppo
@@ -122,67 +126,46 @@ class LengthPolicyOptimizer:
         
         return returns, advantages
     
-    def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Prepare completion tokens as batched tensors"""
-        completion_tokens_list = [self.agent.tokenizer.encode(t, add_special_tokens=False) for t in target_completions]
-        max_comp_len = max(len(ct) for ct in completion_tokens_list) if completion_tokens_list else 0
-        pad_id = getattr(self.agent.tokenizer, 'pad_token_id', 0)
-        completion_tokens_batch = torch.tensor([
-            ct + [pad_id] * (max_comp_len - len(ct)) for ct in completion_tokens_list
-        ], dtype=torch.long, device=self.agent.device)
-        completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=self.agent.device)
-        return completion_tokens_batch, completion_lengths
-    
     def _apply_length_action_with_prefix(self, optimizer: BasePromptOptimizer, prompt_data: torch.Tensor,
                                         lengths: torch.Tensor, actions: torch.Tensor,
-                                        prefix_tokens: torch.Tensor, prefix_lengths: torch.Tensor,
-                                        attention_mask_offset: torch.Tensor, max_prefix_size: int,
-                                        pad_id: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                                        model_input: ModelBatchedInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply length actions and handle prefix shifting when tokens are deleted.
-        When a suffix token is deleted, it moves to the prefix and attention mask shifts.
+        Apply length actions to suffix only.
+        Prefix and completion are immutable - only suffix tokens/embeddings and attention mask can change.
         """
-        device = prompt_data.device
-        B = prompt_data.shape[0]
+        # Handle remove actions (action=0): remove token from suffix by setting attention mask to 0
+        remove_mask = (actions == 0) & (lengths > 0)
+        if remove_mask.any():
+            remove_indices = torch.nonzero(remove_mask, as_tuple=False).squeeze(-1)
+            model_input.remove_suffix_token(remove_indices)
         
-        # Handle prefix shifting for delete actions (action=0) BEFORE applying length action
-        delete_mask = (actions == 0) & (lengths > 0)
+        # Handle add actions (action=2): add new token to suffix by setting attention mask to 1
+        add_mask = (actions == 2) & (lengths < model_input.max_suffix_len)
+        if add_mask.any():
+            add_indices = torch.nonzero(add_mask, as_tuple=False).squeeze(-1)
+            model_input.add_suffix_token(add_indices)
         
-        if delete_mask.any():
-            # For items that will delete a token, capture the first suffix token and move to prefix
-            # Convert suffix to tokens if needed (for continuous modes)
-            if len(prompt_data.shape) == 3:  # embeddings [B, L, D]
-                # Project to tokens for shifting
-                embedding_layer = self.agent.model.get_input_embeddings()
-                vocab_embeds = embedding_layer.weight.detach()  # [vocab_size, D]
-                
-                # Find closest tokens for first suffix position
-                first_suffix_embeds = prompt_data[:, 0, :]  # [B, D]
-                # Compute distances: [B, vocab_size]
-                distances = torch.cdist(first_suffix_embeds, vocab_embeds)  # [B, vocab_size]
-                first_suffix_tokens = distances.argmin(dim=-1)  # [B]
-            else:  # already tokens [B, L]
-                first_suffix_tokens = prompt_data[:, 0]  # [B]
-            
-            # Shift prefix: move first suffix token to end of prefix
-            for i in range(B):
-                if delete_mask[i] and prefix_lengths[i] < max_prefix_size:
-                    # Add token to prefix
-                    prefix_tokens[i, prefix_lengths[i]] = first_suffix_tokens[i]
-                    prefix_lengths[i] += 1
-                    attention_mask_offset[i] += 1
-        
-        # Apply standard length action (this will remove the token from suffix)
+        # Apply standard length action (initializes new positions if needed)
         prompt_data, lengths = optimizer.apply_length_action(prompt_data, lengths, actions)
         
-        return prompt_data, lengths, prefix_tokens, prefix_lengths, attention_mask_offset
+        # Update suffix in ModelBatchedInput (tokens/embeddings)
+        # Note: model_input.mode is normalized to 'continuous' for continuous_proj
+        if model_input.mode == 'continuous':
+            model_input.update_suffix_embeddings(prompt_data)
+        else:
+            model_input.update_suffix_tokens(prompt_data)
+        
+        # Update lengths from attention mask
+        lengths = model_input.suffix_attention_mask.sum(dim=1)
+        
+        return prompt_data, lengths
     
-    def optimize_prompts_batch(self, target_completions: List[str], episodes: int = 3,
-                               steps_per_episode: int = 50, initial_prompt_length: int = 32,
-                               lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
-                               mode: str = "continuous", batch_size: int = 64,
-                               wandb_log_fn=None, global_step_offset: int = 0,
-                               max_suffix_len: int = 64, init_len: int = 32) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+    def optimize_prompts_batch(self, target_completions: List[str], episodes: int,
+                               steps_per_episode: int, initial_prompt_length: int,
+                               lr_embeddings: float, alpha: float, beta: float,
+                               mode: str, batch_size: int,
+                               max_suffix_len: int, init_len: int,
+                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -203,8 +186,6 @@ class LengthPolicyOptimizer:
             batch_completions = target_completions[batch_start:batch_end]
             batch_B = len(batch_completions)
             
-            completion_tokens_batch, completion_lengths = self._prepare_completions(batch_completions)
-            
             # Create optimizer based on mode
             max_prompt_len = max_suffix_len  # Suffix size is fixed to max_suffix_len from config
             if mode == "continuous":
@@ -216,10 +197,10 @@ class LengthPolicyOptimizer:
                 # Continuous with projection regularization
                 projection_weight = getattr(self, 'projection_weight', None)
                 if projection_weight is None:
-                    projection_weight = 0.1  # Default if not set
+                    raise ValueError("projection_weight must be set via set_optimization_params before using continuous_proj mode")
                 distance_metric = getattr(self, 'distance_metric', None)
                 if distance_metric is None:
-                    distance_metric = 'l2'  # Default if not set
+                    raise ValueError("distance_metric must be set via set_optimization_params before using continuous_proj mode")
                 optimizer: BasePromptOptimizer = ContinuousPromptOptimizerWithProjection(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
                     projection_weight=projection_weight, distance_metric=distance_metric,
@@ -231,19 +212,6 @@ class LengthPolicyOptimizer:
                     max_suffix_len=max_suffix_len, init_len=init_len
                 )
             
-            # Initialize prompts (suffix)
-            prompt_data, lengths = optimizer.initialize_prompts()
-            
-            # Initialize prefix tokens: empty initially, grows as we delete suffix tokens
-            # Max prefix size = initial_prompt_length (can grow up to original suffix size)
-            max_prefix_size = initial_prompt_length
-            pad_id = getattr(self.agent.tokenizer, 'pad_token_id', 0)
-            prefix_tokens = torch.full((batch_B, max_prefix_size), pad_id, dtype=torch.long, device=device)
-            prefix_lengths = torch.zeros(batch_B, dtype=torch.long, device=device)
-            
-            # Track attention mask offsets (how much to mask at start due to deleted tokens)
-            attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)
-            
             best_rewards = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
             best_likelihoods = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
             best_prompts: List[Optional[torch.Tensor]] = [None] * batch_B
@@ -252,13 +220,28 @@ class LengthPolicyOptimizer:
             batch_policy_metrics = []  # Track policy metrics for this batch
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
-                # Reset prompts to initial state at the start of each episode
-                # This ensures episodes are independent from each other
-                prompt_data, lengths = optimizer.initialize_prompts()
-                # Reset prefix tracking (no tokens moved to prefix yet)
-                prefix_tokens.fill_(pad_id)
-                prefix_lengths.zero_()
-                attention_mask_offset.zero_()
+                # Create fresh ModelBatchedInput for this episode
+                # Prefix texts are empty initially (will grow as tokens are deleted)
+                prefix_texts = [''] * batch_B
+                model_input = ModelBatchedInput(
+                    prefix_texts=prefix_texts,
+                    completion_texts=batch_completions,
+                    tokenizer=self.agent.tokenizer,
+                    device=self.agent.device,
+                    embedding_layer=self.agent.model.get_input_embeddings(),
+                    max_suffix_len=max_suffix_len,
+                    init_len=init_len,
+                    mode=mode
+                )
+                
+                # Initialize prompts (suffix) using ModelBatchedInput
+                prompt_data, lengths = optimizer.initialize_prompts(model_input)
+                
+                # Update model_input with initial suffix
+                if mode in ['continuous', 'continuous_proj']:
+                    model_input.update_suffix_embeddings(prompt_data)
+                else:
+                    model_input.update_suffix_tokens(prompt_data)
                 
                 episode_rewards = []
                 episode_likelihoods = []
@@ -281,9 +264,9 @@ class LengthPolicyOptimizer:
                     # This does NOT update the policy network
                     if step == 0 or (step + 1) % 10 == 0 or step == steps_per_episode - 1:
                         logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_start//batch_size + 1})")
+                    
                     prompt_data, likelihoods = optimizer.inner_optimization_step(
-                        prompt_data, lengths, completion_tokens_batch, completion_lengths, step,
-                        prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
+                        prompt_data, lengths, step, model_input
                     )
                     
                     # Compute states for policy (inference only, no gradients)
@@ -321,10 +304,14 @@ class LengthPolicyOptimizer:
                                            policy_log_probs_selected)
                     
                     # Apply length actions and handle prefix shifting
-                    prompt_data, lengths, prefix_tokens, prefix_lengths, attention_mask_offset = self._apply_length_action_with_prefix(
-                        optimizer, prompt_data, lengths, actions, prefix_tokens, prefix_lengths, 
-                        attention_mask_offset, max_prefix_size, pad_id
+                    prompt_data, lengths = self._apply_length_action_with_prefix(
+                        optimizer, prompt_data, lengths, actions, model_input
                     )
+                    
+                    # Update lengths based on suffix attention mask
+                    # Count active suffix positions
+                    active_suffix_counts = model_input.suffix_attention_mask.sum(dim=1)  # [B]
+                    lengths = active_suffix_counts
                 
                     # Compute rewards: both likelihood and length are negative, less negative = better
                     # Likelihoods are negative (log probabilities): less negative = better (e.g., -50 > -80)
@@ -481,7 +468,7 @@ class LengthPolicyOptimizer:
                         total_loss.backward()
                         torch.nn.utils.clip_grad_norm_(
                             list(self.policy_net.parameters()) + list(self.value_net.parameters()),
-                            max_norm=0.5
+                            max_norm=self.max_grad_norm
                         )
                         self.optimizer.step()
                         
@@ -511,7 +498,7 @@ class LengthPolicyOptimizer:
                     returns = torch.zeros_like(rewards_tensor)
                     next_return = torch.zeros(batch_B, device=device)
                     for t in reversed(range(steps_per_episode)):
-                        next_return = rewards_tensor[t] + 0.99 * next_return
+                        next_return = rewards_tensor[t] + self.ppo_gamma * next_return
                         returns[t] = next_return
                     
                     # Normalize returns

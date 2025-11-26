@@ -6,12 +6,13 @@ This allows plug-and-play implementations for continuous vs discrete optimizatio
 from abc import ABC, abstractmethod
 import torch
 from typing import Tuple
+from .model_inputs import ModelBatchedInput
 
 class BasePromptOptimizer(ABC):
     """Abstract base class for prompt optimization methods."""
     
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int, 
-                 batch_size: int, lr_embeddings: float, max_suffix_len: int = 64, init_len: int = 32):
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int, init_len: int):
         """
         Args:
             agent: PromptRLAgent instance
@@ -33,9 +34,12 @@ class BasePromptOptimizer(ABC):
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
     
     @abstractmethod
-    def initialize_prompts(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def initialize_prompts(self, model_input: 'ModelBatchedInput') -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Initialize prompts for batch optimization.
+        Initialize prompts for batch optimization using ModelBatchedInput.
+        
+        Args:
+            model_input: ModelBatchedInput instance for BOS initialization
         
         Returns:
             prompt_data: The prompt representation (embeddings or tokens)
@@ -45,17 +49,14 @@ class BasePromptOptimizer(ABC):
     
     @abstractmethod
     def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
-                       completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                       requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
-                       prefix_lengths: torch.Tensor = None) -> torch.Tensor:
+                       model_input: ModelBatchedInput, requires_grad: bool = False) -> torch.Tensor:
         """
         Compute likelihoods for current prompts.
         
         Args:
             prompt_data: Current prompt representation
             lengths: Current lengths [B]
-            completion_tokens: Completion tokens [B, max_comp]
-            completion_lengths: Completion lengths [B]
+            model_input: ModelBatchedInput instance with all inputs
             requires_grad: Whether gradients are needed
             
         Returns:
@@ -82,9 +83,7 @@ class BasePromptOptimizer(ABC):
     
     @abstractmethod
     def inner_optimization_step(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
-                               completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
-                               step: int, prefix_tokens: torch.Tensor = None,
-                               prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                               step: int, model_input: ModelBatchedInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Perform one step of inner optimization (e.g., gradient updates, GCG replacements).
         This is called before policy actions are applied.
@@ -92,9 +91,8 @@ class BasePromptOptimizer(ABC):
         Args:
             prompt_data: Current prompt representation
             lengths: Current lengths [B]
-            completion_tokens: Completion tokens [B, max_comp]
-            completion_lengths: Completion lengths [B]
             step: Current step number in episode
+            model_input: ModelBatchedInput instance with all inputs
             
         Returns:
             updated_prompt_data: Updated prompt representation

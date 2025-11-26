@@ -246,6 +246,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
     ppo_entropy_coef = ppo_cfg.get('entropy_coef', entropy_coef)  # Use PPO-specific entropy if set, else use general
     
+    # Policy network architecture parameters
+    policy_cfg = train_cfg.get('policy', {})
+    policy_hidden_size = policy_cfg.get('hidden_size', 64)
+    value_init_bias = policy_cfg.get('value_init_bias', -1000.0)
+    value_init_gain = policy_cfg.get('value_init_gain', 0.1)
+    max_grad_norm = train_cfg.get('ppo', {}).get('max_grad_norm', 0.5)
+    
     optimizer = LengthPolicyOptimizer(
         agent, 
         epsilon=epsilon, 
@@ -258,8 +265,19 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         ppo_epochs=ppo_epochs,
         ppo_gamma=ppo_gamma,
         ppo_gae_lambda=ppo_gae_lambda,
-        ppo_value_coef=ppo_value_coef
+        ppo_value_coef=ppo_value_coef,
+        policy_hidden_size=policy_hidden_size,
+        value_init_bias=value_init_bias,
+        value_init_gain=value_init_gain,
+        max_grad_norm=max_grad_norm
     )
+    
+    # Set projection parameters for continuous_proj mode
+    projection_weight = train_cfg.get('projection_weight', 0.1)
+    distance_metric = train_cfg.get('distance_metric', 'l2')
+    optimizer.projection_weight = projection_weight
+    optimizer.distance_metric = distance_metric
+    
     # Prepare metrics output
     metrics_dir = "results"
     os.makedirs(metrics_dir, exist_ok=True)
@@ -523,11 +541,12 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             steps_per_episode=steps_per_episode,
             initial_prompt_length=init_len,
             lr_embeddings=lr_embeddings,
-            max_suffix_len=max_suffix_len,
-            init_len=init_len,
             alpha=alpha,
             beta=beta,
             mode=mode,
+            batch_size=batch_size,
+            max_suffix_len=max_suffix_len,
+            init_len=init_len,
             wandb_log_fn=wandb_log_fn,
             global_step_offset=global_step_offset
         )

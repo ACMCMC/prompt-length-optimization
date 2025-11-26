@@ -24,9 +24,48 @@ def load_trained_model(model_path):
     checkpoint = torch.load(model_path, map_location='cpu')
     model_name = checkpoint['model_name']
     
-    # Initialize agent and optimizer  
+    # Initialize agent and optimizer
+    # For evaluation, we need to initialize with config values even though we're loading weights
+    # Read from checkpoint config if available, otherwise use defaults from train config
+    train_cfg = checkpoint.get('config', {}).get('train', {})
+    policy_cfg = train_cfg.get('policy', {})
+    ppo_cfg = train_cfg.get('ppo', {})
+    
+    epsilon = train_cfg.get('epsilon', 0.3)
+    epsilon_decay = train_cfg.get('epsilon_decay', 0.998)
+    epsilon_min = train_cfg.get('epsilon_min', 0.05)
+    entropy_coef = train_cfg.get('entropy_coef', 0.05)
+    temperature = train_cfg.get('temperature', 1.5)
+    use_ppo = train_cfg.get('use_ppo', True)
+    ppo_clip = ppo_cfg.get('clip', 0.2)
+    ppo_epochs = ppo_cfg.get('epochs', 4)
+    ppo_gamma = ppo_cfg.get('gamma', 0.99)
+    ppo_gae_lambda = ppo_cfg.get('gae_lambda', 0.95)
+    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
+    policy_hidden_size = policy_cfg.get('hidden_size', 64)
+    value_init_bias = policy_cfg.get('value_init_bias', -1000.0)
+    value_init_gain = policy_cfg.get('value_init_gain', 0.1)
+    max_grad_norm = ppo_cfg.get('max_grad_norm', 0.5)
+    
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent)
+    optimizer = LengthPolicyOptimizer(
+        agent,
+        epsilon=epsilon,
+        epsilon_decay=epsilon_decay,
+        epsilon_min=epsilon_min,
+        entropy_coef=entropy_coef,
+        temperature=temperature,
+        use_ppo=use_ppo,
+        ppo_clip=ppo_clip,
+        ppo_epochs=ppo_epochs,
+        ppo_gamma=ppo_gamma,
+        ppo_gae_lambda=ppo_gae_lambda,
+        ppo_value_coef=ppo_value_coef,
+        policy_hidden_size=policy_hidden_size,
+        value_init_bias=value_init_bias,
+        value_init_gain=value_init_gain,
+        max_grad_norm=max_grad_norm
+    )
     
     # Load the trained policy weights
     optimizer.policy_net.load_state_dict(checkpoint['policy_state_dict'])
@@ -61,6 +100,7 @@ def evaluate_prompt(cfg, agent, optimizer):
             alpha=cfg.get('train', {}).get('alpha', 1.0),
             beta=cfg.get('train', {}).get('beta', 0.1),
             mode='continuous' if 'continuous' in opt_mode else 'discrete',
+            batch_size=1,
             max_suffix_len=max_suffix_len,
             init_len=init_len
         )
@@ -309,6 +349,7 @@ def evaluate_on_dataset(cfg, model_path):
                     alpha=alpha,
                     beta=beta,
                     mode='continuous' if 'continuous' in opt_mode else 'discrete',
+                    batch_size=len(targets),
                     max_suffix_len=max_suffix_len,
                     init_len=init_len
                 )
@@ -322,6 +363,7 @@ def evaluate_on_dataset(cfg, model_path):
                     alpha=alpha,
                     beta=beta,
                     mode='continuous',
+                    batch_size=len(targets),
                     max_suffix_len=max_suffix_len,
                     init_len=init_len
                 )
@@ -335,6 +377,7 @@ def evaluate_on_dataset(cfg, model_path):
                     alpha=alpha,
                     beta=beta,
                     mode='discrete',
+                    batch_size=len(targets),
                     max_suffix_len=max_suffix_len,
                     init_len=init_len
                 )
