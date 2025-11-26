@@ -17,7 +17,7 @@ from prompt_optimization.optimizers import (
 )
 
 class LengthPolicyOptimizer:
-    """RL optimizer that learns prompt length policy using REINFORCE."""
+    """RL optimizer that learns prompt length policy using PPO (or REINFORCE fallback)."""
     
     def __init__(self, agent: PromptRLAgent, reward_cfg=None):
         # reward_cfg is accepted for backward compatibility with the GCG branch; it is not used here.
@@ -31,8 +31,14 @@ class LengthPolicyOptimizer:
             nn.ReLU(),
             nn.Linear(64, 3)  # Actions: 0=remove, 1=keep, 2=add
         ).to(agent.device)
+        self.value_net = nn.Sequential(
+            nn.Linear(self.state_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        ).to(agent.device)
         
         self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=3e-4)
     
     def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare completion tokens as batched tensors"""
@@ -92,7 +98,10 @@ class LengthPolicyOptimizer:
     def optimize_prompts_batch(self, target_completions: List[str], episodes: int = 3,
                                steps_per_episode: int = 50, initial_prompt_length: int = 32,
                                lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
-                               mode: str = "continuous", batch_size: int = 64) -> Tuple[List[torch.Tensor], List[float], List[dict]]:
+                               mode: str = "continuous", batch_size: int = 64,
+                               use_ppo: bool = True, ppo_epochs: int = 4, ppo_clip: float = 0.2,
+                               gamma: float = 0.99, gae_lambda: float = 0.95,
+                               value_coef: float = 0.5, entropy_coef: float = 0.01) -> Tuple[List[torch.Tensor], List[float], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -155,6 +164,7 @@ class LengthPolicyOptimizer:
                 episode_rewards = []
                 episode_log_probs = []
                 episode_states = []
+                episode_actions = []
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
@@ -182,6 +192,7 @@ class LengthPolicyOptimizer:
                         log_probs = F.log_softmax(action_logits, dim=-1)[0, actions].unsqueeze(0)
                     else:
                         log_probs = F.log_softmax(action_logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(-1)
+                    episode_actions.append(actions)
                     
                     # Apply length actions and handle prefix shifting
                     prompt_data, lengths, prefix_tokens, prefix_lengths, attention_mask_offset = self._apply_length_action_with_prefix(
@@ -204,25 +215,70 @@ class LengthPolicyOptimizer:
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
                 
-                # Policy update (REINFORCE)
+                # Policy update (PPO by default)
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
-                
-                # Compute returns
-                returns = torch.zeros_like(rewards_tensor)
-                next_return = torch.zeros(batch_B, device=device)
-                for t in reversed(range(steps_per_episode)):
-                    next_return = rewards_tensor[t] + 0.99 * next_return
-                    returns[t] = next_return
-                
-                # Normalize returns
-                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-                
-                # Policy loss
-                policy_loss = -(log_probs_tensor * returns.detach()).mean()
-                self.policy_optimizer.zero_grad()
-                policy_loss.backward()
-                self.policy_optimizer.step()
+                states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
+                T = states_tensor.shape[0]
+
+                states_flat = states_tensor.view(T * batch_B, self.state_dim)
+                values_flat = self.value_net(states_flat).squeeze()
+                values_tensor = values_flat.view(T, batch_B)
+
+                if use_ppo:
+                    advantages = torch.zeros_like(rewards_tensor, device=device)
+                    last_gae = torch.zeros(batch_B, dtype=torch.float32, device=device)
+                    next_value = torch.zeros(batch_B, dtype=torch.float32, device=device)
+                    for t in reversed(range(T)):
+                        delta = rewards_tensor[t] + gamma * next_value - values_tensor[t]
+                        last_gae = delta + gamma * gae_lambda * last_gae
+                        advantages[t] = last_gae
+                        next_value = values_tensor[t]
+
+                    returns_tensor = advantages + values_tensor
+                    advantages_flat = advantages.view(-1)
+                    returns_flat = returns_tensor.view(-1)
+                    advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8 + 1e-12)
+
+                    old_log_probs_flat = log_probs_tensor.view(-1).detach()
+                    actions_flat = torch.stack(episode_actions).view(-1)
+
+                    for _ in range(max(1, ppo_epochs)):
+                        policy_logits = self.policy_net(states_flat)
+                        new_log_probs = F.log_softmax(policy_logits, dim=-1).gather(1, actions_flat.unsqueeze(1)).squeeze(1)
+                        entropy = -(F.softmax(policy_logits, dim=-1) * F.log_softmax(policy_logits, dim=-1)).sum(dim=-1).mean()
+
+                        ratios = torch.exp(new_log_probs - old_log_probs_flat)
+                        surr1 = ratios * advantages_flat
+                        surr2 = torch.clamp(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip) * advantages_flat
+                        policy_loss = -torch.mean(torch.min(surr1, surr2))
+
+                        value_preds = self.value_net(states_flat).squeeze()
+                        value_loss = F.mse_loss(value_preds, returns_flat)
+
+                        total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+                        self.policy_optimizer.zero_grad()
+                        self.value_optimizer.zero_grad()
+                        total_loss.backward()
+                        self.policy_optimizer.step()
+                        self.value_optimizer.step()
+                else:
+                    # Fallback REINFORCE with value baseline
+                    returns = torch.zeros_like(rewards_tensor)
+                    next_return = torch.zeros(batch_B, device=device)
+                    for t in reversed(range(T)):
+                        next_return = rewards_tensor[t] + gamma * next_return
+                        returns[t] = next_return
+                    returns_flat = returns.view(-1)
+                    advantages = returns_flat - values_flat.detach()
+                    policy_loss = -(log_probs_tensor.view(-1) * advantages.detach()).mean()
+                    value_loss = F.mse_loss(values_flat, returns_flat)
+                    total_loss = policy_loss + value_coef * value_loss
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    total_loss.backward()
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
                 
                 traces.append({
                     'episode': episode,

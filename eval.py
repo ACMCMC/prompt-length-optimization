@@ -216,6 +216,8 @@ def evaluate_on_dataset(cfg, model_path):
     ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
     ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
     ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
+    rl_algo = str(eval_cfg.get('rl_algo', cfg.get('train', {}).get('rl_algo', 'ppo'))).lower()
+    use_ppo = rl_algo == 'ppo'
     
     # Check if we should save plots
     save_plots = not eval_cfg.get('no_plots', True)
@@ -309,7 +311,14 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous'
+                    mode='continuous',
+                    use_ppo=use_ppo,
+                    ppo_epochs=ppo_epochs,
+                    ppo_clip=ppo_clip,
+                    gamma=ppo_gamma,
+                    gae_lambda=ppo_lambda,
+                    value_coef=ppo_value_coef,
+                    entropy_coef=ppo_entropy_coef
                 )
             elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
@@ -320,7 +329,14 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='discrete'
+                    mode='discrete',
+                    use_ppo=use_ppo,
+                    ppo_epochs=ppo_epochs,
+                    ppo_clip=ppo_clip,
+                    gamma=ppo_gamma,
+                    gae_lambda=ppo_lambda,
+                    value_coef=ppo_value_coef,
+                    entropy_coef=ppo_entropy_coef
                 )
             else:
                 # fallback: run sequentially

@@ -41,6 +41,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
     ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
     ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
+    rl_algo = str(train_cfg.get('rl_algo', 'ppo')).lower()
+    use_ppo = rl_algo == 'ppo'
     global_reward_cfg = cfg.get('reward', {})
     reward_cfg = train_cfg.get('reward', global_reward_cfg)
 
@@ -236,7 +238,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 lr_embeddings=lr_embeddings,
                 alpha=alpha,
                 beta=beta,
-                mode='continuous'
+                mode='continuous',
+                use_ppo=use_ppo,
+                ppo_epochs=ppo_epochs,
+                ppo_clip=ppo_clip,
+                gamma=ppo_gamma,
+                gae_lambda=ppo_lambda,
+                value_coef=ppo_value_coef,
+                entropy_coef=ppo_entropy_coef
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
@@ -296,7 +305,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 lr_embeddings=lr_embeddings,
                 alpha=alpha,
                 beta=beta,
-                mode='continuous'
+                mode='continuous',
+                use_ppo=use_ppo,
+                ppo_epochs=ppo_epochs,
+                ppo_clip=ppo_clip,
+                gamma=ppo_gamma,
+                gae_lambda=ppo_lambda,
+                value_coef=ppo_value_coef,
+                entropy_coef=ppo_entropy_coef
             )
 
             # unpack and report per-prompt
@@ -384,7 +400,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 lr_embeddings=lr_embeddings,
                 alpha=alpha,
                 beta=beta,
-                mode='discrete'
+                mode='discrete',
+                use_ppo=use_ppo,
+                ppo_epochs=ppo_epochs,
+                ppo_clip=ppo_clip,
+                gamma=ppo_gamma,
+                gae_lambda=ppo_lambda,
+                value_coef=ppo_value_coef,
+                entropy_coef=ppo_entropy_coef
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
