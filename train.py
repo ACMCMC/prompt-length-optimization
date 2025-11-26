@@ -45,20 +45,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     use_ppo = rl_algo == 'ppo'
     one_batch = bool(train_cfg.get('one_batch', False))
 
-    # Optional W&B logging
-    wandb_cfg = cfg.get('wandb', train_cfg.get('wandb', {})) if isinstance(train_cfg, dict) else {}
-    use_wandb = bool(wandb_cfg.get('enable', False))
-    if use_wandb:
-        try:
-            import wandb  # type: ignore
-            wandb.init(
-                project=wandb_cfg.get('project', 'prompt-length-optimization'),
-                name=wandb_cfg.get('run_name', f"{mode_name.lower()}_{dataset_name}_{rl_algo}"),
-                config=cfg
-            )
-        except Exception as e:
-            print(f"Warning: failed to initialize wandb ({e}), disabling wandb logging.")
-            use_wandb = False
     global_reward_cfg = cfg.get('reward', {})
     reward_cfg = train_cfg.get('reward', global_reward_cfg)
 
@@ -107,6 +93,21 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     print(f"Alpha: {alpha}, Beta: {beta}")
     if fast_mode:
         print("Fast mode applies half episodes/steps and doubles learning rates relative to config values.")
+
+    # Optional W&B logging (initialized after mode_name is defined)
+    wandb_cfg = cfg.get('wandb', train_cfg.get('wandb', {})) if isinstance(train_cfg, dict) else {}
+    use_wandb = bool(wandb_cfg.get('enable', False))
+    if use_wandb:
+        try:
+            import wandb  # type: ignore
+            wandb.init(
+                project=wandb_cfg.get('project', 'prompt-length-optimization'),
+                name=wandb_cfg.get('run_name', f"{mode_name.lower()}_{dataset_name}_{rl_algo}"),
+                config=cfg
+            )
+        except Exception as e:
+            print(f"Warning: failed to initialize wandb ({e}), disabling wandb logging.")
+            use_wandb = False
     
     # Load dataset according to selected dataset_name
     prompts = []
