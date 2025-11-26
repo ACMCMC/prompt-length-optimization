@@ -101,7 +101,9 @@ class LengthPolicyOptimizer:
                                mode: str = "continuous", batch_size: int = 64,
                                use_ppo: bool = True, ppo_epochs: int = 4, ppo_clip: float = 0.2,
                                gamma: float = 0.99, gae_lambda: float = 0.95,
-                               value_coef: float = 0.5, entropy_coef: float = 0.01) -> Tuple[List[torch.Tensor], List[float], List[dict]]:
+                               value_coef: float = 0.5, entropy_coef: float = 0.01,
+                               max_suffix_len: int = 64, init_len: int = 32,
+                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -109,12 +111,13 @@ class LengthPolicyOptimizer:
         device = self.agent.device
         B = len(target_completions)
         if B == 0:
-            return [], [], []
+            return [], [], [], []
         
         # Process in batches of batch_size
         all_final_prompts = []
         all_rewards = []
         all_traces = []
+        all_policy_metrics = []
         
         for batch_start in range(0, B, batch_size):
             batch_end = min(batch_start + batch_size, B)
@@ -159,6 +162,7 @@ class LengthPolicyOptimizer:
             best_prompts: List[Optional[torch.Tensor]] = [None] * batch_B
             
             traces = []
+            batch_policy_metrics = []
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
                 episode_rewards = []
@@ -225,6 +229,10 @@ class LengthPolicyOptimizer:
                 values_flat = self.value_net(states_flat).squeeze()
                 values_tensor = values_flat.view(T, batch_B)
 
+                last_policy_loss = 0.0
+                last_value_loss = 0.0
+                last_entropy = 0.0
+
                 if use_ppo:
                     advantages = torch.zeros_like(rewards_tensor, device=device)
                     last_gae = torch.zeros(batch_B, dtype=torch.float32, device=device)
@@ -257,6 +265,9 @@ class LengthPolicyOptimizer:
                         value_loss = F.mse_loss(value_preds, returns_flat)
 
                         total_loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+                        last_policy_loss = policy_loss.item()
+                        last_value_loss = value_loss.item()
+                        last_entropy = entropy.item()
                         self.policy_optimizer.zero_grad()
                         self.value_optimizer.zero_grad()
                         total_loss.backward()
@@ -274,6 +285,9 @@ class LengthPolicyOptimizer:
                     policy_loss = -(log_probs_tensor.view(-1) * advantages.detach()).mean()
                     value_loss = F.mse_loss(values_flat, returns_flat)
                     total_loss = policy_loss + value_coef * value_loss
+                    last_policy_loss = policy_loss.item()
+                    last_value_loss = value_loss.item()
+                    last_entropy = 0.0
                     self.policy_optimizer.zero_grad()
                     self.value_optimizer.zero_grad()
                     total_loss.backward()
@@ -285,6 +299,36 @@ class LengthPolicyOptimizer:
                     'rewards': [float(r) for r in rewards_tensor[-1]],
                     'lengths': [int(l) for l in lengths]
                 })
+
+                # Collect policy metrics for this episode
+                batch_policy_metrics.append({
+                    'episode': episode,
+                    'batch_idx': batch_start // batch_size,
+                    'avg_reward': float(rewards_tensor.mean().item()),
+                    'avg_return': float(returns_tensor.mean().item() if use_ppo else returns.mean().item()),
+                    'avg_advantage': float(advantages_flat.mean().item()) if use_ppo else 0.0,
+                    'policy_loss': float(last_policy_loss),
+                    'value_loss': float(last_value_loss),
+                    'entropy': float(last_entropy),
+                    'epsilon': 0.0,
+                    'step': global_step_offset + episode * steps_per_episode
+                })
+
+                # Optional wandb logging hook
+                if wandb_log_fn is not None:
+                    try:
+                        wandb_log_fn({
+                            'policy/avg_reward': float(rewards_tensor.mean().item()),
+                            'policy/avg_return': float(returns_tensor.mean().item() if use_ppo else returns.mean().item()),
+                            'policy/avg_advantage': float(advantages_flat.mean().item()) if use_ppo else 0.0,
+                            'policy/policy_loss': float(last_policy_loss),
+                            'policy/value_loss': float(last_value_loss),
+                            'policy/entropy': float(last_entropy),
+                            'policy/episode': episode,
+                            'policy/batch_idx': batch_start // batch_size
+                        }, step=global_step_offset + episode * steps_per_episode)
+                    except Exception:
+                        pass
             
             # Convert best prompts to tokens using optimizer's to_tokens method
             # This is mode-agnostic - each optimizer handles its own conversion
@@ -362,5 +406,6 @@ class LengthPolicyOptimizer:
             all_final_prompts.extend(batch_final_prompts)
             all_rewards.extend([float(r) for r in best_rewards])
             all_traces.extend(traces)
+            all_policy_metrics.extend(batch_policy_metrics)
         
-        return all_final_prompts, all_rewards, all_traces
+        return all_final_prompts, all_rewards, all_traces, all_policy_metrics

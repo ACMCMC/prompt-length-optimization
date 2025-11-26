@@ -285,7 +285,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         if 'ppo' in opt_mode:
             # PPO removed, use standard continuous mode
             targets = [p.get('target', '') for p in batch_prompts]
-            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
+            best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
                 steps_per_episode=steps_per_episode,
@@ -371,7 +371,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
         elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
-            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
+            best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
                 steps_per_episode=steps_per_episode,
@@ -466,7 +466,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             # Use the batched discrete (GCG) optimizer for this whole batch
             print(f"Running batched discrete optimizer on batch size={len(batch_prompts)}")
             targets = [p.get('target', '') for p in batch_prompts]
-            best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
+            best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
                 steps_per_episode=steps_per_episode,
