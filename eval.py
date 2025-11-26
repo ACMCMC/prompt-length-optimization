@@ -51,7 +51,7 @@ def evaluate_prompt(cfg, agent, optimizer):
     if 'ppo' in opt_mode:
         # PPO method removed during refactoring, fall back to standard optimization
         print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch(
+        best_prompts_batch, best_rewards_batch, _, _ = optimizer.optimize_prompts_batch(
             target_completions=[test_prompt],
             episodes=1,
             steps_per_episode=max_policy_steps,
@@ -278,7 +278,7 @@ def evaluate_on_dataset(cfg, model_path):
             if 'ppo' in opt_mode:
                 # PPO method removed during refactoring, fall back to standard optimization
                 print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
@@ -289,7 +289,7 @@ def evaluate_on_dataset(cfg, model_path):
                     mode='continuous' if 'continuous' in opt_mode else 'discrete'
                 )
             elif opt_mode == 'continuous':
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
@@ -300,7 +300,7 @@ def evaluate_on_dataset(cfg, model_path):
                     mode='continuous'
                 )
             elif opt_mode == 'discrete':
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,

@@ -167,7 +167,8 @@ class LengthPolicyOptimizer:
     def optimize_prompts_batch(self, target_completions: List[str], episodes: int = 3,
                                steps_per_episode: int = 50, initial_prompt_length: int = 32,
                                lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
-                               mode: str = "continuous", batch_size: int = 64) -> Tuple[List[torch.Tensor], List[float], List[dict]]:
+                               mode: str = "continuous", batch_size: int = 64,
+                               wandb_log_fn=None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -175,12 +176,13 @@ class LengthPolicyOptimizer:
         device = self.agent.device
         B = len(target_completions)
         if B == 0:
-            return [], [], []
+            return [], [], [], []
         
         # Process in batches of batch_size
         all_final_prompts = []
         all_rewards = []
         all_traces = []
+        all_policy_metrics = []  # Track policy training metrics
         
         for batch_start in range(0, B, batch_size):
             batch_end = min(batch_start + batch_size, B)
@@ -230,6 +232,7 @@ class LengthPolicyOptimizer:
             best_prompts: List[Optional[torch.Tensor]] = [None] * batch_B
             
             traces = []
+            batch_policy_metrics = []  # Track policy metrics for this batch
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
                 episode_rewards = []
@@ -241,11 +244,16 @@ class LengthPolicyOptimizer:
                 
                 logger.info(f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_start//batch_size + 1}, {steps_per_episode} steps")
                 
+                # Set policy to eval mode during episode (no gradients, only inference)
+                self.policy_net.eval()
+                if self.use_ppo:
+                    self.value_net.eval()
+                
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
-                    # Inner optimization step (e.g., gradient updates, GCG replacements)
-                    # Pass prefix info for proper likelihood computation
-                    # Log every 10 steps or at key milestones to avoid spam
+                    # ===== PROMPT OPTIMIZATION ONLY (no policy updates) =====
+                    # Inner optimization step: optimize prompt embeddings/tokens only
+                    # This does NOT update the policy network
                     if step == 0 or (step + 1) % 10 == 0 or step == steps_per_episode - 1:
                         logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_start//batch_size + 1})")
                     prompt_data, likelihoods = optimizer.inner_optimization_step(
@@ -253,7 +261,7 @@ class LengthPolicyOptimizer:
                         prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
                     )
                     
-                    # Compute states for policy
+                    # Compute states for policy (inference only, no gradients)
                     step_ratio = step / steps_per_episode
                     states = torch.stack([
                         lengths.float() / initial_prompt_length,  # normalized length
@@ -262,9 +270,12 @@ class LengthPolicyOptimizer:
                         torch.zeros(batch_B, device=device)  # improvement (simplified)
                     ], dim=1)  # [batch_B, 4]
                     
-                    # Policy forward pass with temperature
-                    action_logits = self.policy_net(states)  # [batch_B, 3]
-                    action_probs = F.softmax(action_logits / self.temperature, dim=-1)
+                    # Policy forward pass (INFERENCE ONLY - no gradients, no updates)
+                    # Policy network is in eval mode and we're only collecting data
+                    with torch.no_grad():
+                        action_logits = self.policy_net(states)  # [batch_B, 3]
+                    # Compute action probabilities (detached, no gradients)
+                    action_probs = F.softmax(action_logits / self.temperature, dim=-1).detach()
                     
                     # Epsilon-greedy action selection (batched)
                     explore_mask = torch.rand(batch_B, device=device) < self.current_epsilon
@@ -343,8 +354,42 @@ class LengthPolicyOptimizer:
                         'best_likelihoods': best_likelihoods_list,
                         'lengths': [int(l) for l in lengths]
                     })
+                    
+                    # Log step-level metrics to wandb in real-time
+                    if wandb_log_fn is not None:
+                        # Compute batch averages for logging
+                        avg_reward = rewards.mean().item()
+                        avg_likelihood = likelihoods.mean().item()
+                        avg_length = lengths.float().mean().item()
+                        avg_best_likelihood = best_likelihoods.float().mean().item()
+                        
+                        # Action distribution
+                        action_counts = torch.bincount(actions, minlength=3)
+                        action_probs_step = action_counts.float() / batch_B
+                        
+                        step_log_dict = {
+                            'step/avg_reward': avg_reward,
+                            'step/avg_likelihood': avg_likelihood,
+                            'step/avg_length': avg_length,
+                            'step/avg_best_likelihood': avg_best_likelihood,
+                            'step/action_prob_decrease': action_probs_step[0].item(),
+                            'step/action_prob_keep': action_probs_step[1].item(),
+                            'step/action_prob_increase': action_probs_step[2].item(),
+                            'step/epsilon': self.current_epsilon,
+                            'episode': episode,
+                            'step_in_episode': step,
+                            'global_step': global_step,
+                            'batch_idx': batch_start // batch_size
+                        }
+                        wandb_log_fn(step_log_dict, step=global_step)
                 
-                # Policy update (REINFORCE or PPO)
+                # ===== POLICY UPDATE (only after episode completes) =====
+                # Now we update the policy network using collected episode data
+                # Set to training mode for gradient computation
+                self.policy_net.train()
+                if self.use_ppo:
+                    self.value_net.train()
+                
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
                 states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
@@ -367,6 +412,9 @@ class LengthPolicyOptimizer:
                     old_log_probs = log_probs_tensor.detach()
                     
                     # Multiple PPO epochs
+                    final_policy_loss = None
+                    final_value_loss = None
+                    final_entropy = None
                     for epoch in range(self.ppo_epochs):
                         # Recompute log probs and values with current policy
                         action_logits = self.policy_net(states_tensor)  # [T, batch_B, 3]
@@ -403,6 +451,27 @@ class LengthPolicyOptimizer:
                             max_norm=0.5
                         )
                         self.optimizer.step()
+                        
+                        # Store final metrics from last epoch
+                        final_policy_loss = policy_loss.item()
+                        final_value_loss = value_loss.item()
+                        final_entropy = entropy.item()
+                    
+                    # Track policy metrics for PPO (after all epochs)
+                    avg_reward = rewards_tensor.mean().item()
+                    avg_return = returns.mean().item()
+                    avg_advantage = advantages.mean().item()
+                    batch_policy_metrics.append({
+                        'episode': episode,
+                        'batch_idx': batch_start // batch_size,
+                        'avg_reward': avg_reward,
+                        'avg_return': avg_return,
+                        'avg_advantage': avg_advantage,
+                        'policy_loss': final_policy_loss,
+                        'value_loss': final_value_loss,
+                        'entropy': final_entropy,
+                        'epsilon': self.current_epsilon
+                    })
                 else:
                     # REINFORCE update
                     # Compute returns
@@ -425,6 +494,23 @@ class LengthPolicyOptimizer:
                     self.policy_optimizer.zero_grad()
                     policy_loss.backward()
                     self.policy_optimizer.step()
+                    
+                    # Track policy metrics for REINFORCE
+                    avg_reward = rewards_tensor.mean().item()
+                    avg_return = returns.mean().item()
+                    policy_loss_val = policy_loss.item()
+                    entropy_val = entropy.mean().item()
+                    batch_policy_metrics.append({
+                        'episode': episode,
+                        'batch_idx': batch_start // batch_size,
+                        'avg_reward': avg_reward,
+                        'avg_return': avg_return,
+                        'policy_loss': policy_loss_val,
+                        'entropy': entropy_val,
+                        'value_loss': 0.0,  # Not applicable for REINFORCE
+                        'avg_advantage': 0.0,  # Not applicable for REINFORCE
+                        'epsilon': self.current_epsilon
+                    })
                 
                 # Decay epsilon after each episode
                 self.current_epsilon = max(self.epsilon_min, self.current_epsilon * self.epsilon_decay)
@@ -506,6 +592,8 @@ class LengthPolicyOptimizer:
             all_rewards.extend([float(r) for r in best_rewards])
             # Extend traces once per prompt in the batch (traces has batch-level data, so we need one copy per prompt)
             all_traces.extend([traces] * batch_B)
+            # Accumulate policy metrics
+            all_policy_metrics.extend(batch_policy_metrics)
         
-        return all_final_prompts, all_rewards, all_traces
+        return all_final_prompts, all_rewards, all_traces, all_policy_metrics
 

@@ -15,14 +15,22 @@ from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
 from prompt_optimization.datasets import ToxicChatDatasetManager
 import numpy as np
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
-def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
+def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_wandb: bool = True, wandb_project: str = "prompt-optimization"):
     """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
 
     dataset_name: 'advbench' or 'toxicchat' (default 'advbench')
+    use_wandb: Whether to log to wandb
+    wandb_project: Wandb project name
     """
     model_name = cfg['model']
     train_cfg = cfg['train']
@@ -65,6 +73,56 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         steps_per_episode = max(20, base_steps // 2)
         lr_embeddings = base_lr_embeddings * 2
         lr_policy = base_lr_policy * 2
+    
+    # Initialize wandb if available and requested (after variables are set)
+    wandb_initialized = False
+    if use_wandb and WANDB_AVAILABLE:
+        try:
+            if wandb.run is None:
+                wandb.init(
+                    project=wandb_project,
+                    name=f"policy_training_{optimization_mode}",
+                    config={
+                        'model': model_name,
+                        'optimization_mode': optimization_mode,
+                        'episodes_per_prompt': episodes_per_prompt,
+                        'steps_per_episode': steps_per_episode,
+                        'init_len': init_len,
+                        'max_prompts': max_prompts,
+                        'batch_size': batch_size,
+                        'lr_embeddings': lr_embeddings,
+                        'lr_policy': lr_policy,
+                        'alpha': alpha,
+                        'beta': beta,
+                        'epsilon': epsilon,
+                        'epsilon_decay': epsilon_decay,
+                        'epsilon_min': epsilon_min,
+                        'entropy_coef': entropy_coef,
+                        'temperature': temperature,
+                        'use_ppo': use_ppo,
+                        'ppo_epochs': ppo_epochs,
+                        'ppo_clip': ppo_clip,
+                        'ppo_gamma': ppo_gamma,
+                        'ppo_gae_lambda': ppo_lambda,
+                        'ppo_value_coef': ppo_value_coef,
+                        'ppo_entropy_coef': ppo_entropy_coef,
+                        'dataset': dataset_name,
+                        'seed': cfg.get('seed', 2262)
+                    }
+                )
+                wandb_initialized = True
+                logger.info(f"Wandb initialized: project={wandb_project}, run={wandb.run.name}")
+            else:
+                wandb_initialized = True  # Already initialized (e.g., by sweep)
+                logger.info("Wandb already initialized (likely by sweep)")
+        except Exception as e:
+            logger.warning(f"Failed to initialize wandb: {e}")
+            wandb_initialized = False
+    elif use_wandb and not WANDB_AVAILABLE:
+        logger.warning("Wandb requested but not available (wandb not installed)")
+        wandb_initialized = False
+    else:
+        wandb_initialized = False
 
     seed = cfg.get('seed', 2262)
     torch.manual_seed(seed)
@@ -188,6 +246,16 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             writer.writerow([
                 'timestamp', 'batch_idx', 'global_prompt_idx', 'local_prompt_idx',
                 'episode_count', 'final_likelihood', 'best_likelihood', 'best_episode', 'best_reward', 'base_text'
+            ])
+    
+    # Prepare policy metrics output
+    policy_metrics_path = os.path.join(metrics_dir, "policy_training_metrics.csv")
+    if not os.path.exists(policy_metrics_path):
+        with open(policy_metrics_path, 'w', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow([
+                'timestamp', 'batch_idx', 'episode', 'avg_reward', 'avg_return', 
+                'avg_advantage', 'policy_loss', 'value_loss', 'entropy', 'epsilon'
             ])
 
     # Shared helper to extract per-prompt final and best likelihood from batched traces
@@ -403,11 +471,21 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             logger.debug(f"  (could not pretty-print {mode_name} traces)")
     
     def run_batch_optimization(batch_prompts, mode):
-        """Run batch optimization for a given mode. Returns (results, rewards, traces)."""
+        """Run batch optimization for a given mode. Returns (results, rewards, traces, policy_metrics)."""
         targets = [p.get('target', '') for p in batch_prompts]
         logger.debug(f"Running batched {mode} optimizer on batch size={len(batch_prompts)}")
         
-        best_results, best_rewards_batch, traces = optimizer.optimize_prompts_batch(
+        # Create wandb logging function if wandb is initialized
+        wandb_log_fn = None
+        if wandb_initialized:
+            def log_to_wandb(log_dict, step=None):
+                try:
+                    wandb.log(log_dict, step=step)
+                except Exception as e:
+                    logger.debug(f"Failed to log to wandb: {e}")
+            wandb_log_fn = log_to_wandb
+        
+        best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
             target_completions=targets,
             episodes=episodes_per_prompt,
             steps_per_episode=steps_per_episode,
@@ -415,10 +493,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             lr_embeddings=lr_embeddings,
             alpha=alpha,
             beta=beta,
-            mode=mode
+            mode=mode,
+            wandb_log_fn=wandb_log_fn
         )
         
-        return best_results, best_rewards_batch, traces
+        return best_results, best_rewards_batch, traces, policy_metrics
     
     # Map optimization mode to the mode string for optimize_prompts_batch
     mode_map = {
@@ -445,10 +524,71 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         if opt_mode in mode_map:
             # Run batch optimization with the mapped mode
             mode = mode_map[opt_mode]
-            best_results, best_rewards_batch, traces = run_batch_optimization(batch_prompts, mode)
+            best_results, best_rewards_batch, traces, policy_metrics = run_batch_optimization(batch_prompts, mode)
             
             # Log traces
             log_traces(traces, mode)
+            
+            # Save policy training metrics
+            try:
+                with open(policy_metrics_path, 'a', newline='') as fh:
+                    writer = csv.writer(fh)
+                    for pm in policy_metrics:
+                        writer.writerow([
+                            datetime.utcnow().isoformat(),
+                            pm.get('batch_idx', batch_start // batch_size),
+                            pm.get('episode', 0),
+                            pm.get('avg_reward', 0.0),
+                            pm.get('avg_return', 0.0),
+                            pm.get('avg_advantage', 0.0),
+                            pm.get('policy_loss', 0.0),
+                            pm.get('value_loss', 0.0),
+                            pm.get('entropy', 0.0),
+                            pm.get('epsilon', 0.0)
+                        ])
+                
+                # Log policy metrics to wandb
+                if wandb_initialized and policy_metrics:
+                    for pm in policy_metrics:
+                        log_dict = {
+                            'policy/avg_reward': pm.get('avg_reward', 0.0),
+                            'policy/avg_return': pm.get('avg_return', 0.0),
+                            'policy/policy_loss': pm.get('policy_loss', 0.0),
+                            'policy/entropy': pm.get('entropy', 0.0),
+                            'policy/epsilon': pm.get('epsilon', 0.0),
+                            'batch': pm.get('batch_idx', batch_start // batch_size),
+                            'episode': pm.get('episode', 0)
+                        }
+                        if pm.get('avg_advantage', 0.0) != 0.0:  # PPO only
+                            log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
+                            log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
+                        wandb.log(log_dict, step=pm.get('batch_idx', 0) * episodes_per_prompt + pm.get('episode', 0))
+                
+                # Log policy metrics summary to console
+                if policy_metrics:
+                    latest = policy_metrics[-1]
+                    logger.info(
+                        f"Policy metrics (Episode {latest.get('episode', 0)+1}, Batch {batch_start//batch_size + 1}): "
+                        f"avg_reward={latest.get('avg_reward', 0.0):.3f}, "
+                        f"policy_loss={latest.get('policy_loss', 0.0):.4f}, "
+                        f"entropy={latest.get('entropy', 0.0):.4f}, "
+                        f"epsilon={latest.get('epsilon', 0.0):.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to save policy metrics: {e}")
+            
+            # Log batch-level summary to wandb
+            if wandb_initialized and best_rewards_batch:
+                batch_avg_reward = np.mean(best_rewards_batch)
+                batch_max_reward = np.max(best_rewards_batch)
+                batch_min_reward = np.min(best_rewards_batch)
+                wandb.log({
+                    'batch/avg_reward': batch_avg_reward,
+                    'batch/max_reward': batch_max_reward,
+                    'batch/min_reward': batch_min_reward,
+                    'batch/prompts_processed': len(best_rewards_batch),
+                    'batch/batch_idx': batch_start // batch_size
+                }, step=batch_start // batch_size)
             
             # Process results
             process_batch_results(
@@ -568,6 +708,15 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     
     else:
         print("No successful training results!")
+    
+    # Finish wandb run if it was initialized
+    if wandb_initialized:
+        try:
+            if wandb.run is not None:
+                wandb.finish()
+                logger.info("Wandb run finished")
+        except Exception as e:
+            logger.warning(f"Error finishing wandb run: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -577,6 +726,8 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, help="Steps per episode (overrides config)")
     parser.add_argument("--fast", action="store_true", help="Use speed-optimized hyperparameters")
     parser.add_argument("--dataset", type=str, default="advbench", choices=["advbench", "toxicchat"], help="Dataset to use (default: advbench)")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="prompt-optimization", help="Wandb project name")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
@@ -590,4 +741,12 @@ if __name__ == "__main__":
     if args.steps:
         cfg['train']['steps_per_episode'] = args.steps
     
-    train_on_dataset(cfg, fast_mode=args.fast, dataset_name=args.dataset)
+    train_on_dataset(
+        cfg, 
+        fast_mode=args.fast, 
+        dataset_name=args.dataset,
+        use_wandb=not args.no_wandb,
+        wandb_project=args.wandb_project
+    )
+    
+    # Note: wandb.finish() is called at the end of train_on_dataset if wandb was initialized

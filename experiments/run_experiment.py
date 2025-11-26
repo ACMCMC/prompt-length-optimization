@@ -203,7 +203,7 @@ def run_single_experiment(
             continue
         
         # Optimize all prompts in batch in parallel
-        optimized_prompts, rewards, traces = optimizer.optimize_prompts_batch(
+        optimized_prompts, rewards, traces, _ = optimizer.optimize_prompts_batch(
             target_completions=batch_completions,
             episodes=episodes_per_prompt,
             steps_per_episode=steps_per_episode,
