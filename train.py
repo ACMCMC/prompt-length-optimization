@@ -303,7 +303,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         if 'ppo' in opt_mode:
             # PPO removed, use standard continuous mode
             targets = [p.get('target', '') for p in batch_prompts]
-            wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
+            wandb_cb = (lambda d: wandb.log(d, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -393,7 +393,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
         elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
-            wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
+            wandb_cb = (lambda d: wandb.log(d, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
