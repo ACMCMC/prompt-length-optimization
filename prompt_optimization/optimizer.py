@@ -23,6 +23,12 @@ class LengthPolicyOptimizer:
         # reward_cfg is accepted for backward compatibility with the GCG branch; it is not used here.
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
+        # Default exploration params to keep logging fields defined
+        self.epsilon = 0.0
+        self.epsilon_decay = 1.0
+        self.epsilon_min = 0.0
+        self.current_epsilon = 0.0
+        self.temperature = 1.0
         
         # Simple policy network: state -> action probs
         self.state_dim = 4  # [length, likelihood, step_ratio, improvement]
