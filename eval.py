@@ -91,13 +91,32 @@ def evaluate_prompt(cfg, agent, optimizer):
     
     # Decode the compressed prompt for display
     try:
-        tokens = agent.tokenizer.encode(test_prompt)[:len(best_prompt)]
-        compressed_prompt = agent.tokenizer.decode(tokens)
-    except:
-        compressed_prompt = str(best_prompt)  # Fallback if decoding fails
+        # Convert best_prompt tensor to list of token IDs
+        if torch.is_tensor(best_prompt):
+            best_prompt_tokens = best_prompt.cpu().tolist()
+        elif isinstance(best_prompt, list):
+            best_prompt_tokens = best_prompt
+        else:
+            best_prompt_tokens = []
+        
+        if best_prompt_tokens:
+            compressed_prompt = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True)
+        else:
+            compressed_prompt = ''
+    except Exception as e:
+        logger.warning(f"Failed to decode compressed prompt: {e}")
+        compressed_prompt = ''  # Fallback if decoding fails
+    
+    # Get length properly
+    if torch.is_tensor(best_prompt):
+        prompt_length = len(best_prompt)
+    elif isinstance(best_prompt, list):
+        prompt_length = len(best_prompt)
+    else:
+        prompt_length = 0
     
     return {
-        'length': len(best_prompt),
+        'length': prompt_length,
         'likelihood': float(best_likelihood),
         'reward': float(reward),
         'compressed_prompt': compressed_prompt
@@ -371,25 +390,45 @@ def evaluate_on_dataset(cfg, model_path):
                 final_likelihood = _extract_final_likelihood(trace, idx_in_batch)
                 completion_tokens = agent.tokenizer.encode(target_completion_text, add_special_tokens=False)
                 avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1) if completion_tokens else float('nan')
-                final_reward = alpha * final_likelihood - beta * (len(best_prompt) if isinstance(best_prompt, list) else 0)
+                
+                # Convert best_prompt tensor to list of token IDs for decoding
+                if torch.is_tensor(best_prompt):
+                    best_prompt_tokens = best_prompt.cpu().tolist()
+                    best_prompt_length = len(best_prompt)
+                elif isinstance(best_prompt, list):
+                    best_prompt_tokens = best_prompt
+                    best_prompt_length = len(best_prompt)
+                else:
+                    best_prompt_tokens = []
+                    best_prompt_length = 0
+                
+                final_reward = alpha * final_likelihood - beta * best_prompt_length
 
+                # Decode optimized prompt from token IDs
                 try:
-                    optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
-                except Exception:
-                    optimized_full_text = str(best_prompt)
+                    if best_prompt_tokens:
+                        optimized_full_text = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True)
+                    else:
+                        optimized_full_text = ''
+                except Exception as e:
+                    logger.warning(f"Failed to decode optimized prompt: {e}")
+                    optimized_full_text = ''
 
+                # Extract optimized suffix (part after the base prompt)
                 optimized_suffix_text = ''
                 try:
-                    if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
+                    if best_prompt_tokens and isinstance(input_prompt_text, str) and input_prompt_text:
                         base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
-                        if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
-                            suffix_ids = best_prompt[len(base_ids):]
+                        if len(best_prompt_tokens) >= len(base_ids) and best_prompt_tokens[:len(base_ids)] == base_ids:
+                            suffix_ids = best_prompt_tokens[len(base_ids):]
                             optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
                         else:
+                            # If base doesn't match, try to extract suffix by text replacement
                             optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
                     else:
                         optimized_suffix_text = optimized_full_text
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to extract optimized suffix: {e}")
                     optimized_suffix_text = optimized_full_text
 
                 result_row = {
@@ -397,15 +436,15 @@ def evaluate_on_dataset(cfg, model_path):
                     'prompt_text': input_prompt_text,
                     'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
                     'initial_tokens': init_len,
-                    'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
-                    'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
+                    'final_tokens': best_prompt_length,
+                    'compression_ratio': (init_len - best_prompt_length) / init_len * 100 if init_len > 0 else 0.0,
                     'final_likelihood': float(final_likelihood),
                     'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
                     'final_reward': float(final_reward),
                     'target_completion': target_completion_text,
                     'optimized_full_prompt': optimized_full_text,
                     'optimized_suffix': optimized_suffix_text,
-                    'compressed_prompt': str(best_prompt)
+                    'compressed_prompt': optimized_full_text  # Use decoded text instead of tensor string
                 }
                 results.append(result_row)
 

@@ -40,6 +40,10 @@ train:
   plots_prefix: training
   no_plots: false
   plots_format: pdf                  # png|pdf (default: pdf)
+  
+  # Wandb logging
+  use_wandb: true                    # Enable wandb logging (default: true)
+  wandb_project: prompt-optimization  # Wandb project name
 
   optimization_mode: continuous_proj
   

@@ -38,11 +38,24 @@ class LengthPolicyOptimizer:
         ).to(agent.device)
         
         # Value network for PPO (estimates state values)
+        # Initialize output layer to predict values around -1000 (typical return scale)
+        # This helps the network start in the right range
         self.value_net = nn.Sequential(
             nn.Linear(self.state_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1)  # Single value output
         ).to(agent.device)
+        
+        # Initialize value network output layer to predict values around typical return scale
+        # This prevents initial value loss from being extremely large
+        with torch.no_grad():
+            # Initialize last layer bias to a typical return value (e.g., -1000)
+            # and scale down weights to prevent large initial predictions
+            if len(self.value_net) > 0:
+                last_layer = self.value_net[-1]
+                if isinstance(last_layer, nn.Linear):
+                    last_layer.bias.fill_(-1000.0)  # Initialize to typical return scale
+                    nn.init.xavier_uniform_(last_layer.weight, gain=0.1)  # Smaller weights
         
         # Use shared optimizer for both networks (PPO) or separate (REINFORCE)
         self.use_ppo = use_ppo
@@ -168,7 +181,7 @@ class LengthPolicyOptimizer:
                                steps_per_episode: int = 50, initial_prompt_length: int = 32,
                                lr_embeddings: float = 0.01, alpha: float = 1.0, beta: float = 0.1,
                                mode: str = "continuous", batch_size: int = 64,
-                               wandb_log_fn=None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -328,7 +341,8 @@ class LengthPolicyOptimizer:
                     episode_actions.append(actions)  # Store actions for PPO
                     
                     # Store step-level trace for plotting
-                    global_step = episode * steps_per_episode + step
+                    local_step = episode * steps_per_episode + step
+                    global_step = global_step_offset + local_step  # Truly global step across all batches
                     # Convert to Python floats, handling NaN/Inf
                     likelihoods_list = []
                     for l in likelihoods:
@@ -405,6 +419,11 @@ class LengthPolicyOptimizer:
                     # Compute returns and advantages using GAE
                     returns, advantages = self._compute_gae(rewards_tensor, old_values, device)
                     
+                    # Normalize returns for stable value learning (store stats for denormalization)
+                    returns_mean = returns.mean()
+                    returns_std = returns.std() + 1e-8
+                    returns_normalized = (returns - returns_mean) / returns_std
+                    
                     # Normalize advantages
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                     
@@ -432,15 +451,20 @@ class LengthPolicyOptimizer:
                         policy_loss_2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages
                         policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
                         
-                        # Value loss
+                        # Value loss (use normalized returns for stable learning)
                         new_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
-                        value_loss = F.mse_loss(new_values, returns)
+                        # Normalize new values to match normalized returns
+                        new_values_normalized = (new_values - returns_mean) / returns_std
+                        # Compute loss on normalized scale (much smaller, more stable)
+                        value_loss = F.mse_loss(new_values_normalized, returns_normalized)
+                        # Scale back to original scale for logging (multiply by std^2)
+                        value_loss_scaled = value_loss * (returns_std ** 2)
                         
                         # Entropy bonus
                         entropy = -(new_action_probs * torch.log(new_action_probs + 1e-8)).sum(dim=-1).mean()
                         entropy_bonus = entropy * self.entropy_coef
                         
-                        # Total loss
+                        # Total loss (use normalized value loss for training, but log scaled version)
                         total_loss = policy_loss + self.ppo_value_coef * value_loss - entropy_bonus
                         
                         # Update
@@ -452,9 +476,9 @@ class LengthPolicyOptimizer:
                         )
                         self.optimizer.step()
                         
-                        # Store final metrics from last epoch
+                        # Store final metrics from last epoch (use scaled loss for logging)
                         final_policy_loss = policy_loss.item()
-                        final_value_loss = value_loss.item()
+                        final_value_loss = value_loss_scaled.item()  # Use scaled loss for logging
                         final_entropy = entropy.item()
                     
                     # Track policy metrics for PPO (after all epochs)
