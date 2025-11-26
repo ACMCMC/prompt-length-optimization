@@ -9,18 +9,35 @@ import yaml
 import random
 import time
 import csv
+import logging
 from datetime import datetime
 from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
 from prompt_optimization.datasets import ToxicChatDatasetManager
 import numpy as np
 
-def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
+try:
+    import wandb  # type: ignore
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_wandb: bool = None, wandb_project: str = None):
     """Train the prompt compression policy. Set fast_mode=True for a speed-focused run.
 
     dataset_name: 'advbench' or 'toxicchat' (default 'advbench')
+    use_wandb: Whether to log to wandb (None = use config, True/False = override)
+    wandb_project: Wandb project name (None = use config, str = override)
     """
     model_name = cfg['model']
     train_cfg = cfg['train']
+    cfg_use_wandb = train_cfg.get('use_wandb', train_cfg.get('wandb', {}).get('enable', False))
+    cfg_wandb_project = train_cfg.get('wandb_project', train_cfg.get('wandb', {}).get('project', 'prompt-length-optimization'))
+    if use_wandb is None:
+        use_wandb = cfg_use_wandb
+    if wandb_project is None:
+        wandb_project = cfg_wandb_project
 
     base_episodes = train_cfg.get('episodes_per_prompt', 3)
     base_steps = train_cfg.get('steps_per_episode', 100)
@@ -95,19 +112,39 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         print("Fast mode applies half episodes/steps and doubles learning rates relative to config values.")
 
     # Optional W&B logging (initialized after mode_name is defined)
-    wandb_cfg = cfg.get('wandb', train_cfg.get('wandb', {})) if isinstance(train_cfg, dict) else {}
-    use_wandb = bool(wandb_cfg.get('enable', False))
-    if use_wandb:
+    wandb_initialized = False
+    if use_wandb and WANDB_AVAILABLE:
         try:
-            import wandb  # type: ignore
             wandb.init(
-                project=wandb_cfg.get('project', 'prompt-length-optimization'),
-                name=wandb_cfg.get('run_name', f"{mode_name.lower()}_{dataset_name}_{rl_algo}"),
-                config=cfg
+                project=wandb_project or 'prompt-length-optimization',
+                name=f"{mode_name.lower()}_{dataset_name}_{rl_algo}",
+                config={
+                    'model': model_name,
+                    'optimization_mode': optimization_mode,
+                    'episodes_per_prompt': episodes_per_prompt,
+                    'steps_per_episode': steps_per_episode,
+                    'init_len': init_len,
+                    'max_prompts': max_prompts,
+                    'batch_size': batch_size,
+                    'lr_embeddings': lr_embeddings,
+                    'lr_policy': lr_policy,
+                    'alpha': alpha,
+                    'beta': beta,
+                    'dataset': dataset_name,
+                    'seed': cfg.get('seed', 2262)
+                }
             )
+            wandb_initialized = True
+            logger.info(f"Wandb initialized: project={wandb_project or 'prompt-length-optimization'}, run={wandb.run.name}")
+            try:
+                wandb.log({'train/started': 1, 'train/max_prompts': max_prompts, 'train/batch_size': batch_size})
+            except Exception as e:
+                logger.warning(f"Failed to send initial wandb log: {e}")
         except Exception as e:
-            print(f"Warning: failed to initialize wandb ({e}), disabling wandb logging.")
-            use_wandb = False
+            logger.warning(f"Failed to initialize wandb: {e}")
+            wandb_initialized = False
+    elif use_wandb and not WANDB_AVAILABLE:
+        logger.warning("Wandb requested but not available (wandb not installed)")
     
     # Load dataset according to selected dataset_name
     prompts = []
@@ -318,45 +355,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
                     'likelihood': best_ll
                 })
-                if use_wandb:
-                    try:
-                        wandb.log({
-                            "reward": float(best_reward),
-                            "prompt_length": len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
-                            "likelihood": best_ll,
-                            "prompt_idx": global_idx
-                        })
-                    except Exception:
-                        print("Warning: failed to log prompt metrics to wandb.")
-                batch_summaries.append({
-                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
-                    'optimized_full': optimized_text,
-                    'optimized_suffix': optimized_suffix_text,
-                    'target': batch_prompts[prompt_idx].get('target', ''),
-                    'reward': float(best_reward),
-                    'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
-                    'likelihood': best_ll
-                })
-                if use_wandb:
-                    try:
-                        wandb.log({
-                            "reward": float(best_reward),
-                            "prompt_length": len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
-                            "likelihood": best_ll,
-                            "prompt_idx": global_idx
-                        })
-                    except Exception:
-                        print("Warning: failed to log prompt metrics to wandb.")
-                batch_summaries.append({
-                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
-                    'optimized_full': optimized_text,
-                    'optimized_suffix': optimized_suffix_text,
-                    'target': batch_prompts[prompt_idx].get('target', ''),
-                    'reward': float(best_reward),
-                    'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
-                    'likelihood': best_ll
-                })
-                if use_wandb:
+                if wandb_initialized:
                     try:
                         wandb.log({
                             "reward": float(best_reward),
@@ -633,9 +632,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
             print(f"  Input: {summary['input'][:180]}{'...' if len(summary['input']) > 180 else ''}")
             print(f"  Optimized suffix: {summary['optimized_suffix'][:180]}{'...' if len(summary['optimized_suffix']) > 180 else ''}")
             print(f"  Target completion: {summary['target'][:180]}{'...' if len(summary['target']) > 180 else ''}")
-        if use_wandb:
+        if wandb_initialized:
             try:
-                import wandb  # type: ignore
                 wandb.log({
                     "batch/index": batch_start // batch_size,
                     "batch/mean_best_reward": float(np.mean(all_rewards[-len(batch_prompts):])) if batch_prompts else 0.0,
@@ -755,7 +753,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                 
             except Exception as e:
                 print(f"Could not generate plot: {e}")
-        if use_wandb:
+        if wandb_initialized:
             try:
                 wandb.log({
                     "final/best_reward": float(best_overall_reward),
@@ -769,6 +767,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     
     else:
         print("No successful training results!")
+
+    if wandb_initialized and WANDB_AVAILABLE:
+        try:
+            if wandb.run is not None:
+                wandb.finish()
+                logger.info("Wandb run finished")
+        except Exception as e:
+            logger.warning(f"Error finishing wandb run: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
