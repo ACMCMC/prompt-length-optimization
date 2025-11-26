@@ -19,7 +19,8 @@ from prompt_optimization.optimizers import (
 class LengthPolicyOptimizer:
     """RL optimizer that learns prompt length policy using REINFORCE."""
     
-    def __init__(self, agent: PromptRLAgent):
+    def __init__(self, agent: PromptRLAgent, reward_cfg=None):
+        # reward_cfg is accepted for backward compatibility with the GCG branch; it is not used here.
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
@@ -307,4 +308,3 @@ class LengthPolicyOptimizer:
             all_traces.extend(traces)
         
         return all_final_prompts, all_rewards, all_traces
-
