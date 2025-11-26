@@ -366,11 +366,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
-                # Recompute likelihood directly for reliability
+                # Recompute likelihood directly for reliability (use this as best/final)
                 recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
                 if recomputed_ll is not None:
                     final_ll = recomputed_ll
-                    best_ll = max(best_ll, recomputed_ll)
+                    best_ll = recomputed_ll
+                    if best_ep is None:
+                        best_ep = 0
 
                 print(f"PPO metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
@@ -487,11 +489,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
-                # Recompute likelihood directly for reliability
+                # Recompute likelihood directly for reliability (use this as best/final)
                 recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
                 if recomputed_ll is not None:
                     final_ll = recomputed_ll
-                    best_ll = max(best_ll, recomputed_ll)
+                    best_ll = recomputed_ll
+                    if best_ep is None:
+                        best_ep = 0
 
                 # Print per-prompt episode metrics
                 print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
@@ -566,11 +570,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
                     final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
-                # Recompute likelihood directly for reliability
+                # Recompute likelihood directly for reliability (use this as best/final)
                 recomputed_ll = _compute_likelihood(agent, best_prompt_result, batch_prompts[prompt_idx].get('target', ''))
                 if recomputed_ll is not None:
                     final_ll = recomputed_ll
-                    best_ll = max(best_ll, recomputed_ll)
+                    best_ll = recomputed_ll
+                    if best_ep is None:
+                        best_ep = 0
 
                 print(f"Episode metrics (prompt local idx={prompt_idx}, global idx={global_idx}): final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, best_reward={best_reward_val}")
 
