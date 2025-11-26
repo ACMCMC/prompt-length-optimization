@@ -325,10 +325,12 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
         # Select optimization pipeline based on config
         opt_mode = optimization_mode_lower
+        # Wandb log callback (monotonic steps handled in optimizer)
+        wandb_cb = (lambda d: wandb.log(d, commit=True)) if wandb_initialized else None
+        tracked_prompts = train_cfg.get('wandb_track_prompts', [0, 1, 2])
         if 'ppo' in opt_mode:
             # PPO removed, use standard continuous mode
             targets = [p.get('target', '') for p in batch_prompts]
-            wandb_cb = (lambda d: wandb.log(d, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -348,7 +350,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 wandb_log_fn=wandb_cb,
-                global_step_offset=(batch_start // batch_size) * steps_per_episode
+                global_step_offset=(batch_start // batch_size) * steps_per_episode,
+                log_prompt_indices=tracked_prompts
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
@@ -425,7 +428,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
 
         elif opt_mode == 'continuous':
             targets = [p.get('target', '') for p in batch_prompts]
-            wandb_cb = (lambda d: wandb.log(d, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
                 episodes=episodes_per_prompt,
@@ -445,7 +447,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 wandb_log_fn=wandb_cb,
-                global_step_offset=(batch_start // batch_size) * steps_per_episode
+                global_step_offset=(batch_start // batch_size) * steps_per_episode,
+                log_prompt_indices=tracked_prompts
             )
 
             # unpack and report per-prompt
@@ -551,7 +554,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 wandb_log_fn=wandb_cb,
-                global_step_offset=(batch_start // batch_size) * steps_per_episode
+                global_step_offset=(batch_start // batch_size) * steps_per_episode,
+                log_prompt_indices=tracked_prompts
             )
 
             for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):

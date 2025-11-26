@@ -103,7 +103,8 @@ class LengthPolicyOptimizer:
                                gamma: float = 0.99, gae_lambda: float = 0.95,
                                value_coef: float = 0.5, entropy_coef: float = 0.01,
                                max_suffix_len: int = 64, init_len: int = 32,
-                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               wandb_log_fn=None, global_step_offset: int = 0,
+                               log_prompt_indices: Optional[List[int]] = None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -112,6 +113,8 @@ class LengthPolicyOptimizer:
         B = len(target_completions)
         if B == 0:
             return [], [], [], []
+        if log_prompt_indices is None:
+            log_prompt_indices = []
         
         # Process in batches of batch_size
         all_final_prompts = []
@@ -218,6 +221,42 @@ class LengthPolicyOptimizer:
                     episode_rewards.append(rewards)
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
+
+                    # Optional wandb logging hook (step-level)
+                    if wandb_log_fn is not None:
+                        avg_reward = rewards.mean().item()
+                        avg_likelihood = likelihoods.mean().item()
+                        avg_length = lengths.float().mean().item()
+                        avg_best_likelihood = best_rewards.mean().item()
+                        action_counts = torch.bincount(actions, minlength=3)
+                        action_probs_step = action_counts.float() / batch_B
+                        step_log = {
+                            'step/avg_reward': avg_reward,
+                            'step/avg_likelihood': avg_likelihood,
+                            'step/avg_length': avg_length,
+                            'step/min_length': lengths.min().item(),
+                            'step/max_length': lengths.max().item(),
+                            'step/avg_best_reward': avg_best_likelihood,
+                            'step/action_prob_decrease': action_probs_step[0].item(),
+                            'step/action_prob_keep': action_probs_step[1].item(),
+                            'step/action_prob_increase': action_probs_step[2].item(),
+                            'step/epsilon': self.current_epsilon,
+                            'episode': episode,
+                            'step_in_episode': step,
+                            'global_step': global_step,
+                            'batch_idx': batch_start // batch_size
+                        }
+                        for idx in log_prompt_indices:
+                            if 0 <= idx < batch_B:
+                                step_log.update({
+                                    f"prompt/{idx}/reward": rewards[idx].item(),
+                                    f"prompt/{idx}/likelihood": likelihoods[idx].item(),
+                                    f"prompt/{idx}/length": int(lengths[idx].item())
+                                })
+                        try:
+                            wandb_log_fn(step_log)
+                        except Exception:
+                            pass
                 
                 # Policy update (PPO by default)
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
