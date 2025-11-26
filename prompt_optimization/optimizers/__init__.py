@@ -7,8 +7,7 @@ from prompt_optimization.optimizers.continuous_proj import ContinuousPromptOptim
 from prompt_optimization.optimizers.discrete import DiscretePromptOptimizer
 
 __all__ = [
-    'ContinuousPromptOptimizer',
-    'ContinuousPromptOptimizerWithProjection',
-    'DiscretePromptOptimizer',
+    "ContinuousPromptOptimizer",
+    "ContinuousPromptOptimizerWithProjection",
+    "DiscretePromptOptimizer",
 ]
-
