@@ -10,7 +10,7 @@ dataset:
 
 train:
   # Dataset parameters - SMOKE TEST: minimal settings
-  max_prompts: 1                      # Only 1 prompt for smoke test
+  max_prompts: 10                      # Only 10 prompts for smoke test
   min_prompt_length: 30               # Minimum prompt length (characters)
   max_prompt_length: 150              # Maximum prompt length (characters)
   
@@ -34,7 +34,7 @@ train:
   distance_metric: l2                 # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters - SMOKE TEST: batch size 1
-  batch_size: 1                       # Batch size 1 for smoke test
+  batch_size: 10                       # Batch size 10 for smoke test
   
   # Output
   save_path: models/trained_policy_smoke_test.pt

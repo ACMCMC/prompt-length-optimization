@@ -6,7 +6,7 @@ Optimizes both likelihood and distance to nearest vocabulary token.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Tuple
+from typing import Tuple, Optional
 from ..interface import BasePromptOptimizer
 from ..model_inputs import ModelBatchedInput
 
@@ -87,29 +87,33 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         
         return prompt_data, updated_lengths
     
-    def _compute_projection_loss(self, embeds: torch.Tensor) -> torch.Tensor:
+    def _compute_projection_loss(self, embeds: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Compute distance to nearest vocabulary token for each embedding.
+        Compute projection loss (mean distance to nearest vocab token).
         
         Args:
             embeds: [B, L, D] or [L, D] tensor of embeddings
+            mask: [B, L] optional mask indicating which positions to include (1 = active, 0 = inactive)
+                  If embeds is 2D, mask should be [L] or None
             
         Returns:
-            loss: Scalar loss (mean distance to nearest vocab token)
+            loss: Scalar loss (mean distance to nearest vocab token, only over masked positions)
         """
+        # Handle 2D input (single prompt)
         if embeds.dim() == 2:
             embeds = embeds.unsqueeze(0)  # [1, L, D]
+            if mask is not None and mask.dim() == 1:
+                mask = mask.unsqueeze(0)  # [1, L]
         
         B, L, D = embeds.shape
         
         # Flatten for batch processing
-        flat_embeds = embeds.view(B * L, D)  # [B*L, D]
+        flat_embeds = embeds.reshape(B * L, D)  # [B*L, D]
         
         if self.distance_metric == "l2":
             # L2 distance: ||e - v||^2
             distances = torch.cdist(flat_embeds, self.vocab_embeds)  # [B*L, vocab_size]
             min_distances = distances.min(dim=-1)[0]  # [B*L]
-            loss = min_distances.mean()
         else:  # dot product
             # Negative dot product (maximize similarity = minimize negative dot)
             # Normalize embeddings first
@@ -119,6 +123,20 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             max_similarities = similarities.max(dim=-1)[0]  # [B*L]
             # Convert to distance: 1 - similarity (since similarity is in [-1, 1])
             min_distances = 1.0 - max_similarities
+        
+        # Reshape to [B, L] and apply mask if provided
+        min_distances = min_distances.reshape(B, L)  # [B, L]
+        
+        if mask is not None:
+            # Only compute loss over active positions (where mask == 1)
+            masked_distances = min_distances * mask  # [B, L]
+            num_active = mask.sum()  # Total number of active positions
+            if num_active > 0:
+                loss = masked_distances.sum() / num_active
+            else:
+                loss = torch.tensor(0.0, device=embeds.device, requires_grad=True)
+        else:
+            # No mask: compute mean over all positions
             loss = min_distances.mean()
         
         return loss
@@ -184,9 +202,10 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         likelihoods = self.agent.get_likelihoods_batch(model_input, requires_grad=True)
         
         # Compute projection loss with gradients enabled (only on active positions)
-        # Use a slice of prompt_data directly (not through model_input) to avoid graph issues
-        active_embeds = prompt_data[:, :max_active_len] if max_active_len > 0 else prompt_data
-        proj_loss = self._compute_projection_loss(active_embeds)
+        # Use the suffix attention mask from model_input to determine which positions are active
+        # This preserves the connection to the original suffix positions and avoids indexing issues
+        suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
+        proj_loss = self._compute_projection_loss(prompt_data, mask=suffix_mask)
         
         # Combined loss: negative likelihood (maximize) + projection loss (minimize)
         loss = -likelihoods.mean() + self.projection_weight * proj_loss

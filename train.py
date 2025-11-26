@@ -131,18 +131,18 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 )
                 wandb_initialized = True
                 logger.info(f"Wandb initialized: project={wandb_project}, run={wandb.run.name}")
-                # Log initial metrics to verify wandb is working
+                # Log initial metrics to verify wandb is working (use step=0, will be first step)
                 try:
-                    wandb.log({'train/started': 1, 'train/max_prompts': max_prompts, 'train/batch_size': batch_size})
+                    wandb.log({'train/started': 1, 'train/max_prompts': max_prompts, 'train/batch_size': batch_size}, step=0)
                     logger.info(f"Wandb test log sent. View at: {wandb.run.url}")
                 except Exception as e:
                     logger.warning(f"Failed to send test log to wandb: {e}")
             else:
                 wandb_initialized = True  # Already initialized (e.g., by sweep)
                 logger.info("Wandb already initialized (likely by sweep)")
-                # Log initial metrics to verify wandb is working
+                # Log initial metrics to verify wandb is working (use step=0, will be first step)
                 try:
-                    wandb.log({'train/started': 1, 'train/max_prompts': max_prompts, 'train/batch_size': batch_size})
+                    wandb.log({'train/started': 1, 'train/max_prompts': max_prompts, 'train/batch_size': batch_size}, step=0)
                     logger.info(f"Wandb test log sent. View at: {wandb.run.url}")
                 except Exception as e:
                     logger.warning(f"Failed to send test log to wandb: {e}")
@@ -596,6 +596,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     batch_prompts, mode, batch_idx, episode_idx, num_batches
                 )
                 
+                # Calculate the last step of this episode for logging policy/batch metrics
+                # This ensures we log at the same step as the last step-level metric
+                # We add a small offset to ensure it's logged after all step-level metrics
+                last_episode_step = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode + steps_per_episode - 1
+                # Use the next step to ensure it's after all step-level metrics for this episode
+                policy_batch_step = last_episode_step + 1
+                
                 # Log traces
                 log_traces(traces, mode)
                 
@@ -617,7 +624,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 pm.get('epsilon', 0.0)
                             ])
                     
-                    # Log policy metrics to wandb
+                    # Log policy metrics to wandb at the last step of the episode
+                    # This should be done immediately after the episode completes, before the next episode starts
                     if wandb_initialized and policy_metrics:
                         for pm in policy_metrics:
                             log_dict = {
@@ -627,16 +635,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 'policy/entropy': pm.get('entropy', 0.0),
                                 'policy/epsilon': pm.get('epsilon', 0.0),
                                 'batch': pm.get('batch_idx', batch_idx),
-                                'episode': pm.get('episode', episode_idx)
+                                'episode': episode_idx  # Use episode_idx from outer loop
                             }
                             if pm.get('avg_advantage', 0.0) != 0.0:  # PPO only
                                 log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
                                 log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
-                            # Use same global step calculation as step-level metrics for consistency
-                            batch_idx_for_step = pm.get('batch_idx', batch_idx)
-                            episode_for_step = pm.get('episode', episode_idx)
-                            policy_step = episode_for_step * num_batches * steps_per_episode + batch_idx_for_step * steps_per_episode
-                            wandb.log(log_dict, step=policy_step, commit=True)
+                            # Log at the step after the last step-level metric to ensure monotonic ordering
+                            wandb.log(log_dict, step=policy_batch_step, commit=True)
                     
                     # Log policy metrics summary to console
                     if policy_metrics:
@@ -651,14 +656,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 except Exception as e:
                     logger.warning(f"Failed to save policy metrics: {e}")
                 
-                # Log batch-level summary to wandb
+                # Log batch-level summary to wandb at the last step of the episode
+                # This should be done immediately after the episode completes, before the next episode starts
                 if wandb_initialized and best_rewards_batch:
                     batch_avg_reward = np.mean(best_rewards_batch)
                     batch_max_reward = np.max(best_rewards_batch)
                     batch_min_reward = np.min(best_rewards_batch)
                     try:
-                        # Use same global step calculation for consistency
-                        batch_step = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
+                        # Log at the step after the last step-level metric to ensure monotonic ordering
                         wandb.log({
                             'batch/avg_reward': batch_avg_reward,
                             'batch/max_reward': batch_max_reward,
@@ -666,7 +671,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                             'batch/prompts_processed': len(best_rewards_batch),
                             'batch/batch_idx': batch_idx,
                             'batch/episode': episode_idx
-                        }, step=batch_step, commit=True)
+                        }, step=policy_batch_step, commit=True)
                     except Exception as e:
                         logger.warning(f"Failed to log batch metrics to wandb: {e}")
                 
