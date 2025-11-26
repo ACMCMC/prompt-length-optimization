@@ -87,6 +87,21 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     print(f"Alpha: {alpha}, Beta: {beta}")
     if fast_mode:
         print("Fast mode applies half episodes/steps and doubles learning rates relative to config values.")
+
+    # Optional W&B logging (safe initialization after mode_name is defined)
+    wandb_cfg = cfg.get('wandb', train_cfg.get('wandb', {})) if isinstance(train_cfg, dict) else {}
+    use_wandb = bool(wandb_cfg.get('enable', False))
+    if use_wandb:
+        try:
+            import wandb  # type: ignore
+            wandb.init(
+                project=wandb_cfg.get('project', 'prompt-length-optimization'),
+                name=wandb_cfg.get('run_name', f"{mode_name.lower()}_{dataset_name}"),
+                config=cfg
+            )
+        except Exception as e:
+            print(f"Warning: failed to initialize wandb ({e}), disabling wandb logging.")
+            use_wandb = False
     
     # Load dataset according to selected dataset_name
     prompts = []
@@ -315,8 +330,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                         else:
                             # generic trace dump
                             print(f"  trace entry: {t}")
-                    if not show_all:
-                        print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
+        if not show_all:
+            print(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
             except Exception as _:
                 print("  (could not pretty-print traces)")
             
@@ -527,6 +542,17 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
         print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
         print(f"  Best batch reward: {max(all_rewards[-len(batch_prompts):]) if all_rewards else 'N/A'}")
         print(f"  Overall best so far: {best_overall_reward:.3f}")
+        if use_wandb:
+            try:
+                wandb.log({
+                    "batch/index": batch_start // batch_size,
+                    "batch/time_sec": batch_time,
+                    "batch/avg_time_per_prompt": avg_time_per_prompt,
+                    "batch/best_reward": float(max(all_rewards[-len(batch_prompts):])) if all_rewards else float('nan'),
+                    "overall/best_reward": float(best_overall_reward),
+                })
+            except Exception as _:
+                print("Warning: failed to log batch metrics to wandb.")
         
         # Progress estimate
         completed = len(all_rewards)
