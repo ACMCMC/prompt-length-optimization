@@ -181,6 +181,7 @@ class LengthPolicyOptimizer:
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
+                    global_step = global_step_offset + episode * steps_per_episode + step
                     # Inner optimization step (e.g., gradient updates, GCG replacements)
                     # Pass prefix info for proper likelihood computation
                     prompt_data, likelihoods = optimizer.inner_optimization_step(
