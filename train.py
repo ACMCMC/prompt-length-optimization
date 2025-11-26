@@ -313,20 +313,59 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     'input': batch_prompts[prompt_idx].get('base', '')[:200],
                     'optimized_full': optimized_text,
                     'optimized_suffix': optimized_suffix_text,
-                    'target': batch_prompts[prompt_idx].get('target', '')
+                    'target': batch_prompts[prompt_idx].get('target', ''),
+                    'reward': float(best_reward),
+                    'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                    'likelihood': best_ll
                 })
+                if use_wandb:
+                    try:
+                        wandb.log({
+                            "reward": float(best_reward),
+                            "prompt_length": len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                            "likelihood": best_ll,
+                            "prompt_idx": global_idx
+                        })
+                    except Exception:
+                        print("Warning: failed to log prompt metrics to wandb.")
                 batch_summaries.append({
                     'input': batch_prompts[prompt_idx].get('base', '')[:200],
                     'optimized_full': optimized_text,
                     'optimized_suffix': optimized_suffix_text,
-                    'target': batch_prompts[prompt_idx].get('target', '')
+                    'target': batch_prompts[prompt_idx].get('target', ''),
+                    'reward': float(best_reward),
+                    'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                    'likelihood': best_ll
                 })
+                if use_wandb:
+                    try:
+                        wandb.log({
+                            "reward": float(best_reward),
+                            "prompt_length": len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                            "likelihood": best_ll,
+                            "prompt_idx": global_idx
+                        })
+                    except Exception:
+                        print("Warning: failed to log prompt metrics to wandb.")
                 batch_summaries.append({
                     'input': batch_prompts[prompt_idx].get('base', '')[:200],
                     'optimized_full': optimized_text,
                     'optimized_suffix': optimized_suffix_text,
-                    'target': batch_prompts[prompt_idx].get('target', '')
+                    'target': batch_prompts[prompt_idx].get('target', ''),
+                    'reward': float(best_reward),
+                    'length': len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                    'likelihood': best_ll
                 })
+                if use_wandb:
+                    try:
+                        wandb.log({
+                            "reward": float(best_reward),
+                            "prompt_length": len(best_prompt_result) if isinstance(best_prompt_result, list) else len(best_prompt_result) if hasattr(best_prompt_result, '__len__') else 0,
+                            "likelihood": best_ll,
+                            "prompt_idx": global_idx
+                        })
+                    except Exception:
+                        print("Warning: failed to log prompt metrics to wandb.")
 
                 if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                     print(f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, Latest PPO reward: {best_reward:.3f}")
@@ -603,6 +642,18 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
                     "batch/best_reward": float(max(all_rewards[-len(batch_prompts):])) if batch_prompts else 0.0,
                     "batch/time_sec": batch_time
                 })
+                if batch_summaries:
+                    table = wandb.Table(columns=["input", "optimized_suffix", "target", "reward", "length", "likelihood"])
+                    for s in batch_summaries:
+                        table.add_data(
+                            s.get('input', ''),
+                            s.get('optimized_suffix', ''),
+                            s.get('target', ''),
+                            s.get('reward', float('nan')),
+                            s.get('length', 0),
+                            s.get('likelihood', float('nan'))
+                        )
+                    wandb.log({"examples": table})
             except Exception as _:
                 print("Warning: failed to log to wandb for this batch.")
         
