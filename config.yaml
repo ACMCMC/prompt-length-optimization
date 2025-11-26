@@ -24,6 +24,8 @@ train:
   lr_policy: 0.0003
   alpha: 1.0                         # Likelihood weight
   beta: 0.2                          # Length penalty (higher = more compression)
+  projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
+  distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
   batch_size: 64                      # Prompts per batch for progress tracking

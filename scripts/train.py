@@ -41,8 +41,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
     ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
     ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
-    global_reward_cfg = cfg.get('reward', {})
-    reward_cfg = train_cfg.get('reward', global_reward_cfg)
 
     # Default to a larger prompt-batch to better utilize a single GPU
     batch_size = train_cfg.get('batch_size', 16)
@@ -143,7 +141,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench"):
     
     # Initialize agent and optimizer
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg)
+    optimizer = LengthPolicyOptimizer(agent)
     # Prepare metrics output
     metrics_dir = "results"
     os.makedirs(metrics_dir, exist_ok=True)

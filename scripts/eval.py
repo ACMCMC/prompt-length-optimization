@@ -14,14 +14,14 @@ from prompt_optimization.datasets import ToxicChatDatasetManager
 from prompt_optimization.plotting import plot_eval_trace, save_trace_csv
 import pandas as pd
 
-def load_trained_model(model_path, reward_cfg=None):
+def load_trained_model(model_path):
     """Load a trained policy model from disk."""
     checkpoint = torch.load(model_path, map_location='cpu')
     model_name = checkpoint['model_name']
     
     # Initialize agent and optimizer  
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg)
+    optimizer = LengthPolicyOptimizer(agent)
     
     # Load the trained policy weights
     optimizer.policy_net.load_state_dict(checkpoint['policy_state_dict'])
@@ -40,17 +40,18 @@ def evaluate_prompt(cfg, agent, optimizer):
     gcg_steps = eval_cfg.get('gcg_steps', cfg.get('train', {}).get('gcg_steps', 5))
     opt_mode = optimization_mode.lower()
     if 'ppo' in opt_mode:
-        # PPO method removed during refactoring, fall back to standard optimization
-        print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch(
+        best_prompts_batch, best_rewards_batch, _ = optimizer.optimize_prompts_batch_ppo(
             target_completions=[test_prompt],
             episodes=1,
             steps_per_episode=max_policy_steps,
             initial_prompt_length=init_len,
             lr_embeddings=0.01,
+            lr_policy=0.0003,
             alpha=cfg.get('train', {}).get('alpha', 1.0),
             beta=cfg.get('train', {}).get('beta', 0.1),
-            mode='continuous' if 'continuous' in opt_mode else 'discrete'
+            base_prompts=[None],
+            optimization_mode='continuous',
+            inner_steps=5
         )
         best_prompt = best_prompts_batch[0] if best_prompts_batch else []
         completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
@@ -76,27 +77,14 @@ def evaluate_prompt(cfg, agent, optimizer):
     # Calculate reward (negative of the combined loss)
     alpha = cfg.get('train', {}).get('alpha', 1.0)
     beta = cfg.get('train', {}).get('beta', 0.1)
-    completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
-    if isinstance(best_prompt, torch.Tensor):
-        best_prompt_tokens = best_prompt.detach().tolist()
-    elif isinstance(best_prompt, list):
-        best_prompt_tokens = best_prompt
-    else:
-        best_prompt_tokens = []
-    reward, _ = optimizer._compute_total_reward(
-        teacher_ll=best_likelihood,
-        combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
-        completion_tokens=completion_tokens,
-        current_length=len(best_prompt_tokens),
-        alpha=alpha,
-        beta=beta
-    )
+    reward = alpha * best_likelihood - beta * len(best_prompt)
     
     # Decode the compressed prompt for display
     try:
-        compressed_prompt = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True) if best_prompt_tokens else ''
-    except Exception:
-        compressed_prompt = str(best_prompt_tokens)  # Fallback if decoding fails
+        tokens = agent.tokenizer.encode(test_prompt)[:len(best_prompt)]
+        compressed_prompt = agent.tokenizer.decode(tokens)
+    except:
+        compressed_prompt = str(best_prompt)  # Fallback if decoding fails
     
     return {
         'length': len(best_prompt),
@@ -193,9 +181,7 @@ def evaluate_on_dataset(cfg, model_path):
         raise ValueError("No test prompts found")
     
     # Load trained model
-    global_reward_cfg = cfg.get('reward', {})
-    eval_reward_cfg = eval_cfg.get('reward', cfg.get('train', {}).get('reward', global_reward_cfg))
-    agent, optimizer, checkpoint = load_trained_model(model_path, reward_cfg=eval_reward_cfg)
+    agent, optimizer, checkpoint = load_trained_model(model_path)
     
     print(f"Loaded model with {len(checkpoint.get('training_rewards', []))} training examples")
     best_reward_val = checkpoint.get('best_reward', None)
@@ -207,15 +193,6 @@ def evaluate_on_dataset(cfg, model_path):
     # Get alpha and beta for reward calculation
     alpha = cfg.get('train', {}).get('alpha', 1.0)
     beta = cfg.get('train', {}).get('beta', 0.1)
-    
-    # Get PPO parameters from config (for backward compatibility, though PPO is removed)
-    ppo_cfg = cfg.get('train', {}).get('ppo', {})
-    ppo_epochs = ppo_cfg.get('epochs', 1)
-    ppo_clip = ppo_cfg.get('clip', 0.2)
-    ppo_gamma = ppo_cfg.get('gamma', 0.99)
-    ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
-    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
-    ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
     
     # Check if we should save plots
     save_plots = not eval_cfg.get('no_plots', True)
@@ -288,17 +265,27 @@ def evaluate_on_dataset(cfg, model_path):
         opt_mode = optimization_mode.lower()
         try:
             if 'ppo' in opt_mode:
-                # PPO method removed during refactoring, fall back to standard optimization
-                print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                if 'discrete' in opt_mode:
+                    raise NotImplementedError("Parallel PPO evaluation currently supports continuous mode only.")
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_ppo(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
                     initial_prompt_length=init_len,
                     lr_embeddings=0.01,
+                    lr_policy=0.0003,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous' if 'continuous' in opt_mode else 'discrete'
+                    base_prompts=bases,
+                    optimization_mode='continuous',
+                    inner_steps=5,
+                    use_ppo=True,
+                    ppo_epochs=ppo_epochs,
+                    ppo_clip=ppo_clip,
+                    gamma=ppo_gamma,
+                    gae_lambda=ppo_lambda,
+                    value_coef=ppo_value_coef,
+                    entropy_coef=ppo_entropy_coef
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
@@ -309,18 +296,21 @@ def evaluate_on_dataset(cfg, model_path):
                     lr_embeddings=0.01,
                     alpha=alpha,
                     beta=beta,
-                    mode='continuous'
+                    base_prompts=bases,
+                    inner_steps=5
                 )
             elif opt_mode == 'discrete':
-                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch(
+                best_prompts_batch, best_rewards_batch, traces_batch = optimizer.optimize_prompts_batch_discrete(
                     target_completions=targets,
                     episodes=1,
                     steps_per_episode=max_policy_steps,
                     initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
+                    gcg_top_k=gcg_top_k,
+                    gcg_batch_size=gcg_batch_size,
+                    gcg_steps=gcg_steps,
                     alpha=alpha,
                     beta=beta,
-                    mode='discrete'
+                    base_prompts=bases
                 )
             else:
                 # fallback: run sequentially
@@ -381,33 +371,19 @@ def evaluate_on_dataset(cfg, model_path):
                 final_likelihood = _extract_final_likelihood(trace, idx_in_batch)
                 completion_tokens = agent.tokenizer.encode(target_completion_text, add_special_tokens=False)
                 avg_likelihood = float(final_likelihood) / max(len(completion_tokens), 1) if completion_tokens else float('nan')
-                if isinstance(best_prompt, torch.Tensor):
-                    best_prompt_tokens = best_prompt.detach().tolist()
-                elif isinstance(best_prompt, list):
-                    best_prompt_tokens = best_prompt
-                else:
-                    best_prompt_tokens = []
-                reward_value, _ = optimizer._compute_total_reward(
-                    teacher_ll=final_likelihood,
-                    combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
-                    completion_tokens=completion_tokens,
-                    current_length=len(best_prompt_tokens),
-                    alpha=alpha,
-                    beta=beta
-                )
-                final_reward = float(reward_value)
+                final_reward = alpha * final_likelihood - beta * (len(best_prompt) if isinstance(best_prompt, list) else 0)
 
                 try:
-                    optimized_full_text = agent.tokenizer.decode(best_prompt_tokens, skip_special_tokens=True) if best_prompt_tokens else ''
+                    optimized_full_text = agent.tokenizer.decode(best_prompt, skip_special_tokens=True) if isinstance(best_prompt, list) else str(best_prompt)
                 except Exception:
-                    optimized_full_text = str(best_prompt_tokens)
+                    optimized_full_text = str(best_prompt)
 
                 optimized_suffix_text = ''
                 try:
-                    if best_prompt_tokens and isinstance(input_prompt_text, str) and input_prompt_text:
+                    if isinstance(best_prompt, list) and isinstance(input_prompt_text, str) and input_prompt_text:
                         base_ids = agent.tokenizer.encode(input_prompt_text, add_special_tokens=False)
-                        if len(best_prompt_tokens) >= len(base_ids) and best_prompt_tokens[:len(base_ids)] == base_ids:
-                            suffix_ids = best_prompt_tokens[len(base_ids):]
+                        if len(best_prompt) >= len(base_ids) and best_prompt[:len(base_ids)] == base_ids:
+                            suffix_ids = best_prompt[len(base_ids):]
                             optimized_suffix_text = agent.tokenizer.decode(suffix_ids, skip_special_tokens=True)
                         else:
                             optimized_suffix_text = optimized_full_text.replace(input_prompt_text, '', 1).strip()
@@ -421,8 +397,8 @@ def evaluate_on_dataset(cfg, model_path):
                     'prompt_text': input_prompt_text,
                     'prompt_length_chars': len(input_prompt_text) if isinstance(input_prompt_text, str) else 0,
                     'initial_tokens': init_len,
-                    'final_tokens': len(best_prompt_tokens),
-                    'compression_ratio': (init_len - len(best_prompt_tokens)) / init_len * 100,
+                    'final_tokens': len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else 0),
+                    'compression_ratio': (init_len - (len(best_prompt) if isinstance(best_prompt, list) else (len(best_prompt) if hasattr(best_prompt, '__len__') else init_len))) / init_len * 100,
                     'final_likelihood': float(final_likelihood),
                     'avg_likelihood': float(avg_likelihood) if not (isinstance(avg_likelihood, float) and np.isnan(avg_likelihood)) else float('nan'),
                     'final_reward': float(final_reward),

@@ -1,40 +1,129 @@
 """
-Compatibility stub matching the master branch's interface module.
-
-The GCG branch folds optimization logic into ``LengthPolicyOptimizer`` and the
-underlying prompt optimizers; this stub preserves import compatibility without
-changing behavior.
+Abstract interface for prompt optimization methods.
+This allows plug-and-play implementations for continuous vs discrete optimization.
 """
 
 from abc import ABC, abstractmethod
-
+import torch
+from typing import Tuple
 
 class BasePromptOptimizer(ABC):
-    """Abstract base retained for compatibility; not used in the GCG branch."""
-
+    """Abstract base class for prompt optimization methods."""
+    
+    def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int, 
+                 batch_size: int, lr_embeddings: float):
+        """
+        Args:
+            agent: PromptRLAgent instance
+            initial_prompt_length: Starting length for prompts
+            max_prompt_len: Maximum allowed prompt length
+            batch_size: Number of prompts to optimize in parallel
+            lr_embeddings: Learning rate for embedding optimization (if applicable)
+        """
+        self.agent = agent
+        self.initial_prompt_length = initial_prompt_length
+        self.max_prompt_len = max_prompt_len
+        self.batch_size = batch_size
+        self.lr_embeddings = lr_embeddings
+        self.device = agent.device
+        self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
+    
     @abstractmethod
-    def initialize_prompts(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
-
+    def initialize_prompts(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Initialize prompts for batch optimization.
+        
+        Returns:
+            prompt_data: The prompt representation (embeddings or tokens)
+            lengths: Current lengths tensor [B]
+        """
+        pass
+    
     @abstractmethod
-    def get_likelihoods(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
-
+    def get_likelihoods(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
+                       completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
+                       requires_grad: bool = False, prefix_tokens: torch.Tensor = None,
+                       prefix_lengths: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute likelihoods for current prompts.
+        
+        Args:
+            prompt_data: Current prompt representation
+            lengths: Current lengths [B]
+            completion_tokens: Completion tokens [B, max_comp]
+            completion_lengths: Completion lengths [B]
+            requires_grad: Whether gradients are needed
+            
+        Returns:
+            likelihoods: [B] tensor of log likelihoods
+        """
+        pass
+    
     @abstractmethod
-    def apply_length_action(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
-
+    def apply_length_action(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
+                           actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply length modification actions (add/remove tokens).
+        
+        Args:
+            prompt_data: Current prompt representation
+            lengths: Current lengths [B]
+            actions: Action tensor [B] where 0=remove, 1=keep, 2=add
+            
+        Returns:
+            updated_prompt_data: Updated prompt representation
+            updated_lengths: Updated lengths [B]
+        """
+        pass
+    
     @abstractmethod
-    def inner_optimization_step(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
-
+    def inner_optimization_step(self, prompt_data: torch.Tensor, lengths: torch.Tensor,
+                               completion_tokens: torch.Tensor, completion_lengths: torch.Tensor,
+                               step: int, prefix_tokens: torch.Tensor = None,
+                               prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Perform one step of inner optimization (e.g., gradient updates, GCG replacements).
+        This is called before policy actions are applied.
+        
+        Args:
+            prompt_data: Current prompt representation
+            lengths: Current lengths [B]
+            completion_tokens: Completion tokens [B, max_comp]
+            completion_lengths: Completion lengths [B]
+            step: Current step number in episode
+            
+        Returns:
+            updated_prompt_data: Updated prompt representation
+            updated_likelihoods: Current likelihoods after optimization [B]
+        """
+        pass
+    
     @abstractmethod
-    def to_tokens(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
-
+    def to_tokens(self, prompt_data: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Convert prompt representation to token IDs for final output.
+        
+        Args:
+            prompt_data: Prompt representation
+            lengths: Current lengths [B]
+            
+        Returns:
+            tokens: Token IDs [B, max_len] (padded to max_len)
+        """
+        pass
+    
     @abstractmethod
-    def clone_prompt(self, *args, **kwargs):
-        raise NotImplementedError("Use LengthPolicyOptimizer in prompt_rl_poc.py")
+    def clone_prompt(self, prompt_data: torch.Tensor, idx: int, length: int) -> torch.Tensor:
+        """
+        Clone a single prompt from the batch (for saving best prompts).
+        
+        Args:
+            prompt_data: Batch prompt representation
+            idx: Index in batch
+            length: Length of this prompt
+            
+        Returns:
+            cloned_prompt: Cloned prompt representation
+        """
+        pass
 
-
-__all__ = ["BasePromptOptimizer"]

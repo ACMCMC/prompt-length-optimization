@@ -1,16 +1,23 @@
 """
-Compatibility shims to make the GCG branch look like the master package layout.
-
-We reuse the core implementations living in ``prompt_rl_poc.py`` so downstream
-code can continue importing ``prompt_optimization.PromptRLAgent`` and
-``prompt_optimization.LengthPolicyOptimizer`` without changing behavior.
+Prompt Length Optimization Package
+RL-based prompt optimization with pluggable continuous/discrete optimizers
 """
 
-from prompt_rl_poc import PromptRLAgent, LengthPolicyOptimizer
-from prompt_optimization.datasets import ToxicChatDatasetManager  # re-export for parity
+from prompt_optimization.agent import PromptRLAgent
+from prompt_optimization.optimizer import LengthPolicyOptimizer
+from prompt_optimization.interface import BasePromptOptimizer
+from prompt_optimization.optimizers import (
+    ContinuousPromptOptimizer,
+    ContinuousPromptOptimizerWithProjection,
+    DiscretePromptOptimizer
+)
 
 __all__ = [
-    "PromptRLAgent",
-    "LengthPolicyOptimizer",
-    "ToxicChatDatasetManager",
+    'PromptRLAgent',
+    'LengthPolicyOptimizer',
+    'BasePromptOptimizer',
+    'ContinuousPromptOptimizer',
+    'ContinuousPromptOptimizerWithProjection',
+    'DiscretePromptOptimizer',
 ]
+

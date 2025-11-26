@@ -5,3 +5,5 @@ numpy
 pyyaml
 datasets
 pandas
+wandb
+pytest
