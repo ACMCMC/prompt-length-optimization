@@ -246,7 +246,7 @@ def main() -> None:
             print("Saved sweep plot to gcg_sweep.png")
         # Save results to JSON
         try:
-            import json, os
+            import json
             os.makedirs(os.path.dirname(args.output), exist_ok=True)
             serializable = []
             for r in results:
