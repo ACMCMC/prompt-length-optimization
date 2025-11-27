@@ -94,117 +94,127 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             
             # Repeat for gcg_steps iterations
             for gcg_iter in range(self.gcg_steps):
-                # Test all positions in parallel, each with gcg_batch_size candidates
-                # Total batch size: num_elements * gcg_batch_size
-                total_candidates = num_elements * self.gcg_batch_size
+                # Process positions one at a time to avoid OOM
+                # For each position, test candidates in smaller batches to avoid OOM
+                # Limit batch size to avoid memory issues
+                max_candidates_per_batch = min(16, self.gcg_batch_size)  # Test at most 16 candidates at a time
+                positions_to_test = list(range(num_elements))
                 
-                # Generate candidates for all positions: [num_elements, gcg_batch_size]
-                all_candidates = torch.tensor(
-                    [[self.agent.get_random_token() for _ in range(self.gcg_batch_size)] 
-                     for _ in range(num_elements)],
-                    dtype=torch.long, device=self.device
-                )  # [num_elements, gcg_batch_size]
+                # Process each position sequentially
+                for pos in positions_to_test:
+                    # Test candidates for this position in batches
+                    for candidate_batch_start in range(0, self.gcg_batch_size, max_candidates_per_batch):
+                        candidate_batch_end = min(candidate_batch_start + max_candidates_per_batch, self.gcg_batch_size)
+                        num_candidates_in_batch = candidate_batch_end - candidate_batch_start
+                        total_candidates = num_candidates_in_batch
                 
-                # Create test batch: for each position, duplicate prompt with candidates
-                # Shape: [num_elements * gcg_batch_size, max_prompt_len]
-                test_prompt_batch = prompt_data[i:i+1].expand(total_candidates, -1).clone()
-                
-                # Set candidates: for position p, set candidates[p, :] at position p
-                for pos in range(num_elements):
-                    start_idx = pos * self.gcg_batch_size
-                    end_idx = start_idx + self.gcg_batch_size
-                    test_prompt_batch[start_idx:end_idx, pos] = all_candidates[pos]
-                
-                # Prepare inputs for batch processing
-                prefix_input_ids = model_input.prefix_input_ids[i:i+1].expand(total_candidates, -1)
-                prefix_attention_mask = model_input.prefix_attention_mask[i:i+1].expand(total_candidates, -1)
-                completion_input_ids = model_input.completion_input_ids[i:i+1].expand(total_candidates, -1)
-                completion_attention_mask = model_input.completion_attention_mask[i:i+1].expand(total_candidates, -1)
-                completion_lengths = model_input.completion_lengths[i:i+1].expand(total_candidates)
-                suffix_mask = model_input.suffix_attention_mask[i:i+1].expand(total_candidates, -1)
-                
-                # Match ModelBatchedInput padding logic
-                prefix_len = prefix_input_ids.shape[1]
-                comp_len = completion_input_ids.shape[1]
-                max_len = max(prefix_len, comp_len) if (prefix_len > 0 or comp_len > 0) else model_input.max_suffix_len
-                pad_id = model_input.pad_id
-                
-                # Pad prefix (left padding)
-                if prefix_len > 0:
-                    prefix_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
-                    prefix_ids_padded[:, max_len - prefix_len:] = prefix_input_ids
-                    prefix_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
-                    prefix_mask_padded[:, max_len - prefix_len:] = prefix_attention_mask
-                else:
-                    prefix_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
-                    prefix_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
-                
-                # Pad completion (right padding)
-                if comp_len > 0:
-                    completion_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
-                    completion_ids_padded[:, :comp_len] = completion_input_ids
-                    completion_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
-                    completion_mask_padded[:, :comp_len] = completion_attention_mask
-                else:
-                    completion_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
-                    completion_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
-                
-                # Concatenate: prefix (padded) + suffix + completion (padded)
-                full_input_ids = torch.cat([prefix_ids_padded, test_prompt_batch, completion_ids_padded], dim=1)
-                full_attention_mask = torch.cat([prefix_mask_padded, suffix_mask, completion_mask_padded], dim=1)
-                
-                # Completion starts after prefix (padded) and suffix
-                completion_start_pos = max_len + model_input.max_suffix_len
-                
-                # Get embeddings
-                inputs_embeds = self.embedding_layer(full_input_ids)  # [total_candidates, total_len, D]
-                
-                # Forward pass
-                with torch.no_grad():
-                    outputs = self.agent.model.gpt_neox(inputs_embeds=inputs_embeds, attention_mask=full_attention_mask)
-                    hidden_states = outputs.last_hidden_state  # [total_candidates, total_len, hidden]
-                    logits = self.agent.model.embed_out(hidden_states)  # [total_candidates, total_len, vocab]
-                
-                # Extract logits for completion positions
-                max_comp_len = completion_lengths.max().item()
-                comp_logits = logits[:, completion_start_pos-1:completion_start_pos-1+max_comp_len, :]  # [total_candidates, max_comp_len, vocab]
-                
-                # Extract completion tokens
-                comp_tokens = completion_input_ids[:, :max_comp_len]  # [total_candidates, max_comp_len]
-                
-                # Compute log probabilities
-                import torch.nn.functional as F
-                log_probs = F.log_softmax(comp_logits, dim=-1)
-                token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)  # [total_candidates, max_comp_len]
-                
-                # Mask invalid positions
-                comp_mask = torch.arange(max_comp_len, device=self.device).unsqueeze(0) < completion_lengths.unsqueeze(-1)
-                masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
-                
-                # Sum over completion length
-                candidate_lls = masked_log_probs.sum(dim=-1)  # [total_candidates]
-                
-                # Reshape to [num_elements, gcg_batch_size] to find best per position
-                candidate_lls_reshaped = candidate_lls.view(num_elements, self.gcg_batch_size)  # [num_elements, gcg_batch_size]
-                
-                # Find best candidate for each position
-                best_candidate_per_pos = candidate_lls_reshaped.argmax(dim=1)  # [num_elements]
-                best_ll_per_pos = candidate_lls_reshaped.max(dim=1)[0]  # [num_elements]
-                
-                # Find overall best position-candidate combination
-                best_pos_idx = best_ll_per_pos.argmax().item()
-                best_candidate_idx_in_pos = best_candidate_per_pos[best_pos_idx].item()
-                best_overall_ll = best_ll_per_pos[best_pos_idx].item()
-                
-                # Apply best candidate if it's better
-                if best_overall_ll > best_ll:
-                    best_ll = best_overall_ll
-                    # Get the index in the flat batch
-                    flat_idx = best_pos_idx * self.gcg_batch_size + best_candidate_idx_in_pos
-                    best_tokens = test_prompt_batch[flat_idx, :num_elements].clone()
-                    prompt_data[i, :num_elements] = best_tokens
-                    # Update model_input with the improvement
-                    model_input.update_suffix_tokens(prompt_data)
+                        # Generate candidates for this batch: [num_candidates_in_batch]
+                        candidates = torch.tensor(
+                            [self.agent.get_random_token() for _ in range(num_candidates_in_batch)],
+                            dtype=torch.long, device=self.device
+                        )  # [num_candidates_in_batch]
+                    
+                        # Create test batch: duplicate prompt for each candidate
+                        # Shape: [num_candidates_in_batch, max_prompt_len]
+                        test_prompt_batch = prompt_data[i:i+1].expand(total_candidates, -1).clone()
+                        
+                        # Set candidates at position pos
+                        test_prompt_batch[:, pos] = candidates
+                        
+                        # Prepare inputs for batch processing
+                        prefix_input_ids = model_input.prefix_input_ids[i:i+1].expand(total_candidates, -1)
+                        prefix_attention_mask = model_input.prefix_attention_mask[i:i+1].expand(total_candidates, -1)
+                        completion_input_ids = model_input.completion_input_ids[i:i+1].expand(total_candidates, -1)
+                        completion_attention_mask = model_input.completion_attention_mask[i:i+1].expand(total_candidates, -1)
+                        completion_lengths = model_input.completion_lengths[i:i+1].expand(total_candidates)
+                        suffix_mask = model_input.suffix_attention_mask[i:i+1].expand(total_candidates, -1)
+                    
+                        # Match ModelBatchedInput padding logic
+                        prefix_len = prefix_input_ids.shape[1]
+                        comp_len = completion_input_ids.shape[1]
+                        max_len = max(prefix_len, comp_len) if (prefix_len > 0 or comp_len > 0) else model_input.max_suffix_len
+                        pad_id = model_input.pad_id
+                        
+                        # Pad prefix (left padding)
+                        if prefix_len > 0:
+                            prefix_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
+                            prefix_ids_padded[:, max_len - prefix_len:] = prefix_input_ids
+                            prefix_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
+                            prefix_mask_padded[:, max_len - prefix_len:] = prefix_attention_mask
+                        else:
+                            prefix_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
+                            prefix_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
+                        
+                        # Pad completion (right padding)
+                        if comp_len > 0:
+                            completion_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
+                            completion_ids_padded[:, :comp_len] = completion_input_ids
+                            completion_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
+                            completion_mask_padded[:, :comp_len] = completion_attention_mask
+                        else:
+                            completion_ids_padded = torch.full((total_candidates, max_len), pad_id, dtype=torch.long, device=self.device)
+                            completion_mask_padded = torch.zeros(total_candidates, max_len, dtype=torch.long, device=self.device)
+                        
+                        # Concatenate: prefix (padded) + suffix + completion (padded)
+                        full_input_ids = torch.cat([prefix_ids_padded, test_prompt_batch, completion_ids_padded], dim=1)
+                        full_attention_mask = torch.cat([prefix_mask_padded, suffix_mask, completion_mask_padded], dim=1)
+                        
+                        # Completion starts after prefix (padded) and suffix
+                        completion_start_pos = max_len + model_input.max_suffix_len
+                        
+                        # Get embeddings
+                        inputs_embeds = self.embedding_layer(full_input_ids)  # [total_candidates, total_len, D]
+                        
+                        # Forward pass
+                        with torch.no_grad():
+                            outputs = self.agent.model.gpt_neox(inputs_embeds=inputs_embeds, attention_mask=full_attention_mask)
+                            hidden_states = outputs.last_hidden_state  # [total_candidates, total_len, hidden]
+                            logits = self.agent.model.embed_out(hidden_states)  # [total_candidates, total_len, vocab]
+                        
+                        # Extract logits for completion positions
+                        max_comp_len = completion_lengths.max().item()
+                        comp_logits = logits[:, completion_start_pos-1:completion_start_pos-1+max_comp_len, :]  # [total_candidates, max_comp_len, vocab]
+                        
+                        # Extract completion tokens
+                        comp_tokens = completion_input_ids[:, :max_comp_len]  # [total_candidates, max_comp_len]
+                        
+                        # Compute log probabilities
+                        import torch.nn.functional as F
+                        log_probs = F.log_softmax(comp_logits, dim=-1)
+                        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)  # [total_candidates, max_comp_len]
+                        
+                        # Mask invalid positions
+                        comp_mask = torch.arange(max_comp_len, device=self.device).unsqueeze(0) < completion_lengths.unsqueeze(-1)
+                        masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
+                        
+                        # Sum over completion length
+                        candidate_lls_batch = masked_log_probs.sum(dim=-1)  # [total_candidates]
+                        
+                        # Track best candidate across all batches for this position
+                        if candidate_batch_start == 0:
+                            best_candidate_ll_for_pos = candidate_lls_batch.max().item()
+                            best_candidate_idx_for_pos = candidate_lls_batch.argmax().item()
+                            best_candidate_token_for_pos = candidates[best_candidate_idx_for_pos].item()
+                        else:
+                            # Compare with previous batches
+                            current_best_ll = candidate_lls_batch.max().item()
+                            if current_best_ll > best_candidate_ll_for_pos:
+                                best_candidate_ll_for_pos = current_best_ll
+                                best_candidate_idx_for_pos = candidate_lls_batch.argmax().item()
+                                best_candidate_token_for_pos = candidates[best_candidate_idx_for_pos].item()
+                        
+                        # Clear cache to free memory
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    # Apply best candidate for this position if it's better than current best
+                    if best_candidate_ll_for_pos > best_ll:
+                        best_ll = best_candidate_ll_for_pos
+                        # Update the token at this position
+                        prompt_data[i, pos] = best_candidate_token_for_pos
+                        best_tokens = prompt_data[i, :num_elements].clone()
+                        # Update model_input with the improvement
+                        model_input.update_suffix_tokens(prompt_data)
         
         # Update model_input with final suffix tokens
         model_input.update_suffix_tokens(prompt_data)
