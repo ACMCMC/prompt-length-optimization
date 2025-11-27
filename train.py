@@ -361,8 +361,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             
             # Last fallback: single likelihood value
             if ll_val is None and 'likelihood' in t:
-                    try:
-                        ll_val = float(t['likelihood'])
+                try:
+                    ll_val = float(t['likelihood'])
                     if not (isinstance(ll_val, float) and (ll_val != ll_val or ll_val == float('inf') or ll_val == float('-inf'))):
                         # Valid value
                         pass
@@ -452,22 +452,22 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             )
             
             # Write to CSV
-                try:
-                    with open(metrics_path, 'a', newline='') as fh:
-                        writer = csv.writer(fh)
-                        writer.writerow([
-                            datetime.utcnow().isoformat(),
-                            batch_start // batch_size,
-                            global_idx,
-                            prompt_idx,
+            try:
+                with open(metrics_path, 'a', newline='') as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow([
+                        datetime.utcnow().isoformat(),
+                        batch_start // batch_size,
+                        global_idx,
+                        prompt_idx,
                         episodes_per_prompt,
-                            final_ll,
-                            best_ll,
-                            best_ep,
-                            best_reward_val if best_reward_val is not None else best_reward,
-                            batch_prompts[prompt_idx].get('base', '')[:200]
-                        ])
-                except Exception:
+                        final_ll,
+                        best_ll,
+                        best_ep,
+                        best_reward_val if best_reward_val is not None else best_reward,
+                        batch_prompts[prompt_idx].get('base', '')[:200]
+                    ])
+            except Exception:
                 logger.warning("Failed to write training metrics to CSV")
 
             # Log details
@@ -488,7 +488,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 f"{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}"
             )
 
-                if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
+            if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                 logger.debug(
                     f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, "
                     f"Latest reward: {best_reward:.3f}"
@@ -496,32 +496,32 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     
     def log_traces(traces, mode_name):
         """Log batch-level trace information."""
-            try:
-                if traces:
+        try:
+            if traces:
                 logger.debug(
                     f"Batch traces ({mode_name}, total entries={len(traces)}) - "
                     f"showing per-step likelihoods/rewards:"
                 )
-                    show_all = len(traces) <= 50
-                    entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
-                    for t in entries_to_show:
-                        if 'best_likelihoods' in t:
-                            bl = t['best_likelihoods']
+                show_all = len(traces) <= 50
+                entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
+                for t in entries_to_show:
+                    if 'best_likelihoods' in t:
+                        bl = t['best_likelihoods']
                         logger.debug(
                             f"  Ep {t.get('episode','?')} step {t.get('step','?')} "
                             f"best_likelihoods: {[f'{v:.3f}' for v in bl]}"
                         )
-                        elif 'likelihoods' in t:
-                            ll = t['likelihoods']
+                    elif 'likelihoods' in t:
+                        ll = t['likelihoods']
                         logger.debug(
                             f"  Ep {t.get('episode', '?')} likelihoods: "
                             f"{[f'{v:.3f}' for v in ll]}"
                         )
-                        else:
+                    else:
                         logger.debug(f"  trace entry: {t}")
-                    if not show_all:
+                if not show_all:
                     logger.debug(f"  ... omitted {len(traces)-20} intermediate trace entries ...")
-            except Exception:
+        except Exception:
             logger.debug(f"  (could not pretty-print {mode_name} traces)")
     
     def run_batch_optimization(batch_prompts, mode, batch_idx, episode_idx, num_batches):

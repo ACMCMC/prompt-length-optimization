@@ -150,7 +150,8 @@ def test_gcg_multiple_iterations(agent, gcg_optimizer):
         likelihoods_history.append(current_ll)
     
     # Verify that we can run multiple steps without errors
-    assert torch.isfinite(torch.tensor(likelihoods_history)), "All likelihoods should be finite"
+    likelihoods_tensor = torch.tensor(likelihoods_history)
+    assert torch.all(torch.isfinite(likelihoods_tensor)), "All likelihoods should be finite"
     
     # Log the progression
     print(f"\nGCG Multiple Iterations Test:")
