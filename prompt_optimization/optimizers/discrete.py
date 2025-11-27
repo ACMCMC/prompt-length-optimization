@@ -97,7 +97,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                         
                         if test_ll > best_ll:
                             best_ll = test_ll
-                            best_tokens = test_tokens
+                            best_tokens = test_tokens[:lengths[i]]
                             prompt_data[i, :lengths[i]] = best_tokens
         
         # Update model_input with final suffix tokens

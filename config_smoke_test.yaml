@@ -10,12 +10,12 @@ dataset:
 
 train:
   # Dataset parameters - SMOKE TEST: minimal settings
-  max_prompts: 10                      # Only 10 prompts for smoke test
+  max_prompts: 25                      # Only 25 prompts for smoke test
   min_prompt_length: 30               # Minimum prompt length (characters)
   max_prompt_length: 150              # Maximum prompt length (characters)
   
   # Training parameters per prompt - SMOKE TEST: minimal settings
-  episodes_per_prompt: 10              # Only 10 episode for smoke test
+  episodes_per_prompt: 30              # Only 30 episode for smoke test
   steps_per_episode: 25               # Reduced steps for quick test
   init_len: 32                        # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
   max_suffix_len: 64                  # Maximum suffix length (fixed size for batched suffix embeddings)
@@ -35,6 +35,7 @@ train:
   
   # Parallel processing parameters - SMOKE TEST: batch size 1
   batch_size: 10                       # Batch size 10 for smoke test
+  rollouts_per_prompt: 4               # Number of trajectories (rollouts) per prompt for PPO advantage computation
   
   # Output
   save_path: models/trained_policy_smoke_test.pt
@@ -46,7 +47,7 @@ train:
   use_wandb: false                    # Disable wandb for smoke test
   wandb_project: prompt-optimization  # Wandb project name (not used if use_wandb is false)
 
-  optimization_mode: continuous_proj  # Use continuous_proj for smoke test
+  optimization_mode: continuous_proj  # Use continuous_proj optimizer for smoke test
   
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:
@@ -54,16 +55,15 @@ train:
     batch_size: 64
     steps: 10
   
-  # PPO parameters
-  use_ppo: true                       # Enable PPO
-  ppo:
-    epochs: 4                         # Number of PPO update epochs per episode
-    clip: 0.2                         # PPO clipping epsilon
+  # GRPO parameters (Group Relative Policy Optimization)
+  grpo:
+    epochs: 4                         # Number of GRPO update epochs per episode
+    clip: 0.2                         # GRPO clipping epsilon
     gamma: 0.99                       # Discount factor
-    gae_lambda: 0.95                 # GAE lambda parameter
-    value_coef: 0.5                  # Value loss coefficient
-    entropy_coef: 0.01               # Entropy bonus coefficient (overrides train.entropy_coef if set)
-    max_grad_norm: 0.5               # Maximum gradient norm for clipping
+    gae_lambda: 0.95                  # GAE lambda parameter
+    value_coef: 0.5                   # Value loss coefficient
+    entropy_coef: 0.01                # Entropy bonus coefficient (overrides train.entropy_coef if set)
+    max_grad_norm: 0.5                # Maximum gradient norm for clipping
   
   # Policy network architecture
   policy:

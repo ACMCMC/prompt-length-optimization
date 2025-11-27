@@ -59,13 +59,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     gcg_batch_size = gcg_cfg.get('batch_size', 32)
     gcg_steps = gcg_cfg.get('steps', 5)
     save_path = train_cfg.get('save_path', 'models/trained_policy.pt')
-    ppo_cfg = train_cfg.get('ppo', {})
-    ppo_epochs = ppo_cfg.get('epochs', 4)
-    ppo_clip = ppo_cfg.get('clip', 0.2)
-    ppo_gamma = ppo_cfg.get('gamma', 0.99)
-    ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
-    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
-    ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
+    grpo_cfg = train_cfg.get('grpo', train_cfg.get('ppo', {}))  # Support both 'grpo' and legacy 'ppo' keys
+    grpo_epochs = grpo_cfg.get('epochs', 4)
+    grpo_clip = grpo_cfg.get('clip', 0.2)
+    grpo_gamma = grpo_cfg.get('gamma', 0.99)
+    grpo_lambda = grpo_cfg.get('gae_lambda', 0.95)
+    grpo_value_coef = grpo_cfg.get('value_coef', 0.5)
+    grpo_entropy_coef = grpo_cfg.get('entropy_coef', 0.01)
 
     # Default to a larger prompt-batch to better utilize a single GPU
     batch_size = train_cfg.get('batch_size', 16)
@@ -85,13 +85,12 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         lr_embeddings = base_lr_embeddings * 2
         lr_policy = base_lr_policy * 2
     
-    # Get RL/PPO parameters (needed for wandb config)
+    # Get RL/GRPO parameters (needed for wandb config)
     epsilon = train_cfg.get('epsilon', 0.1)
     epsilon_decay = train_cfg.get('epsilon_decay', 0.995)
     epsilon_min = train_cfg.get('epsilon_min', 0.01)
     entropy_coef = train_cfg.get('entropy_coef', 0.01)
     temperature = train_cfg.get('temperature', 1.0)
-    use_ppo = train_cfg.get('use_ppo', False)
     
     # Initialize wandb if available and requested (after variables are set)
     wandb_initialized = False
@@ -118,13 +117,12 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         'epsilon_min': epsilon_min,
                         'entropy_coef': entropy_coef,
                         'temperature': temperature,
-                        'use_ppo': use_ppo,
-                        'ppo_epochs': ppo_epochs,
-                        'ppo_clip': ppo_clip,
-                        'ppo_gamma': ppo_gamma,
-                        'ppo_gae_lambda': ppo_lambda,
-                        'ppo_value_coef': ppo_value_coef,
-                        'ppo_entropy_coef': ppo_entropy_coef,
+                        'grpo_epochs': grpo_epochs,
+                        'grpo_clip': grpo_clip,
+                        'grpo_gamma': grpo_gamma,
+                        'grpo_gae_lambda': grpo_lambda,
+                        'grpo_value_coef': grpo_value_coef,
+                        'grpo_entropy_coef': grpo_entropy_coef,
                         'dataset': dataset_name,
                         'seed': cfg.get('seed', 2262)
                     }
@@ -236,36 +234,35 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     
     # Initialize agent and optimizer
     agent = PromptRLAgent(model_name=model_name)
-    # Note: epsilon, epsilon_decay, epsilon_min, entropy_coef, temperature, use_ppo
+    # Note: epsilon, epsilon_decay, epsilon_min, entropy_coef, temperature
     # are already defined above (before wandb init) for wandb config
-    ppo_cfg = train_cfg.get('ppo', {})
-    ppo_clip = ppo_cfg.get('clip', 0.2)
-    ppo_epochs = ppo_cfg.get('epochs', 4)
-    ppo_gamma = ppo_cfg.get('gamma', 0.99)
-    ppo_gae_lambda = ppo_cfg.get('gae_lambda', 0.95)
-    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
-    ppo_entropy_coef = ppo_cfg.get('entropy_coef', entropy_coef)  # Use PPO-specific entropy if set, else use general
+    grpo_cfg = train_cfg.get('grpo', train_cfg.get('ppo', {}))  # Support both 'grpo' and legacy 'ppo' keys
+    grpo_clip = grpo_cfg.get('clip', 0.2)
+    grpo_epochs = grpo_cfg.get('epochs', 4)
+    grpo_gamma = grpo_cfg.get('gamma', 0.99)
+    grpo_gae_lambda = grpo_cfg.get('gae_lambda', 0.95)
+    grpo_value_coef = grpo_cfg.get('value_coef', 0.5)
+    grpo_entropy_coef = grpo_cfg.get('entropy_coef', entropy_coef)  # Use GRPO-specific entropy if set, else use general
     
     # Policy network architecture parameters
     policy_cfg = train_cfg.get('policy', {})
     policy_hidden_size = policy_cfg.get('hidden_size', 64)
     value_init_bias = policy_cfg.get('value_init_bias', -1000.0)
     value_init_gain = policy_cfg.get('value_init_gain', 0.1)
-    max_grad_norm = train_cfg.get('ppo', {}).get('max_grad_norm', 0.5)
+    max_grad_norm = grpo_cfg.get('max_grad_norm', 0.5)
     
     optimizer = LengthPolicyOptimizer(
         agent, 
         epsilon=epsilon, 
         epsilon_decay=epsilon_decay, 
         epsilon_min=epsilon_min,
-        entropy_coef=ppo_entropy_coef if use_ppo else entropy_coef,
+        entropy_coef=grpo_entropy_coef,
         temperature=temperature,
-        use_ppo=use_ppo,
-        ppo_clip=ppo_clip,
-        ppo_epochs=ppo_epochs,
-        ppo_gamma=ppo_gamma,
-        ppo_gae_lambda=ppo_gae_lambda,
-        ppo_value_coef=ppo_value_coef,
+        grpo_clip=grpo_clip,
+        grpo_epochs=grpo_epochs,
+        grpo_gamma=grpo_gamma,
+        grpo_gae_lambda=grpo_gae_lambda,
+        grpo_value_coef=grpo_value_coef,
         policy_hidden_size=policy_hidden_size,
         value_init_bias=value_init_bias,
         value_init_gain=value_init_gain,
@@ -298,7 +295,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             writer = csv.writer(fh)
             writer.writerow([
                 'timestamp', 'batch_idx', 'episode', 'avg_reward', 'avg_return', 
-                'avg_advantage', 'policy_loss', 'value_loss', 'entropy', 'epsilon'
+                'avg_advantage', 'std_advantage', 'policy_loss', 'value_loss', 'entropy', 'epsilon',
+                'avg_value_pred', 'value_pred_error'
             ])
 
     # Shared helper to extract per-prompt final and best likelihood from batched traces
@@ -395,12 +393,20 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     start_time = time.time()
     
     optimization_mode_lower = optimization_mode.lower()
-    
+
     def process_batch_results(best_results, best_rewards_batch, traces, batch_prompts, 
                               batch_start, batch_size, metrics_path, episodes_per_prompt):
         """Process results from a batch optimization run. Returns updated best tracking."""
         nonlocal all_rewards, best_overall_reward, best_prompt, best_prompt_text
         
+        # Debug: check lengths match
+        if len(best_results) != len(batch_prompts):
+            logger.warning(f"Length mismatch: best_results has {len(best_results)} entries, batch_prompts has {len(batch_prompts)} entries")
+            # Truncate or pad to match
+            min_len = min(len(best_results), len(batch_prompts))
+            best_results = best_results[:min_len]
+            best_rewards_batch = best_rewards_batch[:min_len]
+
         for prompt_idx, (best_prompt_result, best_reward) in enumerate(zip(best_results, best_rewards_batch)):
             global_idx = batch_start + prompt_idx
             all_rewards.append(float(best_reward))
@@ -433,7 +439,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             except Exception as e:
                 logger.warning(f"Error extracting metrics from traces for prompt {global_idx}: {e}")
                 final_ll, best_ll, best_ep, best_reward_val = 0.0, 0.0, None, None
-            
+
             logger.debug(
                 f"Metrics (prompt local idx={prompt_idx}, global idx={global_idx}): "
                 f"final_ll={final_ll:.3f}, best_ll={best_ll:.3f}, best_ep={best_ep}, "
@@ -458,7 +464,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     ])
             except Exception:
                 logger.warning("Failed to write training metrics to CSV")
-            
+
             # Log details
             logger.debug(
                 f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}"
@@ -476,7 +482,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}"
                 f"{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}"
             )
-            
+
             if (prompt_idx + 1) % max(1, len(batch_prompts) // 4) == 0:
                 logger.debug(
                     f"  Progress: {prompt_idx + 1}/{len(batch_prompts)}, "
@@ -534,21 +540,25 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         # Formula: episode * num_batches * steps_per_episode + batch_idx * steps_per_episode
         global_step_offset = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
         
+        # Get rollouts_per_prompt from config (default to 1 for backward compatibility)
+        rollouts_per_prompt = train_cfg.get('rollouts_per_prompt', 1)
+        
         # Run only ONE episode for this batch (we cycle through episodes in the outer loop)
         best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
             target_completions=targets,
             episodes=1,  # Only one episode per call
-            steps_per_episode=steps_per_episode,
-            initial_prompt_length=init_len,
-            lr_embeddings=lr_embeddings,
-            alpha=alpha,
-            beta=beta,
+                        steps_per_episode=steps_per_episode,
+                        initial_prompt_length=init_len,
+                        lr_embeddings=lr_embeddings,
+                        alpha=alpha,
+                        beta=beta,
             mode=mode,
             batch_size=batch_size,
             max_suffix_len=max_suffix_len,
             init_len=init_len,
             wandb_log_fn=wandb_log_fn,
-            global_step_offset=global_step_offset
+            global_step_offset=global_step_offset,
+            rollouts_per_prompt=rollouts_per_prompt
         )
         
         return best_results, best_rewards_batch, traces, policy_metrics
@@ -586,7 +596,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             print(f"\n[Episode {episode_idx+1}/{episodes_per_prompt}, Batch {batch_idx+1}/{num_batches}] Processing prompts {batch_start+1}-{batch_end}")
             
             batch_start_time = time.time()
-            
+
             # Determine which mode to use
             opt_mode = optimization_mode_lower
             if opt_mode in mode_map:
@@ -618,10 +628,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 pm.get('avg_reward', 0.0),
                                 pm.get('avg_return', 0.0),
                                 pm.get('avg_advantage', 0.0),
+                                pm.get('std_advantage', 1.0),
                                 pm.get('policy_loss', 0.0),
                                 pm.get('value_loss', 0.0),
                                 pm.get('entropy', 0.0),
-                                pm.get('epsilon', 0.0)
+                                pm.get('epsilon', 0.0),
+                                pm.get('avg_value_pred', 0.0),
+                                pm.get('value_pred_error', 0.0)
                             ])
                     
                     # Log policy metrics to wandb at the last step of the episode
@@ -637,9 +650,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 'batch': pm.get('batch_idx', batch_idx),
                                 'episode': episode_idx  # Use episode_idx from outer loop
                             }
-                            if pm.get('avg_advantage', 0.0) != 0.0:  # PPO only
+                            if pm.get('avg_advantage', 0.0) != 0.0:  # GRPO
                                 log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
+                                log_dict['policy/std_advantage'] = pm.get('std_advantage', 1.0)
                                 log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
+                                log_dict['policy/avg_value_pred'] = pm.get('avg_value_pred', 0.0)
+                                log_dict['policy/avg_return'] = pm.get('avg_return', 0.0)
+                                log_dict['policy/value_pred_error'] = pm.get('value_pred_error', 0.0)
                             # Log at the step after the last step-level metric to ensure monotonic ordering
                             wandb.log(log_dict, step=policy_batch_step, commit=True)
                     
@@ -689,20 +706,20 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 # Add placeholder rewards to maintain indexing
                 for _ in batch_prompts:
                     all_rewards.append(float('-inf'))
-            
-            batch_time = time.time() - batch_start_time
-            avg_time_per_prompt = batch_time / len(batch_prompts)
-            
-            print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
-            if best_rewards_batch:
-                print(f"  Best batch reward: {max(best_rewards_batch):.3f}")
-            print(f"  Overall best so far: {best_overall_reward:.3f}")
-            
-            # Progress estimate
-            completed = len(all_rewards)
-            remaining = len(prompts) - completed
-            estimated_time_left = remaining * avg_time_per_prompt
-            print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
+        
+        batch_time = time.time() - batch_start_time
+        avg_time_per_prompt = batch_time / len(batch_prompts)
+        
+        print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
+        if best_rewards_batch:
+            print(f"  Best batch reward: {max(best_rewards_batch):.3f}")
+        print(f"  Overall best so far: {best_overall_reward:.3f}")
+        
+        # Progress estimate
+        completed = len(all_rewards)
+        remaining = len(prompts) - completed
+        estimated_time_left = remaining * avg_time_per_prompt
+        print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
     
     training_time = time.time() - start_time
     

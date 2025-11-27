@@ -29,12 +29,13 @@ train:
   entropy_coef: 0.05              # Entropy bonus coefficient (encourages diverse action distributions)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
   alpha: 1.0                         # Likelihood weight
-  beta: 5.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
-  projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
-  distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
+  beta: 3.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  projection_weight: 1.0            # Weight for projection regularization (continuous_proj mode)
+  distance_metric: dot                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 64                      # Prompts per batch for progress tracking
+  batch_size: 16                      # Prompts per batch for progress tracking
+  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for PPO advantage computation
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -54,11 +55,10 @@ train:
     batch_size: 64
     steps: 10
   
-  # PPO parameters
-  use_ppo: true                    # Enable PPO (false for REINFORCE)
-  ppo:
-    epochs: 4                      # Number of PPO update epochs per episode
-    clip: 0.2                       # PPO clipping epsilon
+  # GRPO parameters (Group Relative Policy Optimization)
+  grpo:
+    epochs: 4                      # Number of GRPO update epochs per episode
+    clip: 0.2                       # GRPO clipping epsilon
     gamma: 0.99                     # Discount factor
     gae_lambda: 0.95                # GAE lambda parameter
     value_coef: 0.5                 # Value loss coefficient

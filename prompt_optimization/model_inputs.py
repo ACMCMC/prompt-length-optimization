@@ -241,7 +241,8 @@ class ModelBatchedInput:
     def update_suffix_tokens(self, suffix_tokens: torch.Tensor):
         """
         Update suffix tokens (discrete mode only).
-        Initializes new positions (where attention mask is 1 but token is zero) with BOS.
+        Only initializes positions that are newly active (were 0 in old mask, are 1 in new mask) with BOS.
+        Does not overwrite tokens that are already set (non-zero).
         
         Args:
             suffix_tokens: New suffix token IDs [B, max_suffix_len]
@@ -250,10 +251,14 @@ class ModelBatchedInput:
         assert suffix_tokens.shape == (self.batch_size, self.max_suffix_len), \
             f"Expected shape {(self.batch_size, self.max_suffix_len)}, got {suffix_tokens.shape}"
         
-        # Initialize new positions (where attention mask is 1 but token is zero) with BOS
+        # Only initialize positions that are newly active (attention mask is 1) but token is still zero
+        # This handles the case where a new position was just added but hasn't been set yet
+        # We don't want to overwrite tokens that were already set by apply_length_action
         bos_token_id = self._get_bos_token_id()
         for i in range(self.batch_size):
             for j in range(self.max_suffix_len):
+                # Only set BOS if: position is active (mask=1) AND token is zero (not yet set)
+                # This means it's a newly added position that hasn't been initialized yet
                 if self.suffix_attention_mask[i, j] == 1 and suffix_tokens[i, j].item() == 0:
                     suffix_tokens[i, j] = bos_token_id
         

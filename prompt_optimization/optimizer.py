@@ -21,12 +21,12 @@ from prompt_optimization.optimizers import (
 logger = logging.getLogger(__name__)
 
 class LengthPolicyOptimizer:
-    """RL optimizer that learns prompt length policy using REINFORCE or PPO."""
+    """RL optimizer that learns prompt length policy using GRPO (Group Relative Policy Optimization)."""
     
     def __init__(self, agent: PromptRLAgent, epsilon: float, epsilon_decay: float, epsilon_min: float,
                  entropy_coef: float, temperature: float,
-                 use_ppo: bool, ppo_clip: float, ppo_epochs: int,
-                 ppo_gamma: float, ppo_gae_lambda: float, ppo_value_coef: float,
+                 grpo_clip: float, grpo_epochs: int,
+                 grpo_gamma: float, grpo_gae_lambda: float, grpo_value_coef: float,
                  policy_hidden_size: int, value_init_bias: float, value_init_gain: float,
                  max_grad_norm: float):
         self.agent = agent
@@ -40,7 +40,7 @@ class LengthPolicyOptimizer:
             nn.Linear(policy_hidden_size, 3)  # Actions: 0=remove, 1=keep, 2=add
         ).to(agent.device)
         
-        # Value network for PPO (estimates state values)
+        # Value network for GRPO (estimates state values)
         # Initialize output layer to predict values around typical return scale
         # This helps the network start in the right range
         self.value_net = nn.Sequential(
@@ -49,29 +49,23 @@ class LengthPolicyOptimizer:
             nn.Linear(policy_hidden_size, 1)  # Single value output
         ).to(agent.device)
         
-        # Initialize value network output layer to predict values around typical return scale
-        # This prevents initial value loss from being extremely large
+        # Initialize value network with standard initialization (no bias preset)
+        # Let the network learn the value scale naturally
         with torch.no_grad():
-            # Initialize last layer bias and weights from config
+            # Initialize last layer with standard initialization
             if len(self.value_net) > 0:
                 last_layer = self.value_net[-1]
                 if isinstance(last_layer, nn.Linear):
-                    last_layer.bias.fill_(value_init_bias)
+                    # Use standard initialization (bias starts at 0, weights from xavier)
                     nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
         
         self.max_grad_norm = max_grad_norm
         
-        # Use shared optimizer for both networks (PPO) or separate (REINFORCE)
-        self.use_ppo = use_ppo
-        if use_ppo:
-            # Shared optimizer for policy and value networks
-            self.optimizer = optim.Adam(
-                list(self.policy_net.parameters()) + list(self.value_net.parameters()),
-                lr=3e-4
-            )
-        else:
-            # Separate optimizer for policy only (REINFORCE)
-            self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        # Shared optimizer for policy and value networks (GRPO)
+        self.optimizer = optim.Adam(
+            list(self.policy_net.parameters()) + list(self.value_net.parameters()),
+            lr=3e-4
+        )
         
         # Epsilon-greedy exploration parameters
         self.epsilon = epsilon
@@ -85,12 +79,12 @@ class LengthPolicyOptimizer:
         # Temperature for softmax (higher = more exploration)
         self.temperature = temperature
         
-        # PPO-specific parameters
-        self.ppo_clip = ppo_clip
-        self.ppo_epochs = ppo_epochs
-        self.ppo_gamma = ppo_gamma
-        self.ppo_gae_lambda = ppo_gae_lambda
-        self.ppo_value_coef = ppo_value_coef
+        # GRPO-specific parameters
+        self.grpo_clip = grpo_clip
+        self.grpo_epochs = grpo_epochs
+        self.grpo_gamma = grpo_gamma
+        self.grpo_gae_lambda = grpo_gae_lambda
+        self.grpo_value_coef = grpo_value_coef
     
     def _compute_gae(self, rewards: torch.Tensor, values: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -113,16 +107,43 @@ class LengthPolicyOptimizer:
         next_values = torch.cat([values[1:], torch.zeros(1, batch_B, device=device)], dim=0)
         
         # Compute TD errors: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-        deltas = rewards + self.ppo_gamma * next_values - values
+        deltas = rewards + self.grpo_gamma * next_values - values
         
         # Compute GAE advantages: A_t = δ_t + (γλ) * δ_{t+1} + (γλ)^2 * δ_{t+2} + ...
         gae = 0.0
         for t in reversed(range(T)):
-            gae = deltas[t] + self.ppo_gamma * self.ppo_gae_lambda * gae
+            gae = deltas[t] + self.grpo_gamma * self.grpo_gae_lambda * gae
             advantages[t] = gae
         
         # Returns are advantages + values
         returns = advantages + values
+        
+        return returns, advantages
+    
+    def _compute_grpo_advantages(self, rewards: torch.Tensor, values: torch.Tensor, 
+                                   device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute Generalized Advantage Estimation (GAE) with global normalization (GRPO).
+        Advantages are normalized across all trajectories in the batch, making the policy
+        learn from relative performance rather than absolute reward values.
+        
+        Args:
+            rewards: [T, batch_B] tensor of rewards
+            values: [T, batch_B] tensor of value estimates
+            device: torch device
+            
+        Returns:
+            returns: [T, batch_B] tensor of returns (value targets)
+            advantages: [T, batch_B] tensor of advantages (globally normalized)
+        """
+        # Compute GAE for all trajectories
+        returns, advantages = self._compute_gae(rewards, values, device)
+        
+        # Global normalization: normalize advantages across entire batch
+        # This ensures best trajectories get highest advantages regardless of absolute reward scale
+        advantages_mean = advantages.mean()
+        advantages_std = advantages.std() + 1e-8
+        advantages = (advantages - advantages_mean) / advantages_std
         
         return returns, advantages
     
@@ -165,25 +186,52 @@ class LengthPolicyOptimizer:
                                lr_embeddings: float, alpha: float, beta: float,
                                mode: str, batch_size: int,
                                max_suffix_len: int, init_len: int,
-                               wandb_log_fn=None, global_step_offset: int = 0) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               wandb_log_fn=None, global_step_offset: int = 0,
+                               rollouts_per_prompt: int = 1) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
+        
+        Args:
+            rollouts_per_prompt: Number of trajectories (rollouts) to run per prompt.
+                                Total batch size = num_prompts * rollouts_per_prompt.
+                                Advantages are computed per prompt across its rollouts.
         """
         device = self.agent.device
-        B = len(target_completions)
-        if B == 0:
+        num_prompts = len(target_completions)
+        if num_prompts == 0:
             return [], [], [], []
         
-        # Process in batches of batch_size
+        # Expand batch: duplicate each prompt rollouts_per_prompt times
+        # This creates multiple trajectories per prompt for proper advantage computation
+        expanded_completions = []
+        prompt_indices = []  # Track which prompt each rollout belongs to
+        for prompt_idx, completion in enumerate(target_completions):
+            for rollout_idx in range(rollouts_per_prompt):
+                expanded_completions.append(completion)
+                prompt_indices.append(prompt_idx)
+        
+        B = len(expanded_completions)  # Total batch size = num_prompts * rollouts_per_prompt
+        prompt_indices_tensor = torch.tensor(prompt_indices, device=device)  # [B]
+        
+        # Process in batches, ensuring we process complete groups of rollouts per prompt
+        # batch_size refers to the number of prompts to process, not the number of rollouts
         all_final_prompts = []
         all_rewards = []
         all_traces = []
         all_policy_metrics = []  # Track policy training metrics
         
-        for batch_start in range(0, B, batch_size):
-            batch_end = min(batch_start + batch_size, B)
-            batch_completions = target_completions[batch_start:batch_end]
+        # Process prompts in groups of batch_size (each prompt has rollouts_per_prompt rollouts)
+        num_prompts_per_batch = batch_size  # Number of prompts per processing batch
+        for prompt_batch_start in range(0, num_prompts, num_prompts_per_batch):
+            prompt_batch_end = min(prompt_batch_start + num_prompts_per_batch, num_prompts)
+            num_prompts_in_batch = prompt_batch_end - prompt_batch_start
+            
+            # Get all rollouts for these prompts (each prompt has rollouts_per_prompt rollouts)
+            rollout_batch_start = prompt_batch_start * rollouts_per_prompt
+            rollout_batch_end = prompt_batch_end * rollouts_per_prompt
+            batch_completions = expanded_completions[rollout_batch_start:rollout_batch_end]
+            batch_prompt_indices = prompt_indices_tensor[rollout_batch_start:rollout_batch_end]  # Track prompt indices for this batch
             batch_B = len(batch_completions)
             
             # Create optimizer based on mode
@@ -219,7 +267,11 @@ class LengthPolicyOptimizer:
             traces = []
             batch_policy_metrics = []  # Track policy metrics for this batch
         
-            for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
+            # Store batch_prompt_indices for use in policy update (clone to avoid modifying original)
+            batch_prompt_indices_for_episode = batch_prompt_indices.clone()
+            
+            batch_idx = prompt_batch_start // num_prompts_per_batch
+            for episode in trange(episodes, desc=f"Episodes (batch {batch_idx + 1})"):
                 # Create fresh ModelBatchedInput for this episode
                 # Prefix texts are empty initially (will grow as tokens are deleted)
                 prefix_texts = [''] * batch_B
@@ -248,14 +300,13 @@ class LengthPolicyOptimizer:
                 episode_log_probs = []
                 episode_states = []
                 episode_action_probs = []  # Store for entropy
-                episode_actions = []  # Store actions for PPO importance sampling computation
+                episode_actions = []  # Store actions for GRPO importance sampling computation
                 
-                logger.info(f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_start//batch_size + 1}, {steps_per_episode} steps")
+                logger.info(f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_idx + 1}, {steps_per_episode} steps")
                 
                 # Set policy to eval mode during episode (no gradients, only inference)
                 self.policy_net.eval()
-                if self.use_ppo:
-                    self.value_net.eval()
+                self.value_net.eval()
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
@@ -263,7 +314,7 @@ class LengthPolicyOptimizer:
                     # Inner optimization step: optimize prompt embeddings/tokens only
                     # This does NOT update the policy network
                     if step == 0 or (step + 1) % 10 == 0 or step == steps_per_episode - 1:
-                        logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_start//batch_size + 1})")
+                        logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})")
                     
                     prompt_data, likelihoods = optimizer.inner_optimization_step(
                         prompt_data, lengths, step, model_input
@@ -389,16 +440,19 @@ class LengthPolicyOptimizer:
                             'episode': episode,
                             'step_in_episode': step,
                             'global_step': global_step,
-                            'batch_idx': batch_start // batch_size
+                            'batch_idx': batch_idx
                         }
+                        
+                        # Log min_distances for continuous_proj mode
+                        if hasattr(optimizer, 'min_distances'):
+                            step_log_dict['step/avg_min_distance'] = optimizer.min_distances
                         wandb_log_fn(step_log_dict, step=global_step)
                 
                 # ===== POLICY UPDATE (only after episode completes) =====
                 # Now we update the policy network using collected episode data
                 # Set to training mode for gradient computation
                 self.policy_net.train()
-                if self.use_ppo:
-                    self.value_net.train()
+                self.value_net.train()
                 
                 rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
@@ -406,212 +460,187 @@ class LengthPolicyOptimizer:
                 action_probs_tensor = torch.stack(episode_action_probs)  # [T, batch_B, 3]
                 actions_tensor = torch.stack(episode_actions)  # [T, batch_B]
                 
-                if self.use_ppo:
-                    # PPO update with multiple epochs
-                    # Compute values for all states (old policy)
-                    with torch.no_grad():
-                        old_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                # GRPO update with multiple epochs
+                # Compute values for all states (old policy)
+                with torch.no_grad():
+                    old_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                
+                # Compute returns and advantages using GAE with global normalization (GRPO)
+                # Advantages are normalized across all trajectories, making policy learn from relative performance
+                returns, advantages = self._compute_grpo_advantages(
+                    rewards_tensor, old_values, device
+                )
+                
+                # Normalize returns for stable value learning (store stats for denormalization)
+                # Note: advantages are already globally normalized in _compute_grpo_advantages
+                returns_mean = returns.mean()
+                returns_std = returns.std() + 1e-8
+                returns_normalized = (returns - returns_mean) / returns_std
+                
+                # Store old log probs for importance sampling ratio
+                old_log_probs = log_probs_tensor.detach()
+                
+                # Multiple GRPO epochs
+                final_policy_loss = None
+                final_value_loss = None
+                final_entropy = None
+                for epoch in range(self.grpo_epochs):
+                    # Recompute log probs and values with current policy
+                    action_logits = self.policy_net(states_tensor)  # [T, batch_B, 3]
+                    new_action_probs = F.softmax(action_logits / self.temperature, dim=-1)
+                    new_log_probs = F.log_softmax(action_logits / self.temperature, dim=-1)
                     
-                    # Compute returns and advantages using GAE
-                    returns, advantages = self._compute_gae(rewards_tensor, old_values, device)
+                    # Get log probs for the actions that were actually taken
+                    new_log_probs_selected = new_log_probs.gather(2, actions_tensor.unsqueeze(-1)).squeeze(-1)  # [T, batch_B]
                     
-                    # Normalize returns for stable value learning (store stats for denormalization)
-                    returns_mean = returns.mean()
-                    returns_std = returns.std() + 1e-8
-                    returns_normalized = (returns - returns_mean) / returns_std
+                    # Compute importance sampling ratio
+                    ratio = torch.exp(new_log_probs_selected - old_log_probs)  # [T, batch_B]
                     
-                    # Normalize advantages
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    # Compute clipped policy loss
+                    policy_loss_1 = ratio * advantages
+                    policy_loss_2 = torch.clamp(ratio, 1.0 - self.grpo_clip, 1.0 + self.grpo_clip) * advantages
+                    policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
                     
-                    # Store old log probs for importance sampling ratio
-                    old_log_probs = log_probs_tensor.detach()
+                    # Value loss (use normalized returns for stable learning)
+                    new_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                    # Normalize new values to match normalized returns
+                    new_values_normalized = (new_values - returns_mean) / returns_std
+                    # Compute loss on normalized scale (much smaller, more stable)
+                    value_loss = F.mse_loss(new_values_normalized, returns_normalized)
+                    # Scale back to original scale for logging (multiply by std^2)
+                    value_loss_scaled = value_loss * (returns_std ** 2)
                     
-                    # Multiple PPO epochs
-                    final_policy_loss = None
-                    final_value_loss = None
-                    final_entropy = None
-                    for epoch in range(self.ppo_epochs):
-                        # Recompute log probs and values with current policy
-                        action_logits = self.policy_net(states_tensor)  # [T, batch_B, 3]
-                        new_action_probs = F.softmax(action_logits / self.temperature, dim=-1)
-                        new_log_probs = F.log_softmax(action_logits / self.temperature, dim=-1)
-                        
-                        # Get log probs for the actions that were actually taken
-                        new_log_probs_selected = new_log_probs.gather(2, actions_tensor.unsqueeze(-1)).squeeze(-1)  # [T, batch_B]
-                        
-                        # Compute importance sampling ratio
-                        ratio = torch.exp(new_log_probs_selected - old_log_probs)  # [T, batch_B]
-                        
-                        # Compute clipped policy loss
-                        policy_loss_1 = ratio * advantages
-                        policy_loss_2 = torch.clamp(ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip) * advantages
-                        policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
-                        
-                        # Value loss (use normalized returns for stable learning)
-                        new_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
-                        # Normalize new values to match normalized returns
-                        new_values_normalized = (new_values - returns_mean) / returns_std
-                        # Compute loss on normalized scale (much smaller, more stable)
-                        value_loss = F.mse_loss(new_values_normalized, returns_normalized)
-                        # Scale back to original scale for logging (multiply by std^2)
-                        value_loss_scaled = value_loss * (returns_std ** 2)
-                        
-                        # Entropy bonus
-                        entropy = -(new_action_probs * torch.log(new_action_probs + 1e-8)).sum(dim=-1).mean()
-                        entropy_bonus = entropy * self.entropy_coef
-                        
-                        # Total loss (use normalized value loss for training, but log scaled version)
-                        total_loss = policy_loss + self.ppo_value_coef * value_loss - entropy_bonus
-                        
-                        # Update
-                        self.optimizer.zero_grad()
-                        total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            list(self.policy_net.parameters()) + list(self.value_net.parameters()),
-                            max_norm=self.max_grad_norm
-                        )
-                        self.optimizer.step()
-                        
-                        # Store final metrics from last epoch (use scaled loss for logging)
-                        final_policy_loss = policy_loss.item()
-                        final_value_loss = value_loss_scaled.item()  # Use scaled loss for logging
-                        final_entropy = entropy.item()
+                    # Entropy bonus
+                    entropy = -(new_action_probs * torch.log(new_action_probs + 1e-8)).sum(dim=-1).mean()
+                    entropy_bonus = entropy * self.entropy_coef
                     
-                    # Track policy metrics for PPO (after all epochs)
-                    avg_reward = rewards_tensor.mean().item()
-                    avg_return = returns.mean().item()
-                    avg_advantage = advantages.mean().item()
-                    batch_policy_metrics.append({
-                        'episode': episode,
-                        'batch_idx': batch_start // batch_size,
-                        'avg_reward': avg_reward,
-                        'avg_return': avg_return,
-                        'avg_advantage': avg_advantage,
-                        'policy_loss': final_policy_loss,
-                        'value_loss': final_value_loss,
-                        'entropy': final_entropy,
-                        'epsilon': self.current_epsilon
-                    })
-                else:
-                    # REINFORCE update
-                    # Compute returns
-                    returns = torch.zeros_like(rewards_tensor)
-                    next_return = torch.zeros(batch_B, device=device)
-                    for t in reversed(range(steps_per_episode)):
-                        next_return = rewards_tensor[t] + self.ppo_gamma * next_return
-                        returns[t] = next_return
+                    # Total loss (use normalized value loss for training, but log scaled version)
+                    total_loss = policy_loss + self.grpo_value_coef * value_loss - entropy_bonus
                     
-                    # Normalize returns
-                    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+                    # Update
+                    self.optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.policy_net.parameters()) + list(self.value_net.parameters()),
+                        max_norm=self.max_grad_norm
+                    )
+                    self.optimizer.step()
                     
-                    # Compute entropy bonus (encourages exploration)
-                    # Entropy: -sum(p * log(p)) for each action distribution
-                    entropy = -(action_probs_tensor * torch.log(action_probs_tensor + 1e-8)).sum(dim=-1)  # [T, batch_B]
-                    entropy_bonus = entropy.mean() * self.entropy_coef
-                    
-                    # Policy loss with entropy bonus
-                    policy_loss = -(log_probs_tensor * returns.detach()).mean() - entropy_bonus
-                    self.policy_optimizer.zero_grad()
-                    policy_loss.backward()
-                    self.policy_optimizer.step()
-                    
-                    # Track policy metrics for REINFORCE
-                    avg_reward = rewards_tensor.mean().item()
-                    avg_return = returns.mean().item()
-                    policy_loss_val = policy_loss.item()
-                    entropy_val = entropy.mean().item()
-                    batch_policy_metrics.append({
-                        'episode': episode,
-                        'batch_idx': batch_start // batch_size,
-                        'avg_reward': avg_reward,
-                        'avg_return': avg_return,
-                        'policy_loss': policy_loss_val,
-                        'entropy': entropy_val,
-                        'value_loss': 0.0,  # Not applicable for REINFORCE
-                        'avg_advantage': 0.0,  # Not applicable for REINFORCE
-                        'epsilon': self.current_epsilon
-                    })
+                    # Store final metrics from last epoch (use scaled loss for logging)
+                    final_policy_loss = policy_loss.item()
+                    final_value_loss = value_loss_scaled.item()  # Use scaled loss for logging
+                    final_entropy = entropy.item()
+                
+                # Track policy metrics for GRPO (after all epochs)
+                avg_reward = rewards_tensor.mean().item()
+                avg_return = returns.mean().item()
+                avg_advantage = advantages.mean().item()  # Should be ~0 after normalization
+                std_advantage = advantages.std().item()  # Should be ~1 after normalization
+                
+                # Monitor value predictions vs returns to verify learning
+                # Use final values from last epoch (after updates)
+                with torch.no_grad():
+                    final_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                avg_value_pred = final_values.mean().item()
+                avg_return_actual = returns.mean().item()
+                value_pred_error = (final_values - returns).abs().mean().item()  # Mean absolute error
+                
+                batch_policy_metrics.append({
+                    'episode': episode,
+                    'batch_idx': batch_idx,
+                    'avg_reward': avg_reward,
+                    'avg_return': avg_return,
+                    'avg_advantage': avg_advantage,
+                    'std_advantage': std_advantage,
+                    'policy_loss': final_policy_loss,
+                    'value_loss': final_value_loss,
+                    'entropy': final_entropy,
+                    'epsilon': self.current_epsilon,
+                    'avg_value_pred': avg_value_pred,
+                    'value_pred_error': value_pred_error
+                })
                 
                 # Decay epsilon after each episode
                 self.current_epsilon = max(self.epsilon_min, self.current_epsilon * self.epsilon_decay)
             
-            # Convert best prompts to tokens using optimizer's to_tokens method
-            # This is mode-agnostic - each optimizer handles its own conversion
-            final_prompts = []
-            projection_losses = []
+            # Aggregate best results per prompt (across its rollouts) before converting to tokens
+            # We have batch_B rollouts, but only num_prompts_in_batch unique prompts
+            # Note: batch_prompt_indices_for_episode contains indices relative to the original target_completions list
+            # We need to map them to local batch indices (0, 1, 2, ...) for this processing batch
+            unique_prompts_in_batch = torch.unique(batch_prompt_indices_for_episode, sorted=True)
+            num_prompts_in_batch = len(unique_prompts_in_batch)
             
-            # Prepare batch data for to_tokens
-            # Check if we have embeddings (2D) or tokens (1D) by inspecting first non-None prompt
-            is_embeddings = None
-            max_len = 0
-            valid_indices = []
-            for i, bp in enumerate(best_prompts):
-                if bp is not None and bp.numel() > 0:
-                    max_len = max(max_len, bp.shape[0])
-                    if is_embeddings is None:
-                        is_embeddings = len(bp.shape) > 1
-                    valid_indices.append(i)
+            # Map original prompt indices to local batch indices (0, 1, 2, ...)
+            # The original indices might be [10, 11, 12] but we want [0, 1, 2] for batch_prompts
+            # Since unique_prompts_in_batch is sorted, we can use enumerate
+            prompt_idx_to_local = {int(prompt_idx.item()): local_idx 
+                                   for local_idx, prompt_idx in enumerate(unique_prompts_in_batch)}
             
-            if max_len > 0 and valid_indices:
-                # Create batch tensor - shape depends on whether we have embeddings or tokens
-                if is_embeddings:
-                    prompt_data_batch = torch.zeros(batch_B, max_len, optimizer.emb_dim, device=device)
-                else:
-                    prompt_data_batch = torch.zeros(batch_B, max_len, dtype=torch.long, device=device)
-                lengths_batch = torch.zeros(batch_B, dtype=torch.long, device=device)
+            batch_best_rewards_per_prompt = torch.full((num_prompts_in_batch,), float('-inf'), dtype=torch.float32, device=device)
+            batch_best_prompts_per_prompt: List[Optional[torch.Tensor]] = [None] * num_prompts_in_batch
+            
+            # Group rollouts by prompt and find best for each prompt
+            for original_prompt_idx in unique_prompts_in_batch:
+                local_prompt_idx = prompt_idx_to_local[int(original_prompt_idx.item())]
+                # Find all rollouts for this prompt
+                mask = (batch_prompt_indices_for_episode == original_prompt_idx)
+                prompt_best_rewards = best_rewards[mask]
+                prompt_best_idx = prompt_best_rewards.argmax().item()
+                # Get the global index in the batch
+                global_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                best_rollout_idx = global_indices[prompt_best_idx].item()
                 
-                # Vectorized batch creation: copy valid prompts
-                for i in valid_indices:
-                    bp = best_prompts[i]
-                    length = bp.shape[0]
-                    if length > 0:
-                        prompt_data_batch[i, :length] = bp
-                        lengths_batch[i] = length
+                batch_best_rewards_per_prompt[local_prompt_idx] = best_rewards[best_rollout_idx]
+                batch_best_prompts_per_prompt[local_prompt_idx] = best_prompts[best_rollout_idx]
+            
+            # Convert best prompts to tokens (one per original prompt)
+            batch_final_prompts = []
+            if batch_best_prompts_per_prompt and any(bp is not None for bp in batch_best_prompts_per_prompt):
+                # Prepare batch data for to_tokens
+                is_embeddings = None
+                max_len = 0
+                valid_indices = []
+                for i, bp in enumerate(batch_best_prompts_per_prompt):
+                    if bp is not None and bp.numel() > 0:
+                        max_len = max(max_len, bp.shape[0])
+                        if is_embeddings is None:
+                            is_embeddings = len(bp.shape) > 1
+                        valid_indices.append(i)
                 
-                # Use optimizer's to_tokens method (mode-agnostic)
-                tokens_batch = optimizer.to_tokens(prompt_data_batch, lengths_batch)
-                
-                # Vectorized extraction: extract all prompts at once
-                lengths_list = lengths_batch.tolist()
-                batch_final_prompts = [tokens_batch[i, :lengths_list[i]] if lengths_list[i] > 0 
-                               else torch.tensor([], dtype=torch.long, device=device) 
-                               for i in range(batch_B)]
-                
-                # Compute projection losses (vectorized where possible)
-                batch_projection_losses = []
-                for i in range(batch_B):
-                    if lengths_list[i] > 0:
-                        # Compute projection loss for continuous modes (embeddings -> tokens)
-                        if is_embeddings and best_prompts[i] is not None:
-                            # Use optimizer's method if available, otherwise compute directly
-                            if hasattr(optimizer, '_compute_projection_loss'):
-                                proj_loss = optimizer._compute_projection_loss(best_prompts[i])
-                            else:
-                                # Compute projection loss directly for continuous mode
-                                embedding_layer = self.agent.model.get_input_embeddings()
-                                vocab_embeds = embedding_layer.weight.detach()
-                                distances = torch.cdist(best_prompts[i], vocab_embeds)
-                                proj_loss = distances.min(dim=-1)[0].mean()
-                            batch_projection_losses.append(proj_loss.item() if isinstance(proj_loss, torch.Tensor) else proj_loss)
-                        else:
-                            batch_projection_losses.append(0.0)  # No projection for discrete (already tokens)
+                if max_len > 0 and valid_indices:
+                    # Create batch tensor
+                    if is_embeddings:
+                        prompt_data_batch = torch.zeros(num_prompts_in_batch, max_len, optimizer.emb_dim, device=device)
                     else:
-                        batch_projection_losses.append(float('inf'))
+                        prompt_data_batch = torch.zeros(num_prompts_in_batch, max_len, dtype=torch.long, device=device)
+                    lengths_batch = torch.zeros(num_prompts_in_batch, dtype=torch.long, device=device)
+                    
+                    # Copy valid prompts
+                    for i in valid_indices:
+                        bp = batch_best_prompts_per_prompt[i]
+                        length = bp.shape[0]
+                        if length > 0:
+                            prompt_data_batch[i, :length] = bp
+                            lengths_batch[i] = length
+                    
+                    # Use optimizer's to_tokens method
+                    tokens_batch = optimizer.to_tokens(prompt_data_batch, lengths_batch)
+                    
+                    # Extract prompts
+                    lengths_list = lengths_batch.tolist()
+                    batch_final_prompts = [tokens_batch[i, :lengths_list[i]] if lengths_list[i] > 0 
+                                   else torch.tensor([], dtype=torch.long, device=device) 
+                                   for i in range(num_prompts_in_batch)]
+                else:
+                    batch_final_prompts = [torch.tensor([], dtype=torch.long, device=device) for _ in range(num_prompts_in_batch)]
             else:
-                # No valid prompts: return empty tensors
-                batch_final_prompts = [torch.tensor([], dtype=torch.long, device=device) for _ in range(batch_B)]
-                batch_projection_losses = [float('inf')] * batch_B
+                batch_final_prompts = [torch.tensor([], dtype=torch.long, device=device) for _ in range(num_prompts_in_batch)]
             
-            # Store projection losses in traces for analysis
-            if batch_projection_losses:
-                for trace in traces:
-                    trace['projection_loss'] = batch_projection_losses[0] if batch_projection_losses else 0.0
-            
-            # Accumulate results from this batch
+            # Accumulate results from this batch (one per original prompt)
             all_final_prompts.extend(batch_final_prompts)
-            all_rewards.extend([float(r) for r in best_rewards])
-            # Extend traces once per prompt in the batch (traces has batch-level data, so we need one copy per prompt)
-            all_traces.extend([traces] * batch_B)
+            all_rewards.extend([float(r) for r in batch_best_rewards_per_prompt])
+            # Extend traces once per prompt in the batch
+            all_traces.extend([traces] * num_prompts_in_batch)
             # Accumulate policy metrics
             all_policy_metrics.extend(batch_policy_metrics)
         

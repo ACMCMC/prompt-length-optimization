@@ -87,7 +87,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         
         return prompt_data, updated_lengths
     
-    def _compute_projection_loss(self, embeds: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _compute_projection_loss(self, embeds: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute projection loss (mean distance to nearest vocab token).
         
@@ -98,6 +98,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             
         Returns:
             loss: Scalar loss (mean distance to nearest vocab token, only over masked positions)
+            min_distances: [B, L] tensor of distances to nearest vocab token (for logging)
         """
         # Handle 2D input (single prompt)
         if embeds.dim() == 2:
@@ -139,7 +140,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             # No mask: compute mean over all positions
             loss = min_distances.mean()
         
-        return loss
+        return loss, min_distances
     
     def _compute_projection_loss_per_prompt(self, embeds: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """
@@ -205,11 +206,14 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         # Use the suffix attention mask from model_input to determine which positions are active
         # This preserves the connection to the original suffix positions and avoids indexing issues
         suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
-        proj_loss = self._compute_projection_loss(prompt_data, mask=suffix_mask)
+        proj_loss, min_distances = self._compute_projection_loss(prompt_data, mask=suffix_mask)
+        
+        # Store min_distances for logging (detached, mean over batch)
+        self.min_distances = min_distances.detach().mean().item()
         
         # Combined loss: negative likelihood (maximize) + projection loss (minimize)
         loss = -likelihoods.mean() + self.projection_weight * proj_loss
-        
+            
         # Gradient descent step
         self.prompt_optimizer.zero_grad()
         loss.backward()

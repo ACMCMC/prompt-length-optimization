@@ -90,9 +90,15 @@ class PromptRLAgent:
         return likelihoods
     
     def get_random_token(self) -> int:
-        """Get a random token ID (excluding special tokens)."""
+        """
+        Get a random token ID from the vocabulary, excluding special tokens.
+        
+        Returns:
+            Random token ID (int)
+        """
+        # Sample from vocabulary, excluding special tokens
         while True:
-            token = random.randint(0, self.vocab_size - 1)
-            if token not in self.special_token_ids:
-                return token
-
+            token_id = random.randint(0, self.vocab_size - 1)
+            if token_id not in self.special_token_ids:
+                return token_id
+    
