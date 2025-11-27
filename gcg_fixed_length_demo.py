@@ -114,6 +114,11 @@ def gcg_fixed(agent: PromptRLAgent, prefix_ids: List[int], suffix_ids: List[int]
 def main() -> None:
     args = parse_args()
     agent = PromptRLAgent(model_name=args.model)
+    try:
+        import matplotlib.pyplot as plt
+        plotting_available = True
+    except Exception:
+        plotting_available = False
 
     prefix_ids = agent.tokenizer.encode(args.prefix, add_special_tokens=False) if args.prefix else []
     completion_ids = agent.tokenizer.encode(args.completion, add_special_tokens=False)
@@ -186,6 +191,21 @@ def main() -> None:
             print("\nTrace for best length:")
             for i, v in enumerate(best["trace"], 1):
                 print(f"  Pass {i:02d}: sum={v:.4f} avg/token={v/comp_len:.4f}")
+        if plotting_available:
+            lengths = [r["length"] for r in results]
+            finals = [r["final_ll"] for r in results]
+            bases = [r["base_ll"] for r in results]
+            plt.figure(figsize=(7, 4))
+            plt.plot(lengths, finals, label="Final LL", marker="o")
+            plt.plot(lengths, bases, label="Base LL", linestyle="--", marker="x", alpha=0.7)
+            plt.xlabel("Suffix length")
+            plt.ylabel("Log-likelihood (sum)")
+            plt.title("GCG sweep over suffix length")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig("gcg_sweep.png", dpi=120)
+            print("Saved sweep plot to gcg_sweep.png")
     else:
         res = run_for_length(args.suffix_len)
         comp_len = len(completion_ids)
