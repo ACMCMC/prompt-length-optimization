@@ -315,6 +315,9 @@ class LengthPolicyOptimizer:
                     returns_tensor = advantages + values_tensor
                     advantages_flat = advantages.view(-1)
                     returns_flat = returns_tensor.view(-1)
+                    # Detach to avoid backpropagating through time/reuse in multiple PPO epochs
+                    advantages_flat = advantages_flat.detach()
+                    returns_flat = returns_flat.detach()
                     advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8 + 1e-12)
 
                     old_log_probs_flat = log_probs_tensor.view(-1).detach()

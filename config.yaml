@@ -9,6 +9,10 @@ dataset:
   test_ratio: 0.15
 
 train:
+  wandb:
+    enable: true
+    project: prompt-length-optimization
+    run_name: default
   # Dataset parameters
   max_prompts: 8                   # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
