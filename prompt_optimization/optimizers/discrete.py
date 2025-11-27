@@ -92,7 +92,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     insert_pos = int(self.last_grad_norms[idx, :L].argmax().item())
                     new_token = int(self.last_topk_idx[idx, insert_pos, 0].item())
                 if insert_pos < L:
-                    prompt_data[idx, insert_pos+1:L+1] = prompt_data[idx, insert_pos:L]
+                    prompt_data[idx, insert_pos+1:L+1] = prompt_data[idx, insert_pos:L].clone()
                 prompt_data[idx, insert_pos] = new_token
                 updated_lengths[idx] = L + 1
 
