@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=16, help="Top-k tokens per coordinate")
     parser.add_argument("--candidates", type=int, default=32, help="Candidate samples per pass")
     parser.add_argument("--suffix-len", type=int, default=32, help="Fixed suffix length to optimize")
+    parser.add_argument("--sweep", action="store_true", help="Sweep suffix lengths from 1..suffix-len and report best")
     parser.add_argument("--prefix", type=str, default="", help="Optional fixed prefix text")
     parser.add_argument("--seed-suffix", type=str, default=None, help="Optional seed suffix text (overrides random init)")
     parser.add_argument("--print-trace", action="store_true", help="Print likelihood trace per pass")
@@ -115,66 +116,96 @@ def main() -> None:
     agent = PromptRLAgent(model_name=args.model)
 
     prefix_ids = agent.tokenizer.encode(args.prefix, add_special_tokens=False) if args.prefix else []
-    if args.seed_suffix is not None:
-        suffix_ids = agent.tokenizer.encode(args.seed_suffix, add_special_tokens=False)
-        if len(suffix_ids) == 0:
-            raise ValueError("Seed suffix must produce at least one token")
-        # pad/trim to desired length
-        if len(suffix_ids) < args.suffix_len:
-            pad_id = agent.tokenizer.bos_token_id or 0
-            suffix_ids = suffix_ids + [pad_id] * (args.suffix_len - len(suffix_ids))
-        else:
-            suffix_ids = suffix_ids[:args.suffix_len]
-    else:
-        suffix_ids = [agent.get_random_token() for _ in range(args.suffix_len)]
-
     completion_ids = agent.tokenizer.encode(args.completion, add_special_tokens=False)
     if not completion_ids:
         raise ValueError("Completion must produce at least one token")
 
-    # Baseline LL
-    base_ll = score_suffix(
-        agent,
-        prefix_ids,
-        torch.tensor(suffix_ids, device=agent.device).unsqueeze(0),
-        torch.tensor(completion_ids, device=agent.device),
-    )[0].item()
+    def make_seed_suffix(length: int) -> List[int]:
+        if args.seed_suffix is not None:
+            toks = agent.tokenizer.encode(args.seed_suffix, add_special_tokens=False)
+            if len(toks) == 0:
+                raise ValueError("Seed suffix must produce at least one token")
+            if len(toks) < length:
+                pad_id = agent.tokenizer.bos_token_id or 0
+                toks = toks + [pad_id] * (length - len(toks))
+            else:
+                toks = toks[:length]
+            return toks
+        return [agent.get_random_token() for _ in range(length)]
 
-    final_suffix, ll_trace = gcg_fixed(
-        agent,
-        prefix_ids=prefix_ids,
-        suffix_ids=suffix_ids,
-        completion_ids=completion_ids,
-        steps=args.steps,
-        top_k=args.top_k,
-        candidates=args.candidates,
-    )
+    def run_for_length(length: int):
+        suffix_ids = make_seed_suffix(length)
+        base_ll = score_suffix(
+            agent,
+            prefix_ids,
+            torch.tensor(suffix_ids, device=agent.device).unsqueeze(0),
+            torch.tensor(completion_ids, device=agent.device),
+        )[0].item()
+        final_suffix, ll_trace = gcg_fixed(
+            agent,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            completion_ids=completion_ids,
+            steps=args.steps,
+            top_k=args.top_k,
+            candidates=args.candidates,
+        )
+        final_ll = score_suffix(
+            agent,
+            prefix_ids,
+            torch.tensor(final_suffix, device=agent.device).unsqueeze(0),
+            torch.tensor(completion_ids, device=agent.device),
+        )[0].item()
+        return {
+            "length": length,
+            "base_ll": base_ll,
+            "final_ll": final_ll,
+            "improve": final_ll - base_ll,
+            "suffix": final_suffix,
+            "trace": ll_trace,
+        }
 
-    final_ll = score_suffix(
-        agent,
-        prefix_ids,
-        torch.tensor(final_suffix, device=agent.device).unsqueeze(0),
-        torch.tensor(completion_ids, device=agent.device),
-    )[0].item()
+    results = []
+    if args.sweep:
+        for L in range(1, args.suffix_len + 1):
+            results.append(run_for_length(L))
+        best = max(results, key=lambda r: r["final_ll"])
+        comp_len = len(completion_ids)
+        print(f"Sweep results (1..{args.suffix_len})")
+        for r in results:
+            print(f"  L={r['length']:2d} final_ll={r['final_ll']:.4f} improve={r['improve']:.4f}")
+        print("\nBest result")
+        print(f"  Length              : {best['length']}")
+        print(f"  Log-likelihood (sum): {best['final_ll']:.4f} (avg/token: {best['final_ll']/comp_len:.4f})")
+        print(f"  Improvement (sum)   : {best['improve']:.4f} (avg/token: {best['improve']/comp_len:.4f})")
+        full_prompt_ids = prefix_ids + best["suffix"]
+        print(f"  Full prompt tokens  : {full_prompt_ids}")
+        decoded = decode_tokens(agent, full_prompt_ids)
+        print(f"  Full prompt text    : {decoded if decoded else '<decoded to empty string>'}")
+        if args.print_trace:
+            print("\nTrace for best length:")
+            for i, v in enumerate(best["trace"], 1):
+                print(f"  Pass {i:02d}: sum={v:.4f} avg/token={v/comp_len:.4f}")
+    else:
+        res = run_for_length(args.suffix_len)
+        comp_len = len(completion_ids)
+        print("Initial stats")
+        print(f"  Prefix length : {len(prefix_ids)}")
+        print(f"  Suffix length : {res['length']}")
+        print(f"  Log-likelihood (sum): {res['base_ll']:.4f} (avg/token: {res['base_ll']/comp_len:.4f})")
 
-    comp_len = len(completion_ids)
-    print("Initial stats")
-    print(f"  Prefix length : {len(prefix_ids)}")
-    print(f"  Suffix length : {len(suffix_ids)}")
-    print(f"  Log-likelihood (sum): {base_ll:.4f} (avg/token: {base_ll/comp_len:.4f})")
+        print("\nAfter GCG")
+        print(f"  Log-likelihood (sum): {res['final_ll']:.4f} (avg/token: {res['final_ll']/comp_len:.4f})")
+        print(f"  Improvement (sum)   : {res['improve']:.4f} (avg/token: {res['improve']/comp_len:.4f})")
+        full_prompt_ids = prefix_ids + res["suffix"]
+        print(f"  Full prompt tokens  : {full_prompt_ids}")
+        decoded = decode_tokens(agent, full_prompt_ids)
+        print(f"  Full prompt text    : {decoded if decoded else '<decoded to empty string>'}")
 
-    print("\nAfter GCG")
-    print(f"  Log-likelihood (sum): {final_ll:.4f} (avg/token: {final_ll/comp_len:.4f})")
-    print(f"  Improvement (sum)   : {final_ll - base_ll:.4f} (avg/token: {(final_ll - base_ll)/comp_len:.4f})")
-    full_prompt_ids = prefix_ids + final_suffix
-    print(f"  Full prompt tokens  : {full_prompt_ids}")
-    decoded = decode_tokens(agent, full_prompt_ids)
-    print(f"  Full prompt text    : {decoded if decoded else '<decoded to empty string>'}")
-
-    if args.print_trace:
-        print("\nLikelihood trace (per pass):")
-        for i, v in enumerate(ll_trace, 1):
-            print(f"  Pass {i:02d}: sum={v:.4f} avg/token={v/comp_len:.4f}")
+        if args.print_trace:
+            print("\nLikelihood trace (per pass):")
+            for i, v in enumerate(res["trace"], 1):
+                print(f"  Pass {i:02d}: sum={v:.4f} avg/token={v/comp_len:.4f}")
 
 
 if __name__ == "__main__":
