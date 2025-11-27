@@ -225,6 +225,12 @@ class LengthPolicyOptimizer:
                     action_logits = self.policy_net(states)  # [batch_B, 3]
                     action_probs = F.softmax(action_logits, dim=-1)
                     actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    # Mask "add" when at or above max_prompt_len to prevent runaway growth
+                    if hasattr(optimizer, "max_prompt_len"):
+                        add_mask = (actions == 2) & (lengths >= optimizer.max_prompt_len)
+                        if add_mask.any():
+                            actions = actions.clone()
+                            actions[add_mask] = 1  # convert to KEEP
                     if batch_B == 1:
                         log_probs = F.log_softmax(action_logits, dim=-1)[0, actions].unsqueeze(0)
                     else:
@@ -237,8 +243,9 @@ class LengthPolicyOptimizer:
                         attention_mask_offset, max_prefix_size, pad_id
                     )
                 
-                    # Compute rewards
-                    rewards = alpha * likelihoods - beta * lengths.float()
+                    # Compute rewards (length normalized by initial_prompt_length)
+                    length_norm = lengths.float() / max(1.0, float(initial_prompt_length))
+                    rewards = alpha * likelihoods - beta * length_norm
                     
                     # Vectorized best update: only update where reward improved
                     improve_mask = rewards > best_rewards
