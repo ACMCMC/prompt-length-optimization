@@ -31,7 +31,8 @@ class LengthPolicyOptimizer:
         self.temperature = 1.0
         
         # Simple policy network: state -> action probs
-        self.state_dim = 4  # [length, likelihood, step_ratio, improvement]
+        # State features: [len_norm, ll, delta_ll, best_ll, step_ratio]
+        self.state_dim = 5
         self.policy_net = nn.Sequential(
             nn.Linear(self.state_dim, 64),
             nn.ReLU(),
@@ -200,6 +201,8 @@ class LengthPolicyOptimizer:
                 # Reset prompts and length state each episode (fresh start)
                 prompt_data, lengths = optimizer.initialize_prompts()
                 attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)
+                prev_ll = torch.zeros(batch_B, device=device)
+                best_ll = torch.full((batch_B,), float("-inf"), device=device)
 
                 episode_rewards = []
                 episode_log_probs = []
@@ -218,12 +221,17 @@ class LengthPolicyOptimizer:
                     
                     # Compute states for policy
                     step_ratio = step / steps_per_episode
+                    len_norm = lengths.float() / initial_prompt_length
+                    delta_ll = likelihoods - prev_ll
+                    best_ll = torch.maximum(best_ll, likelihoods)
                     states = torch.stack([
-                        lengths.float() / initial_prompt_length,  # normalized length
-                        likelihoods,  # current likelihood
+                        len_norm,          # normalized length
+                        likelihoods,       # current likelihood
+                        delta_ll,          # change from previous step
+                        best_ll,           # running best LL
                         torch.full((batch_B,), step_ratio, device=device),  # step ratio
-                        torch.zeros(batch_B, device=device)  # improvement (simplified)
-                    ], dim=1)  # [batch_B, 4]
+                    ], dim=1)  # [batch_B, state_dim]
+                    prev_ll = likelihoods.detach()
                     
                     # Policy forward pass
                     action_logits = self.policy_net(states)  # [batch_B, 3]
