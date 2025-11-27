@@ -23,13 +23,13 @@ train:
   # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
-  epsilon: 0.3                    # Epsilon for epsilon-greedy exploration (higher = more random exploration)
-  epsilon_decay: 0.998            # Epsilon decay per episode (higher = slower decay, more exploration)
+  epsilon: 0.5                    # Epsilon for epsilon-greedy exploration (higher = more random exploration)
+  epsilon_decay: 0.95            # Epsilon decay per episode (higher = slower decay, more exploration)
   epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
   entropy_coef: 0.05              # Entropy bonus coefficient (encourages diverse action distributions)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
-  alpha: 1.0                         # Likelihood weight
-  beta: 3.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  alpha: 0.5                         # Likelihood weight
+  beta: 0.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
   projection_weight: 0.5            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
@@ -47,7 +47,7 @@ train:
   use_wandb: true                    # Enable wandb logging (default: true)
   wandb_project: prompt-optimization  # Wandb project name
 
-  optimization_mode: continuous_proj
+  optimization_mode: discrete
   
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:

@@ -302,7 +302,7 @@ def evaluate_on_dataset(cfg, model_path):
         ep_dict = trace_obj if isinstance(trace_obj, dict) else (trace_obj[-1] if isinstance(trace_obj, (list, tuple)) and len(trace_obj) > 0 else None)
         
         if not isinstance(ep_dict, dict):
-            return 0.0
+        return 0.0
         
         # Prefer best_likelihoods, fallback to likelihoods, then single 'likelihood' key
         if 'likelihood' in ep_dict:

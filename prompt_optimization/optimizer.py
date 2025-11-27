@@ -37,7 +37,7 @@ class LengthPolicyOptimizer:
         self.policy_net = nn.Sequential(
             nn.Linear(self.state_dim, policy_hidden_size),
             nn.ReLU(),
-            nn.Linear(policy_hidden_size, 3)  # Actions: 0=remove, 1=keep, 2=add
+            nn.Linear(policy_hidden_size, 3)  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
         ).to(agent.device)
         
         # Value network for GRPO (estimates state values)
@@ -153,21 +153,38 @@ class LengthPolicyOptimizer:
         """
         Apply length actions to suffix only.
         Prefix and completion are immutable - only suffix tokens/embeddings and attention mask can change.
-        """
-        # Handle remove actions (action=0): remove token from suffix by setting attention mask to 0
-        remove_mask = (actions == 0) & (lengths > 0)
-        if remove_mask.any():
-            remove_indices = torch.nonzero(remove_mask, as_tuple=False).squeeze(-1)
-            model_input.remove_suffix_token(remove_indices)
         
-        # Handle add actions (action=2): add new token to suffix by setting attention mask to 1
-        add_mask = (actions == 2) & (lengths < model_input.max_suffix_len)
-        if add_mask.any():
-            add_indices = torch.nonzero(add_mask, as_tuple=False).squeeze(-1)
-            model_input.add_suffix_token(add_indices)
+        Actions:
+        - 0: optimize_suffix (handled separately, not here)
+        - 1: decrease (remove token)
+        - 2: increase (add token)
+        """
+        # Handle decrease actions (action=1): remove token from suffix by setting attention mask to 0
+        decrease_mask = (actions == 1) & (lengths > 0)
+        if decrease_mask.any():
+            decrease_indices = torch.nonzero(decrease_mask, as_tuple=False).squeeze(-1)
+            model_input.remove_suffix_token(decrease_indices)
+        
+        # Handle increase actions (action=2): add new token to suffix by setting attention mask to 1
+        increase_mask = (actions == 2) & (lengths < model_input.max_suffix_len)
+        if increase_mask.any():
+            increase_indices = torch.nonzero(increase_mask, as_tuple=False).squeeze(-1)
+            model_input.add_suffix_token(increase_indices)
+        
+        # Map actions for apply_length_action: 1=decrease -> 0, 2=increase -> 2
+        # Action 0 (optimize_suffix) is not passed to apply_length_action
+        mapped_actions = actions.clone()
+        mapped_actions[actions == 1] = 0  # decrease -> remove
+        # Action 2 (increase) stays as 2 (add)
+        # Action 0 (optimize_suffix) should not be passed, but if it is, it will be treated as no-op in apply_length_action
         
         # Apply standard length action (initializes new positions if needed)
-        prompt_data, lengths = optimizer.apply_length_action(prompt_data, lengths, actions)
+        # Only apply to non-optimize actions (1 and 2)
+        action_mask = (actions != 0)
+        if action_mask.any():
+            prompt_data, lengths = optimizer.apply_length_action(
+                prompt_data, lengths, mapped_actions
+            )
         
         # Update suffix in ModelBatchedInput (tokens/embeddings)
         # Note: model_input.mode is normalized to 'continuous' for continuous_proj
@@ -255,9 +272,20 @@ class LengthPolicyOptimizer:
                     max_suffix_len=max_suffix_len, init_len=init_len
                 )
             else:  # discrete
+                # Get GCG config (must be set from YAML)
+                gcg_steps = getattr(self, 'gcg_steps', None)
+                if gcg_steps is None:
+                    raise ValueError("gcg_steps must be set from YAML config before using discrete mode")
+                gcg_top_k = getattr(self, 'gcg_top_k', None)
+                if gcg_top_k is None:
+                    raise ValueError("gcg_top_k must be set from YAML config before using discrete mode")
+                gcg_batch_size = getattr(self, 'gcg_batch_size', None)
+                if gcg_batch_size is None:
+                    raise ValueError("gcg_batch_size must be set from YAML config before using discrete mode")
                 optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
-                    max_suffix_len=max_suffix_len, init_len=init_len
+                    max_suffix_len=max_suffix_len, init_len=init_len,
+                    gcg_steps=gcg_steps, gcg_top_k=gcg_top_k, gcg_batch_size=gcg_batch_size
                 )
             
             best_rewards = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
@@ -308,22 +336,20 @@ class LengthPolicyOptimizer:
                 self.policy_net.eval()
                 self.value_net.eval()
                 
+                # Track last known likelihood for state representation (initialize to 0)
+                last_known_likelihoods = torch.zeros(batch_B, dtype=torch.float32, device=device)
+                
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
-                    # ===== PROMPT OPTIMIZATION ONLY (no policy updates) =====
-                    # Inner optimization step: optimize prompt embeddings/tokens only
-                    # This does NOT update the policy network
+                    # ===== ACTION SELECTION AND EXECUTION (no policy updates) =====
                     if step == 0 or (step + 1) % 10 == 0 or step == steps_per_episode - 1:
-                        logger.info(f"  Optimization step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})")
-                    
-                    prompt_data, likelihoods = optimizer.inner_optimization_step(
-                        prompt_data, lengths, step, model_input
-                    )
+                        logger.info(f"  Step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})")
                     
                     # Compute states for policy (inference only, no gradients)
+                    # Use last known likelihood (or 0 if not yet computed)
                     states = torch.stack([
                         lengths.float() / initial_prompt_length,  # normalized length
-                        likelihoods,  # current likelihood
+                        last_known_likelihoods,  # last known likelihood (updated when optimize_suffix is called)
                     ], dim=1)  # [batch_B, 2]
                     
                     # Policy forward pass (INFERENCE ONLY - no gradients, no updates)
@@ -354,7 +380,25 @@ class LengthPolicyOptimizer:
                                            torch.full((batch_B,), uniform_log_prob, device=device),
                                            policy_log_probs_selected)
                     
-                    # Apply length actions and handle prefix shifting
+                    # Execute actions conditionally
+                    # Action 0: optimize_suffix - run inner optimization step
+                    optimize_mask = (actions == 0)
+                    if optimize_mask.any():
+                        # Run optimization for items that selected optimize_suffix
+                        # Note: inner_optimization_step works on entire batch, but we only want to optimize
+                        # items where action==0. For now, we'll optimize all and update likelihoods for all,
+                        # but this could be optimized to only optimize selected items.
+                        prompt_data, step_likelihoods = optimizer.inner_optimization_step(
+                            prompt_data, lengths, step, model_input
+                        )
+                        # Update last known likelihoods for items that optimized
+                        last_known_likelihoods = torch.where(
+                            optimize_mask,
+                            step_likelihoods,
+                            last_known_likelihoods
+                        )
+                    
+                    # Actions 1 and 2: decrease and increase - apply length changes
                     prompt_data, lengths = self._apply_length_action_with_prefix(
                         optimizer, prompt_data, lengths, actions, model_input
                     )
@@ -363,25 +407,23 @@ class LengthPolicyOptimizer:
                     # Count active suffix positions
                     active_suffix_counts = model_input.suffix_attention_mask.sum(dim=1)  # [B]
                     lengths = active_suffix_counts
-                
-                    # Compute rewards: both likelihood and length are negative, less negative = better
-                    # Likelihoods are negative (log probabilities): less negative = better (e.g., -50 > -80)
-                    # Lengths are converted to negative: shorter = less negative = better (e.g., -20 > -60)
-                    # Reward = alpha * likelihood - beta * length
-                    # Both terms are negative, so higher (less negative) reward = better performance
-                    rewards = alpha * likelihoods - beta * lengths.float()
                     
-                    # Vectorized best update: only update where reward improved
-                    improve_mask = rewards > best_rewards
+                    # Compute step-level rewards for logging/debugging (not used for policy updates)
+                    # Use last_known_likelihoods for reward computation
+                    step_rewards = alpha * last_known_likelihoods - beta * lengths.float()  # [batch_B]
+                    
+                    # Update best prompts based on step rewards (for tracking best so far)
+                    improve_mask = step_rewards > best_rewards
                     if improve_mask.any():
-                        best_rewards = torch.where(improve_mask, rewards, best_rewards)
-                        best_likelihoods = torch.where(improve_mask, likelihoods, best_likelihoods)
+                        best_rewards = torch.where(improve_mask, step_rewards, best_rewards)
+                        best_likelihoods = torch.where(improve_mask, last_known_likelihoods, best_likelihoods)
                         # Update best prompts for improved items
                         for i in torch.nonzero(improve_mask, as_tuple=False).squeeze(-1).tolist():
                             best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
                     
-                    episode_rewards.append(rewards)
-                    episode_likelihoods.append(likelihoods)
+                    # Store step data (rewards computed at episode end for policy updates)
+                    # Use last_known_likelihoods for tracking (will be replaced with final likelihood at episode end)
+                    episode_likelihoods.append(last_known_likelihoods.clone())
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
                     episode_action_probs.append(action_probs)  # Store for entropy
@@ -392,13 +434,15 @@ class LengthPolicyOptimizer:
                     global_step = global_step_offset + local_step  # Truly global step across all batches
                     # Convert to Python floats, handling NaN/Inf
                     likelihoods_list = []
-                    for l in likelihoods:
+                    for l in last_known_likelihoods:
                         l_val = float(l.item()) if torch.is_tensor(l) else float(l)
                         # Check if value is NaN or Inf, if so set to 0.0
                         if not (isinstance(l_val, (int, float)) and l_val == l_val and l_val != float('inf') and l_val != float('-inf')):
                             l_val = 0.0
                         likelihoods_list.append(l_val)
                     
+                    # Convert step rewards to list for logging
+                    step_rewards_list = [float(r) for r in step_rewards]
                     best_likelihoods_list = []
                     for l in best_likelihoods:
                         l_val = float(l.item()) if torch.is_tensor(l) else float(l)
@@ -410,7 +454,7 @@ class LengthPolicyOptimizer:
                     traces.append({
                         'episode': episode,
                         'step': global_step,  # Global step across all episodes
-                        'rewards': [float(r) for r in rewards],
+                        'rewards': step_rewards_list,  # Step-level rewards for logging
                         'likelihoods': likelihoods_list,
                         'best_likelihoods': best_likelihoods_list,
                         'lengths': [int(l) for l in lengths]
@@ -419,23 +463,31 @@ class LengthPolicyOptimizer:
                     # Log step-level metrics to wandb in real-time
                     if wandb_log_fn is not None:
                         # Compute batch averages for logging
-                        avg_reward = rewards.mean().item()
-                        avg_likelihood = likelihoods.mean().item()
+                        avg_reward = step_rewards.mean().item()
+                        avg_likelihood = last_known_likelihoods.mean().item()
                         avg_length = lengths.float().mean().item()
                         avg_best_likelihood = best_likelihoods.float().mean().item()
                         
-                        # Action distribution
+                        # Action distribution: probabilities from policy (before sampling)
+                        policy_action_probs = action_probs.mean(dim=0)  # Average policy probabilities across batch
+                        
+                        # Actual action ratios (what was actually chosen after sampling)
                         action_counts = torch.bincount(actions, minlength=3)
-                        action_probs_step = action_counts.float() / batch_B
+                        action_ratio_optimize = action_counts[0].float() / batch_B
+                        action_ratio_decrease = action_counts[1].float() / batch_B
+                        action_ratio_increase = action_counts[2].float() / batch_B
                         
                         step_log_dict = {
-                            'step/avg_reward': avg_reward,
+                            'step/avg_reward': avg_reward,  # Step-level reward for debugging
                             'step/avg_likelihood': avg_likelihood,
                             'step/avg_length': avg_length,
                             'step/avg_best_likelihood': avg_best_likelihood,
-                            'step/action_prob_decrease': action_probs_step[0].item(),
-                            'step/action_prob_keep': action_probs_step[1].item(),
-                            'step/action_prob_increase': action_probs_step[2].item(),
+                            'step/action_prob_optimize': policy_action_probs[0].item(),
+                            'step/action_prob_decrease': policy_action_probs[1].item(),
+                            'step/action_prob_increase': policy_action_probs[2].item(),
+                            'step/action_ratio_optimize': action_ratio_optimize.item(),
+                            'step/action_ratio_decrease': action_ratio_decrease.item(),
+                            'step/action_ratio_increase': action_ratio_increase.item(),
                             'step/epsilon': self.current_epsilon,
                             'episode': episode,
                             'step_in_episode': step,
@@ -449,12 +501,52 @@ class LengthPolicyOptimizer:
                         wandb_log_fn(step_log_dict, step=global_step)
                 
                 # ===== POLICY UPDATE (only after episode completes) =====
+                # Compute final likelihood and rewards at episode end
+                # This reduces noise compared to computing rewards at each step
+                with torch.no_grad():
+                    final_likelihoods = optimizer.get_likelihoods(
+                        prompt_data, lengths, model_input, requires_grad=False
+                    )  # [batch_B]
+                
+                # Compute final reward: alpha * likelihood - beta * length
+                final_rewards = alpha * final_likelihoods - beta * lengths.float()  # [batch_B]
+                
+                # Update best prompts based on final reward
+                improve_mask = final_rewards > best_rewards
+                if improve_mask.any():
+                    best_rewards = torch.where(improve_mask, final_rewards, best_rewards)
+                    best_likelihoods = torch.where(improve_mask, final_likelihoods, best_likelihoods)
+                    # Update best prompts for improved items
+                    for i in torch.nonzero(improve_mask, as_tuple=False).squeeze(-1).tolist():
+                        best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
+                
+                # Assign discounted rewards to all steps in episode
+                # Reward at step t = gamma^(T-1-t) * final_reward
+                # This gives credit to all actions that led to the final outcome
+                T = steps_per_episode
+                episode_rewards_list = []
+                for step in range(T):
+                    discount_factor = (self.grpo_gamma ** (T - 1 - step))
+                    step_rewards = discount_factor * final_rewards  # [batch_B]
+                    episode_rewards_list.append(step_rewards)
+                
+                # Note: traces already have step-level rewards for debugging/logging
+                # Policy updates use final discounted rewards (episode_rewards_list), not step-level rewards
+                # Update best_likelihoods in traces with final values
+                for step, trace in enumerate(traces[-T:]):
+                    trace['best_likelihoods'] = [float(l) for l in best_likelihoods]
+                    # Keep step-level rewards in trace for debugging (already set during episode)
+                    # Policy updates use episode_rewards_list (final discounted rewards)
+                
+                # Update episode_likelihoods with final likelihoods (for consistency, though not used in GRPO)
+                episode_likelihoods = [final_likelihoods.unsqueeze(0) for _ in range(T)]
+                
                 # Now we update the policy network using collected episode data
                 # Set to training mode for gradient computation
                 self.policy_net.train()
                 self.value_net.train()
                 
-                rewards_tensor = torch.stack(episode_rewards)  # [T, batch_B]
+                rewards_tensor = torch.stack(episode_rewards_list)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
                 states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
                 action_probs_tensor = torch.stack(episode_action_probs)  # [T, batch_B, 3]
