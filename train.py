@@ -367,8 +367,9 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
                 optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
-
+                base_text = batch_prompts[prompt_idx].get('base', '')
                 optimized_suffix_text = optimized_text
+                optimized_full_with_base = f"{base_text}{optimized_suffix_text}"
                 try:
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
                 except Exception:
@@ -403,13 +404,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 except Exception as _:
                     print("Warning: failed to write training metrics to CSV")
 
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_full_with_base[:300]}{'...' if len(optimized_full_with_base) > 300 else ''}")
                 print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
                 print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
                 batch_summaries.append({
-                    'input': batch_prompts[prompt_idx].get('base', '')[:200],
-                    'optimized_full': optimized_text,
+                    'input': base_text[:200],
+                    'optimized_full': optimized_full_with_base,
                     'optimized_suffix': optimized_suffix_text,
                     'target': batch_prompts[prompt_idx].get('target', ''),
                     'reward': float(best_reward),
@@ -491,8 +492,9 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
                 optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
-
+                base_text = batch_prompts[prompt_idx].get('base', '')
                 optimized_suffix_text = optimized_text
+                optimized_full_with_base = f"{base_text}{optimized_suffix_text}"
 
                 # Extract final and best likelihoods from traces for this prompt
                 try:
@@ -530,8 +532,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         ])
                 except Exception as _:
                     print("Warning: failed to write training metrics to CSV")
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_full_with_base[:300]}{'...' if len(optimized_full_with_base) > 300 else ''}")
                 print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
                 print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
@@ -577,9 +579,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_prompt = best_prompt_result
                     best_prompt_text = batch_prompts[prompt_idx].get('base', '')
 
-                    optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
+                optimized_text = _decode_tokens(agent.tokenizer, best_prompt_result) if best_prompt_result is not None else ''
 
+                base_text = batch_prompts[prompt_idx].get('base', '')
                 optimized_suffix_text = optimized_text
+                optimized_full_with_base = f"{base_text}{optimized_suffix_text}"
                 # Extract final and best likelihoods from traces for this prompt (discrete)
                 try:
                     final_ll, best_ll, best_ep, best_reward_val = _extract_metrics_from_traces(traces, prompt_idx)
@@ -616,8 +620,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 except Exception:
                     print("Warning: failed to write training metrics to CSV")
 
-                print(f"Input (base prompt): {batch_prompts[prompt_idx].get('base', '')[:200]}{'...' if len(batch_prompts[prompt_idx].get('base','')) > 200 else ''}")
-                print(f"Optimized full prompt: {optimized_text[:300]}{'...' if len(optimized_text) > 300 else ''}")
+                print(f"Input (base prompt): {base_text[:200]}{'...' if len(base_text) > 200 else ''}")
+                print(f"Optimized full prompt: {optimized_full_with_base[:300]}{'...' if len(optimized_full_with_base) > 300 else ''}")
                 print(f"Optimized suffix: {optimized_suffix_text[:200]}{'...' if len(optimized_suffix_text) > 200 else ''}")
                 print(f"Target completion: {batch_prompts[prompt_idx].get('target','')[:200]}{'...' if len(batch_prompts[prompt_idx].get('target','')) > 200 else ''}")
 
