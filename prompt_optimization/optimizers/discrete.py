@@ -141,6 +141,16 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 prefix_lengths=pref_len_batch
             )
 
+            # Compute current likelihood for logging
+            current_ll = self.agent.get_likelihoods_batch(
+                embedding_layer(control_tokens.unsqueeze(0)),
+                comp_tokens.unsqueeze(0),
+                torch.tensor([comp_len], device=device),
+                requires_grad=False,
+                prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
+                prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
+            )[0]
+
             if ll_batch.numel() > 0:
                 best_idx = torch.argmax(ll_batch)
                 best_tokens_batch[b, :L] = candidates[best_idx]
@@ -157,6 +167,12 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
                 )[0]
                 best_ll_batch[b] = orig_ll
+
+            # Log before/after likelihoods for inspection
+            try:
+                print(f"[GCG] idx={b} len={L} pref_len={pref_len} ll_before={current_ll.item():.3f} ll_after={best_ll_batch[b].item():.3f}")
+            except Exception:
+                pass
 
         # Update prompt_data with improved tokens
         prompt_data[:, :max_active_len] = best_tokens_batch
