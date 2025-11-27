@@ -1,12 +1,11 @@
 """
-Discrete prompt optimization using a batched GCG-like update.
-Ported from the GCG_atharv_working branch (prompt_rl_poc.py) to fit the current optimizer interface.
+Discrete prompt optimization using the official GCG-style gradient + sampling update.
 """
 
 import torch
-import random
 from typing import Tuple, List, Optional
 from ..interface import BasePromptOptimizer
+from prompt_optimization.gcg_official import token_gradients, sample_control
 
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
@@ -15,9 +14,12 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     """
 
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
-                 batch_size: int, lr_embeddings: float, max_suffix_len: int = None, init_len: int = None):
+                 batch_size: int, lr_embeddings: float, max_suffix_len: int = None, init_len: int = None,
+                 top_k: int = 16, candidate_size: int = 32):
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
         self.embedding_layer = agent.model.get_input_embeddings()
+        self.top_k = max(1, int(top_k))
+        self.candidate_size = max(1, int(candidate_size))
         # Initialize with random non-special tokens
         self.prompt_tokens = torch.zeros(batch_size, max_prompt_len, dtype=torch.long, device=self.device)
         for i in range(batch_size):
@@ -69,67 +71,76 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                                step: int, prefix_tokens: torch.Tensor = None,
                                prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Batched discrete optimization inspired by GCG: compute gradients to propose replacements.
+        Batched discrete optimization using the official GCG gradient + sampling update.
         """
         device = self.device
         B = prompt_data.shape[0]
         max_active_len = lengths.max().item()
         active_tokens = prompt_data[:, :max_active_len]
         embedding_layer = self.embedding_layer
-        vocab_embeds = embedding_layer.weight.detach()
-        vocab_size = vocab_embeds.shape[0]
-
-        # Build prompt embeddings requiring grad
-        prompt_embeds = embedding_layer(active_tokens).detach().requires_grad_(True)  # [B, L, D]
-
-        # Compute likelihoods and gradients
-        likelihoods = self.agent.get_likelihoods_batch(
-            prompt_embeds, completion_tokens, completion_lengths, requires_grad=True,
-            prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
-        )
-        loss = -likelihoods.sum()
-        self.agent.model.zero_grad(set_to_none=True)
-        loss.backward()
-
-        grads = prompt_embeds.grad.detach()  # [B, L, D]
-
-        # Vectorized candidate proposal: top-k per position
-        top_k = min(16, vocab_size)
-        grads_flat = (-grads).reshape(B * max_active_len, -1)
-        scores = torch.matmul(grads_flat, vocab_embeds.t()).reshape(B, max_active_len, vocab_size)
-        if self.agent.special_token_ids:
-            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-            mask[list(self.agent.special_token_ids)] = True
-            scores[..., mask] = float('-inf')
-        _, topk_idx = torch.topk(scores, k=top_k, dim=-1)  # [B, L, top_k]
 
         best_tokens_batch = active_tokens.clone()
-        best_ll_batch = likelihoods.clone().detach()
+        best_ll_batch = torch.full((B,), float("-inf"), device=device)
 
-        # For each position, try best candidate token and keep if improves likelihood
+        # Evaluate each example separately (closest to reference implementation)
         for b in range(B):
             L = lengths[b].item()
-            if L == 0:
+            comp_len = completion_lengths[b].item()
+            if L == 0 or comp_len == 0:
                 continue
-            for pos in range(L):
-                candidates = topk_idx[b, pos]
-                for cand in candidates:
-                    cand_token = int(cand.item())
-                    if cand_token == int(active_tokens[b, pos].item()):
-                        continue
-                    test_tokens = best_tokens_batch[b].clone()
-                    test_tokens[pos] = cand_token
-                    test_embeds = embedding_layer(test_tokens.unsqueeze(0))
-                    test_ll = self.agent.get_likelihoods_batch(
-                        test_embeds, completion_tokens[b:b+1],
-                        completion_lengths[b:b+1],
-                        requires_grad=False,
-                        prefix_tokens=prefix_tokens[b:b+1] if prefix_tokens is not None else None,
-                        prefix_lengths=prefix_lengths[b:b+1] if prefix_lengths is not None else None
-                    )[0]
-                    if test_ll.item() > best_ll_batch[b].item():
-                        best_ll_batch[b] = test_ll
-                        best_tokens_batch[b] = test_tokens
+
+            control_tokens = active_tokens[b, :L]
+            comp_tokens = completion_tokens[b, :comp_len]
+
+            # Build full sequence: control + completion
+            input_ids = torch.cat([control_tokens, comp_tokens], dim=0)
+            control_slice = slice(0, L)
+            target_slice = slice(L, L + comp_len)
+            loss_slice = slice(L - 1, L - 1 + comp_len)
+
+            # Compute gradients using official token_gradients
+            self.agent.model.zero_grad(set_to_none=True)
+            grad = token_gradients(self.agent.model, input_ids, control_slice, target_slice, loss_slice)
+
+            # Sample candidate controls
+            not_allowed = torch.tensor(list(self.agent.special_token_ids), device=device) if self.agent.special_token_ids else None
+            candidates = sample_control(
+                control_tokens,
+                grad,
+                batch_size=self.candidate_size,
+                topk=self.top_k,
+                temp=1,
+                not_allowed_tokens=not_allowed
+            )
+
+            # Score candidates with batched likelihood for efficiency
+            cand_embeds = embedding_layer(candidates)  # [K, L, D]
+            comp_tokens_batch = comp_tokens.unsqueeze(0).expand(candidates.shape[0], -1)
+            comp_lengths_batch = torch.full((candidates.shape[0],), comp_len, device=device, dtype=torch.long)
+
+            ll_batch = self.agent.get_likelihoods_batch(
+                cand_embeds,
+                comp_tokens_batch,
+                comp_lengths_batch,
+                requires_grad=False,
+                prefix_tokens=None,
+                prefix_lengths=None
+            )
+
+            if ll_batch.numel() > 0:
+                best_idx = torch.argmax(ll_batch)
+                best_tokens_batch[b, :L] = candidates[best_idx]
+                best_ll_batch[b] = ll_batch[best_idx]
+            else:
+                # fallback to original tokens
+                orig_embeds = embedding_layer(control_tokens.unsqueeze(0))
+                orig_ll = self.agent.get_likelihoods_batch(
+                    orig_embeds,
+                    comp_tokens.unsqueeze(0),
+                    torch.tensor([comp_len], device=device),
+                    requires_grad=False
+                )[0]
+                best_ll_batch[b] = orig_ll
 
         # Update prompt_data with improved tokens
         prompt_data[:, :max_active_len] = best_tokens_batch

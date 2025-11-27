@@ -110,7 +110,8 @@ class LengthPolicyOptimizer:
                                value_coef: float = 0.5, entropy_coef: float = 0.01,
                                max_suffix_len: int = 64, init_len: int = 32,
                                wandb_log_fn=None, global_step_offset: int = 0,
-                               log_prompt_indices: Optional[List[int]] = None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               log_prompt_indices: Optional[List[int]] = None,
+                               gcg_top_k: int = 16, gcg_candidate_size: int = 32) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -151,7 +152,8 @@ class LengthPolicyOptimizer:
                 )
             else:  # discrete
                 optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
-                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings
+                    self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
+                    top_k=gcg_top_k, candidate_size=gcg_candidate_size
                 )
             
             # Initialize prompts (suffix)

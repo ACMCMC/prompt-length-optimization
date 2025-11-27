@@ -349,6 +349,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 entropy_coef=ppo_entropy_coef,
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
+                gcg_top_k=gcg_top_k,
+                gcg_candidate_size=gcg_steps,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts
@@ -446,6 +448,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 entropy_coef=ppo_entropy_coef,
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
+                gcg_top_k=gcg_top_k,
+                gcg_candidate_size=gcg_steps,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts
@@ -553,6 +557,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 entropy_coef=ppo_entropy_coef,
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
+                gcg_top_k=gcg_top_k,
+                gcg_candidate_size=gcg_steps,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts

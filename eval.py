@@ -50,7 +50,9 @@ def evaluate_prompt(cfg, agent, optimizer):
             lr_embeddings=0.01,
             alpha=cfg.get('train', {}).get('alpha', 1.0),
             beta=cfg.get('train', {}).get('beta', 0.1),
-            mode='continuous' if 'continuous' in opt_mode else 'discrete'
+            mode='continuous' if 'continuous' in opt_mode else 'discrete',
+            gcg_top_k=gcg_top_k,
+            gcg_candidate_size=gcg_steps
         )
         best_prompt = best_prompts_batch[0] if best_prompts_batch else []
         completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
@@ -303,7 +305,9 @@ def evaluate_on_dataset(cfg, model_path):
                     beta=beta,
                     mode='continuous' if 'continuous' in opt_mode else 'discrete',
                     max_suffix_len=max_suffix_len,
-                    init_len=init_len
+                    init_len=init_len,
+                    gcg_top_k=gcg_top_k,
+                    gcg_candidate_size=gcg_steps
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -323,7 +327,9 @@ def evaluate_on_dataset(cfg, model_path):
                     value_coef=ppo_value_coef,
                     entropy_coef=ppo_entropy_coef,
                     max_suffix_len=max_suffix_len,
-                    init_len=init_len
+                    init_len=init_len,
+                    gcg_top_k=gcg_top_k,
+                    gcg_candidate_size=gcg_steps
                 )
             elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -343,7 +349,9 @@ def evaluate_on_dataset(cfg, model_path):
                     value_coef=ppo_value_coef,
                     entropy_coef=ppo_entropy_coef,
                     max_suffix_len=max_suffix_len,
-                    init_len=init_len
+                    init_len=init_len,
+                    gcg_top_k=gcg_top_k,
+                    gcg_candidate_size=gcg_steps
                 )
             else:
                 # fallback: run sequentially
