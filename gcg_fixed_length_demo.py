@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--advbench", action="store_true", help="Load a single AdvBench example as prefix+completion")
     parser.add_argument("--advbench-index", type=int, default=0, help="Index of AdvBench sample to use (default 0)")
     parser.add_argument("--output", type=str, default="results/gcg_sweep_results.json", help="Path to save sweep results")
+    parser.add_argument("--threads", type=int, default=0, help="Number of threads for sweep (0=serial)")
     return parser.parse_args()
 
 
@@ -209,8 +210,11 @@ def main() -> None:
 
     results = []
     if args.sweep:
-        with ThreadPool(mp.cpu_count()) as pool:
-            results = pool.map(run_for_length, list(range(1, args.suffix_len + 1)))
+        if args.threads and args.threads > 1:
+            with ThreadPool(args.threads) as pool:
+                results = pool.map(run_for_length, list(range(1, args.suffix_len + 1)))
+        else:
+            results = [run_for_length(L) for L in range(1, args.suffix_len + 1)]
         best = max(results, key=lambda r: r["final_ll"])
         comp_len = len(completion_ids)
         print(f"Sweep results (1..{args.suffix_len})")
