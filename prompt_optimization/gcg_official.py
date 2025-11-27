@@ -81,19 +81,14 @@ def sample_control(control_toks, grad, batch_size, topk=256, temp=1, not_allowed
         grad[:, not_allowed_tokens.to(grad.device)] = float("inf")
 
     topk = min(topk, grad.shape[1])
-    top_indices = (-grad).topk(topk, dim=1).indices
+    top_indices = (-grad).topk(topk, dim=1).indices  # [L, topk]
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
-    new_token_pos = torch.arange(
-        0,
-        len(control_toks),
-        max(1, len(control_toks) / batch_size),
-        device=grad.device
-    ).type(torch.int64)
-    new_token_val = torch.gather(
-        top_indices[new_token_pos], 1,
-        torch.randint(0, topk, (batch_size, 1), device=grad.device)
-    )
-    new_control_toks = original_control_toks.scatter_(1, new_token_pos.unsqueeze(-1), new_token_val)
+    # Sample positions uniformly; handles batch_size > len(control_toks)
+    pos_choices = torch.randint(0, len(control_toks), (batch_size,), device=grad.device)
+    tok_choices = torch.randint(0, topk, (batch_size,), device=grad.device)
+    new_token_val = top_indices[pos_choices, tok_choices].unsqueeze(-1)  # [B, 1]
+    new_token_pos = pos_choices.unsqueeze(-1)  # [B, 1]
+    new_control_toks = original_control_toks.scatter_(1, new_token_pos, new_token_val)
     return new_control_toks
