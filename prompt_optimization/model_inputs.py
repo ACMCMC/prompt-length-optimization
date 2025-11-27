@@ -330,13 +330,15 @@ class ModelBatchedInput:
     def get_model_input_ids_and_attention_mask(self) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
         Get concatenated input IDs and attention mask for model input (discrete mode only).
+        Also used by continuous_proj mode after projecting suffix embeddings to tokens.
         
         Returns:
             input_ids: Concatenated token IDs [B, seq_len]
             attention_mask: Concatenated attention mask [B, seq_len]
             completion_start_pos: Position where completion starts in sequence
         """
-        assert self.mode == 'discrete', "get_model_input_ids_and_attention_mask only for discrete mode"
+        assert self.mode == 'discrete' or self.original_mode == 'continuous_proj', \
+            "get_model_input_ids_and_attention_mask only for discrete mode or continuous_proj (after projection)"
         
         # Compute max_len for padding prefix and completion to same size
         max_len = max(self.max_prefix_len, self.max_completion_len) if (self.max_prefix_len > 0 or self.max_completion_len > 0) else self.max_suffix_len

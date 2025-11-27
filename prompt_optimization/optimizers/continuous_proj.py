@@ -20,7 +20,8 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
                  batch_size: int, lr_embeddings: float, 
                  projection_weight: float, distance_metric: str,
-                 max_suffix_len: int, init_len: int):
+                 max_suffix_len: int, init_len: int,
+                 max_distance_threshold: Optional[float] = None):
         """
         Args:
             agent: PromptRLAgent instance
@@ -32,12 +33,15 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
             distance_metric: "l2" or "dot" for distance computation
             max_suffix_len: Maximum suffix length from config (fixed size for batched suffix embeddings)
             init_len: Initial number of suffix positions with attention mask = 1 from config
+            max_distance_threshold: Optional threshold for distance penalty. If set, distances above this
+                                   threshold receive quadratic penalty. If None, uses linear penalty for all distances.
         """
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings, max_suffix_len, init_len)
         self.embedding_layer = agent.model.get_input_embeddings()
         self.D = self.emb_dim
         self.projection_weight = float(projection_weight)
         self.distance_metric = str(distance_metric)
+        self.max_distance_threshold = float(max_distance_threshold) if max_distance_threshold is not None else None
         
         # Pre-compute vocabulary embeddings for efficiency
         with torch.no_grad():
@@ -112,7 +116,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         flat_embeds = embeds.reshape(B * L, D)  # [B*L, D]
         
         if self.distance_metric == "l2":
-            # L2 distance: ||e - v||^2
+            # L2 distance: ||e - v|| (Euclidean distance, not squared)
             distances = torch.cdist(flat_embeds, self.vocab_embeds)  # [B*L, vocab_size]
             min_distances = distances.min(dim=-1)[0]  # [B*L]
         else:  # dot product
@@ -128,17 +132,39 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         # Reshape to [B, L] and apply mask if provided
         min_distances = min_distances.reshape(B, L)  # [B, L]
         
+        # Apply threshold-based penalty if specified
+        # Below threshold: linear penalty (distance)
+        # Above threshold: quadratic penalty (distance^2) to heavily penalize large distances
+        if self.max_distance_threshold is not None:
+            # Create penalty: linear below threshold, quadratic above
+            below_threshold = min_distances <= self.max_distance_threshold
+            above_threshold = ~below_threshold
+            
+            # Linear penalty for distances below threshold
+            penalty = min_distances.clone()
+            # Quadratic penalty for distances above threshold: threshold + (distance - threshold)^2
+            # This ensures continuity at the threshold and heavy penalty for exceeding it
+            excess = min_distances - self.max_distance_threshold
+            penalty = torch.where(
+                above_threshold,
+                self.max_distance_threshold + excess ** 2,
+                penalty
+            )
+        else:
+            # No threshold: use linear penalty (original behavior)
+            penalty = min_distances
+        
         if mask is not None:
             # Only compute loss over active positions (where mask == 1)
-            masked_distances = min_distances * mask  # [B, L]
+            masked_penalty = penalty * mask  # [B, L]
             num_active = mask.sum()  # Total number of active positions
             if num_active > 0:
-                loss = masked_distances.sum() / num_active
+                loss = masked_penalty.sum() / num_active
             else:
                 loss = torch.tensor(0.0, device=embeds.device, requires_grad=True)
         else:
             # No mask: compute mean over all positions
-            loss = min_distances.mean()
+            loss = penalty.mean()
         
         return loss, min_distances
     
@@ -208,8 +234,15 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
         proj_loss, min_distances = self._compute_projection_loss(prompt_data, mask=suffix_mask)
         
-        # Store min_distances for logging (detached, mean over batch)
-        self.min_distances = min_distances.detach().mean().item()
+        # Store min_distances for logging (detached, mean over ACTIVE positions only)
+        # Only average over positions where mask == 1
+        with torch.no_grad():
+            masked_distances = min_distances * suffix_mask  # [B, max_suffix_len]
+            num_active = suffix_mask.sum().item()
+            if num_active > 0:
+                self.min_distances = masked_distances.sum().item() / num_active
+            else:
+                self.min_distances = 0.0
         
         # Combined loss: negative likelihood (maximize) + projection loss (minimize)
         loss = -likelihoods.mean() + self.projection_weight * proj_loss

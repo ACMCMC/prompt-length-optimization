@@ -35,9 +35,48 @@ class PromptRLAgent:
         }
         self.vocab_size = len(self.tokenizer)
     
+    def _project_embeddings_to_tokens(self, embeds: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Project embeddings to nearest token IDs.
+        
+        Args:
+            embeds: [B, L, D] tensor of embeddings
+            mask: [B, L] attention mask (1 = active, 0 = inactive)
+            
+        Returns:
+            token_ids: [B, L] tensor of nearest token IDs
+        """
+        B, L, D = embeds.shape
+        embedding_layer = self.model.get_input_embeddings()
+        vocab_embeds = embedding_layer.weight.detach()  # [vocab_size, D]
+        
+        # Flatten for batch processing
+        flat_embeds = embeds.view(B * L, D)  # [B*L, D]
+        
+        # Compute L2 distances to all vocabulary embeddings
+        distances = torch.cdist(flat_embeds, vocab_embeds)  # [B*L, vocab_size]
+        
+        # Find nearest token ID for each embedding
+        token_ids_flat = distances.argmin(dim=-1)  # [B*L]
+        
+        # Reshape back to [B, L]
+        token_ids = token_ids_flat.view(B, L)
+        
+        # Mask inactive positions (set to pad_id)
+        pad_id = getattr(self.tokenizer, 'pad_token_id', 0)
+        token_ids = torch.where(mask.bool(), token_ids, torch.full_like(token_ids, pad_id))
+        
+        return token_ids
+    
     def get_likelihoods_batch(self, model_input, requires_grad: bool = False) -> torch.Tensor:
         """
         Batched likelihood computation using ModelBatchedInput.
+        
+        For continuous_proj mode: 
+        - During optimization (requires_grad=True): uses embeddings directly to preserve gradients
+        - For reward computation (requires_grad=False): projects suffix embeddings to nearest token IDs
+        For continuous mode: uses embeddings directly.
+        For discrete mode: uses token IDs directly.
         
         Args:
             model_input: ModelBatchedInput instance with all inputs
@@ -50,8 +89,29 @@ class PromptRLAgent:
         if max_comp_actual == 0:
             return torch.zeros(B, dtype=torch.float32, device=device, requires_grad=requires_grad)
         
-        # Get concatenated inputs from ModelBatchedInput
-        if model_input.mode == 'continuous':
+        # For continuous_proj mode: 
+        # - During optimization (requires_grad=True): use embeddings directly to preserve gradients
+        # - For reward computation (requires_grad=False): project to tokens for accurate likelihood
+        if model_input.original_mode == 'continuous_proj' and not requires_grad:
+            # Project suffix embeddings to nearest token IDs (for reward computation only)
+            suffix_embeds = model_input.suffix_embeddings  # [B, max_suffix_len, D]
+            suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
+            suffix_token_ids = self._project_embeddings_to_tokens(suffix_embeds, suffix_mask)  # [B, max_suffix_len]
+            
+            # Temporarily store projected suffix tokens in model_input for concatenation
+            # (similar to how discrete mode works)
+            original_suffix_input_ids = model_input.suffix_input_ids
+            model_input.suffix_input_ids = suffix_token_ids
+            
+            # Use the same concatenation logic as discrete mode
+            input_ids, attention_mask, completion_start_pos = model_input.get_model_input_ids_and_attention_mask()
+            
+            # Restore original suffix_input_ids (in case it's used elsewhere)
+            model_input.suffix_input_ids = original_suffix_input_ids
+            
+            # Use token-based forward pass (like discrete mode)
+            inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        elif model_input.mode == 'continuous' or (model_input.original_mode == 'continuous_proj' and requires_grad):
             inputs_embeds, attention_mask, suffix_mask, completion_start_pos = model_input.get_model_input_embeds_and_attention_mask()
             # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
             # Only suffix embeddings have gradients
