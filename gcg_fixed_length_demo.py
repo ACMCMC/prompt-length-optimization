@@ -5,6 +5,7 @@ Optimizes a suffix of fixed length against a target completion, optionally with 
 """
 import argparse
 from typing import List, Tuple
+import multiprocessing as mp
 
 import torch
 
@@ -205,8 +206,8 @@ def main() -> None:
 
     results = []
     if args.sweep:
-        for L in range(1, args.suffix_len + 1):
-            results.append(run_for_length(L))
+        with mp.Pool(mp.cpu_count()) as pool:
+            results = pool.map(run_for_length, list(range(1, args.suffix_len + 1)))
         best = max(results, key=lambda r: r["final_ll"])
         comp_len = len(completion_ids)
         print(f"Sweep results (1..{args.suffix_len})")
