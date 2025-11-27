@@ -313,6 +313,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     for batch_start in range(0, len(prompts), batch_size):
         batch_end = min(batch_start + batch_size, len(prompts))
         batch_prompts = prompts[batch_start:batch_end]
+        batch_bases = [p.get('base', '') for p in batch_prompts]
         batch_summaries = []
         
         print(f"\n[Batch {batch_start//batch_size + 1}/{(len(prompts)-1)//batch_size + 1}] Processing prompts {batch_start+1}-{batch_end}")
@@ -351,6 +352,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
                 gcg_candidate_size=gcg_steps,
+                base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts
@@ -450,6 +452,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
                 gcg_candidate_size=gcg_steps,
+                base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts
@@ -538,6 +541,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             # Use the batched discrete (GCG) optimizer for this whole batch
             print(f"Running batched discrete optimizer on batch size={len(batch_prompts)}")
             targets = [p.get('target', '') for p in batch_prompts]
+            print("targets:", targets)
             wandb_cb = (lambda d, step=None: wandb.log(d, step=step, commit=True)) if wandb_initialized else None
             best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
                 target_completions=targets,
@@ -559,6 +563,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
                 gcg_candidate_size=gcg_steps,
+                base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
                 log_prompt_indices=tracked_prompts

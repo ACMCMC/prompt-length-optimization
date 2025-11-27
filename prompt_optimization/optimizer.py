@@ -111,7 +111,8 @@ class LengthPolicyOptimizer:
                                max_suffix_len: int = 64, init_len: int = 32,
                                wandb_log_fn=None, global_step_offset: int = 0,
                                log_prompt_indices: Optional[List[int]] = None,
-                               gcg_top_k: int = 16, gcg_candidate_size: int = 32) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
+                               gcg_top_k: int = 16, gcg_candidate_size: int = 32,
+                               base_prompts: Optional[List[str]] = None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
         Processes prompts in batches of batch_size (default 64) for parallelization.
@@ -132,10 +133,26 @@ class LengthPolicyOptimizer:
         for batch_start in range(0, B, batch_size):
             batch_end = min(batch_start + batch_size, B)
             batch_completions = target_completions[batch_start:batch_end]
+            batch_bases = base_prompts[batch_start:batch_end] if base_prompts is not None else None
             batch_B = len(batch_completions)
             
             completion_tokens_batch, completion_lengths = self._prepare_completions(batch_completions)
-            
+            # Prepare fixed prefixes (base prompts) if provided
+            pad_id = getattr(self.agent.tokenizer, 'pad_token_id', 0)
+            if batch_bases is not None:
+                base_tokenized = [self.agent.tokenizer.encode(t or "", add_special_tokens=False) for t in batch_bases]
+                max_prefix_len = max((len(t) for t in base_tokenized), default=0)
+                prefix_tokens = torch.full((batch_B, max_prefix_len), pad_id, dtype=torch.long, device=device)
+                prefix_lengths = torch.zeros(batch_B, dtype=torch.long, device=device)
+                for i, toks in enumerate(base_tokenized):
+                    if not toks:
+                        continue
+                    prefix_tokens[i, :len(toks)] = torch.tensor(toks, device=device)
+                    prefix_lengths[i] = len(toks)
+            else:
+                prefix_tokens = torch.empty(batch_B, 0, dtype=torch.long, device=device)
+                prefix_lengths = torch.zeros(batch_B, dtype=torch.long, device=device)
+
             # Create optimizer based on mode
             max_prompt_len = initial_prompt_length * 2  # Allow growth
             if mode == "continuous":
@@ -161,10 +178,14 @@ class LengthPolicyOptimizer:
             
             # Initialize prefix tokens: empty initially, grows as we delete suffix tokens
             # Max prefix size = initial_prompt_length (can grow up to original suffix size)
-            max_prefix_size = initial_prompt_length
-            pad_id = getattr(self.agent.tokenizer, 'pad_token_id', 0)
-            prefix_tokens = torch.full((batch_B, max_prefix_size), pad_id, dtype=torch.long, device=device)
-            prefix_lengths = torch.zeros(batch_B, dtype=torch.long, device=device)
+            max_prefix_size = prefix_tokens.shape[1] if prefix_tokens.numel() > 0 else initial_prompt_length
+            if prefix_tokens.shape[1] < max_prefix_size:
+                # pad to max_prefix_size for uniform shape
+                extra = max_prefix_size - prefix_tokens.shape[1]
+                prefix_tokens = torch.cat(
+                    [prefix_tokens, torch.full((batch_B, extra), pad_id, dtype=torch.long, device=device)],
+                    dim=1
+                )
             
             # Track attention mask offsets (how much to mask at start due to deleted tokens)
             attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)

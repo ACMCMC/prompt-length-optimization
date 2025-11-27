@@ -88,15 +88,23 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             comp_len = completion_lengths[b].item()
             if L == 0 or comp_len == 0:
                 continue
-
             control_tokens = active_tokens[b, :L]
             comp_tokens = completion_tokens[b, :comp_len]
+            # Prefix handling
+            has_prefix = prefix_tokens is not None and prefix_tokens.numel() > 0
+            pref_len = int(prefix_lengths[b].item()) if has_prefix else 0
+            pref_tokens = prefix_tokens[b, :pref_len] if has_prefix else None
 
-            # Build full sequence: control + completion
-            input_ids = torch.cat([control_tokens, comp_tokens], dim=0)
-            control_slice = slice(0, L)
-            target_slice = slice(L, L + comp_len)
-            loss_slice = slice(L - 1, L - 1 + comp_len)
+            # Build full sequence: prefix + control + completion
+            parts = []
+            if pref_len > 0:
+                parts.append(pref_tokens)
+            parts.append(control_tokens)
+            parts.append(comp_tokens)
+            input_ids = torch.cat(parts, dim=0)
+            control_slice = slice(pref_len, pref_len + L)
+            target_slice = slice(pref_len + L, pref_len + L + comp_len)
+            loss_slice = slice(pref_len + L - 1, pref_len + L - 1 + comp_len)
 
             # Compute gradients using official token_gradients
             self.agent.model.zero_grad(set_to_none=True)
@@ -117,14 +125,20 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             cand_embeds = embedding_layer(candidates)  # [K, L, D]
             comp_tokens_batch = comp_tokens.unsqueeze(0).expand(candidates.shape[0], -1)
             comp_lengths_batch = torch.full((candidates.shape[0],), comp_len, device=device, dtype=torch.long)
+            if pref_len > 0:
+                pref_tok_batch = prefix_tokens[b:b+1, :prefix_tokens.shape[1]].expand(candidates.shape[0], -1)
+                pref_len_batch = prefix_lengths[b:b+1].expand(candidates.shape[0])
+            else:
+                pref_tok_batch = None
+                pref_len_batch = None
 
             ll_batch = self.agent.get_likelihoods_batch(
                 cand_embeds,
                 comp_tokens_batch,
                 comp_lengths_batch,
                 requires_grad=False,
-                prefix_tokens=None,
-                prefix_lengths=None
+                prefix_tokens=pref_tok_batch,
+                prefix_lengths=pref_len_batch
             )
 
             if ll_batch.numel() > 0:
@@ -138,7 +152,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     orig_embeds,
                     comp_tokens.unsqueeze(0),
                     torch.tensor([comp_len], device=device),
-                    requires_grad=False
+                    requires_grad=False,
+                    prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
+                    prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
                 )[0]
                 best_ll_batch[b] = orig_ll
 

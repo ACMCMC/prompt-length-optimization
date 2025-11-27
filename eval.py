@@ -307,7 +307,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps
+                    gcg_candidate_size=gcg_steps,
+                    base_prompts=bases
                 )
             elif opt_mode == 'continuous':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -329,7 +330,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps
+                    gcg_candidate_size=gcg_steps,
+                    base_prompts=bases
                 )
             elif opt_mode == 'discrete':
                 best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
@@ -351,7 +353,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps
+                    gcg_candidate_size=gcg_steps,
+                    base_prompts=bases
                 )
             else:
                 # fallback: run sequentially
