@@ -72,7 +72,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 if self.last_grad_norms is not None and self.last_grad_norms.shape[1] >= L:
                     remove_pos = int(self.last_grad_norms[idx, :L].argmin().item())
                 # shift left to delete remove_pos
-                prompt_data[idx, remove_pos:L-1] = prompt_data[idx, remove_pos+1:L]
+                prompt_data[idx, remove_pos:L-1] = prompt_data[idx, remove_pos+1:L].clone()
                 updated_lengths[idx] = L - 1
 
         # ADD
