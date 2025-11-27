@@ -11,6 +11,8 @@ import torch
 from prompt_optimization.agent import PromptRLAgent
 from prompt_optimization.gcg_official import token_gradients, sample_control
 
+PROMPT_KEYS = ["prompt", "instruction", "input", "question"]
+COMPLETION_KEYS = ["target", "completion", "output", "response", "answer"]
 
 DEFAULT_COMPLETION = (
     "Therefore the company expects to deliver revenue growth that outpaces market forecasts and "
@@ -30,6 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", type=str, default="", help="Optional fixed prefix text")
     parser.add_argument("--seed-suffix", type=str, default=None, help="Optional seed suffix text (overrides random init)")
     parser.add_argument("--print-trace", action="store_true", help="Print likelihood trace per pass")
+    parser.add_argument("--advbench", action="store_true", help="Load a single AdvBench example as prefix+completion")
+    parser.add_argument("--advbench-index", type=int, default=0, help="Index of AdvBench sample to use (default 0)")
+    parser.add_argument("--output", type=str, default="results/gcg_sweep_results.json", help="Path to save sweep results")
     return parser.parse_args()
 
 
@@ -120,8 +125,36 @@ def main() -> None:
     except Exception:
         plotting_available = False
 
-    prefix_ids = agent.tokenizer.encode(args.prefix, add_special_tokens=False) if args.prefix else []
-    completion_ids = agent.tokenizer.encode(args.completion, add_special_tokens=False)
+    # Optionally load an AdvBench example
+    adv_prefix_text = None
+    adv_completion_text = None
+    if args.advbench:
+        from datasets import load_dataset
+        raw = load_dataset("walledai/AdvBench", split="train")
+        idx = max(0, min(args.advbench_index, len(raw) - 1))
+        ex = raw[idx]
+        base = ""
+        for k in PROMPT_KEYS:
+            if k in ex and ex[k]:
+                base = ex[k]
+                break
+        target = ""
+        for k in COMPLETION_KEYS:
+            if k in ex and ex[k]:
+                target = ex[k]
+                break
+        adv_prefix_text = base.strip()
+        adv_completion_text = target.strip()
+        print(f"Loaded AdvBench example idx={idx}")
+        print(f"  Base prompt (prefix): {adv_prefix_text[:120]}{'...' if len(adv_prefix_text) > 120 else ''}")
+        print(f"  Target completion   : {adv_completion_text[:120]}{'...' if len(adv_completion_text) > 120 else ''}")
+
+    # Resolve prefix/completion text
+    prefix_text = adv_prefix_text if adv_prefix_text is not None else args.prefix
+    completion_text = adv_completion_text if adv_completion_text is not None else args.completion
+
+    prefix_ids = agent.tokenizer.encode(prefix_text, add_special_tokens=False) if prefix_text else []
+    completion_ids = agent.tokenizer.encode(completion_text, add_special_tokens=False)
     if not completion_ids:
         raise ValueError("Completion must produce at least one token")
 
@@ -178,7 +211,8 @@ def main() -> None:
         comp_len = len(completion_ids)
         print(f"Sweep results (1..{args.suffix_len})")
         for r in results:
-            print(f"  L={r['length']:2d} final_ll={r['final_ll']:.4f} improve={r['improve']:.4f}")
+            decoded_suffix = decode_tokens(agent, r["suffix"])
+            print(f"  L={r['length']:2d} final_ll={r['final_ll']:.4f} improve={r['improve']:.4f} suffix='{decoded_suffix}'")
         print("\nBest result")
         print(f"  Length              : {best['length']}")
         print(f"  Log-likelihood (sum): {best['final_ll']:.4f} (avg/token: {best['final_ll']/comp_len:.4f})")
@@ -206,6 +240,36 @@ def main() -> None:
             plt.tight_layout()
             plt.savefig("gcg_sweep.png", dpi=120)
             print("Saved sweep plot to gcg_sweep.png")
+        # Save results to JSON
+        try:
+            import json, os
+            os.makedirs(os.path.dirname(args.output), exist_ok=True)
+            serializable = []
+            for r in results:
+                serializable.append({
+                    "length": r["length"],
+                    "base_ll": r["base_ll"],
+                    "final_ll": r["final_ll"],
+                    "improve": r["improve"],
+                    "suffix_tokens": r["suffix"],
+                    "suffix_text": decode_tokens(agent, r["suffix"]),
+                })
+            with open(args.output, "w") as f:
+                json.dump({
+                    "prefix": prefix_text,
+                    "completion": completion_text,
+                    "results": serializable,
+                    "best": {
+                        "length": best["length"],
+                        "final_ll": best["final_ll"],
+                        "improve": best["improve"],
+                        "suffix_tokens": best["suffix"],
+                        "suffix_text": decode_tokens(agent, best["suffix"]),
+                    }
+                }, f, indent=2)
+            print(f"Saved sweep data to {args.output}")
+        except Exception as e:
+            print(f"Could not save results to {args.output}: {e}")
     else:
         res = run_for_length(args.suffix_len)
         comp_len = len(completion_ids)
