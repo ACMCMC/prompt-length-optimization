@@ -197,6 +197,10 @@ class LengthPolicyOptimizer:
             batch_policy_metrics = []
         
             for episode in trange(episodes, desc=f"Episodes (batch {batch_start//batch_size + 1})"):
+                # Reset prompts and length state each episode (fresh start)
+                prompt_data, lengths = optimizer.initialize_prompts()
+                attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)
+
                 episode_rewards = []
                 episode_log_probs = []
                 episode_states = []
