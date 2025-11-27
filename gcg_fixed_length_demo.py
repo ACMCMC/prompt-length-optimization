@@ -6,6 +6,8 @@ Optimizes a suffix of fixed length against a target completion, optionally with 
 import argparse
 from typing import List, Tuple
 import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
+import os
 
 import torch
 
@@ -118,6 +120,7 @@ def gcg_fixed(agent: PromptRLAgent, prefix_ids: List[int], suffix_ids: List[int]
 
 
 def main() -> None:
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = parse_args()
     agent = PromptRLAgent(model_name=args.model)
     try:
@@ -206,7 +209,7 @@ def main() -> None:
 
     results = []
     if args.sweep:
-        with mp.Pool(mp.cpu_count()) as pool:
+        with ThreadPool(mp.cpu_count()) as pool:
             results = pool.map(run_for_length, list(range(1, args.suffix_len + 1)))
         best = max(results, key=lambda r: r["final_ll"])
         comp_len = len(completion_ids)
