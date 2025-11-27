@@ -232,11 +232,13 @@ class LengthPolicyOptimizer:
                         torch.full((batch_B,), step_ratio, device=device),  # step ratio
                     ], dim=1)  # [batch_B, state_dim]
                     prev_ll = likelihoods.detach()
-                    
+                    print("states:", states)
                     # Policy forward pass
                     action_logits = self.policy_net(states)  # [batch_B, 3]
                     action_probs = F.softmax(action_logits, dim=-1)
                     actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    print("actions:", actions)
+                    print("action_probs:", action_probs)
                     # Mask "add" when at or above max_prompt_len to prevent runaway growth
                     if hasattr(optimizer, "max_prompt_len"):
                         add_mask = (actions == 2) & (lengths >= optimizer.max_prompt_len)
