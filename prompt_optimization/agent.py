@@ -40,7 +40,7 @@ class PromptRLAgent:
         """
         Batched likelihood computation with prefix + suffix structure.
         
-        Structure: [padding_left] + [prefix] + [suffix] + [completion] + [padding_right]
+        Structure: [prefix] + [suffix] + [completion] + [right_padding]
         
         Args:
             prompt_embeds: Suffix embeddings [B, L_suffix, D]
@@ -69,19 +69,16 @@ class PromptRLAgent:
         max_prefix = prefix_tokens.shape[1] if prefix_tokens.numel() > 0 else 0
         max_comp = completion_tokens.shape[1]
         
-        # Padding sizes: 32 on left, variable on right
-        padding_left = 32
-        padding_right = max(32, max_comp)  # At least 32, or max completion length
-        
-        # Build full sequence structure
-        max_seq = padding_left + max_prefix + L_suffix + max_comp + padding_right
+        # Build full sequence structure with right padding only
+        # Structure: [prefix] + [suffix] + [completion] + [right_padding]
+        max_seq = max_prefix + L_suffix + max_comp
         
         # Initialize with padding
         inputs_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_seq, 1).to(device)
         
-        # Position offsets
-        pos_pad_left = padding_left
-        pos_prefix_end = pos_pad_left + max_prefix
+        # Position offsets (simpler without left padding)
+        pos_prefix_start = 0
+        pos_prefix_end = max_prefix
         pos_suffix_end = pos_prefix_end + L_suffix
         pos_comp_end = pos_suffix_end + max_comp
         
@@ -90,7 +87,7 @@ class PromptRLAgent:
             prefix_embeds = embedding_layer(prefix_tokens)  # [B, max_prefix, D]
             prefix_mask = torch.arange(max_prefix, device=device).unsqueeze(0) < prefix_lengths.unsqueeze(-1)  # [B, max_prefix]
             prefix_mask_expanded = prefix_mask.unsqueeze(-1).expand(-1, -1, D)
-            inputs_embeds[:, pos_pad_left:pos_prefix_end, :] = torch.where(
+            inputs_embeds[:, pos_prefix_start:pos_prefix_end, :] = torch.where(
                 prefix_mask_expanded,
                 prefix_embeds,
                 pad_embed.unsqueeze(0).unsqueeze(0).expand(B, max_prefix, -1)
@@ -114,17 +111,14 @@ class PromptRLAgent:
             attention_mask = torch.zeros(B, max_seq, dtype=torch.long, device=device)
             # Mask: 1 for valid tokens, 0 for padding
             for i in range(B):
-                # Left padding: all 0 (masked)
                 # Prefix: 1 for valid prefix tokens
-                prefix_start = pos_pad_left
-                prefix_end = prefix_start + prefix_lengths[i].item()
-                attention_mask[i, prefix_start:prefix_end] = 1
+                prefix_end = prefix_lengths[i].item()
+                attention_mask[i, :prefix_end] = 1
                 # Suffix: all 1 (all valid)
                 attention_mask[i, pos_prefix_end:pos_suffix_end] = 1
                 # Completion: 1 for valid completion tokens
-                comp_start = pos_suffix_end
-                comp_end = comp_start + completion_lengths[i].item()
-                attention_mask[i, comp_start:comp_end] = 1
+                comp_end = pos_suffix_end + completion_lengths[i].item()
+                attention_mask[i, pos_suffix_end:comp_end] = 1
         
         # Forward pass with attention mask
         context = torch.enable_grad() if requires_grad else torch.no_grad()
