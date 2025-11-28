@@ -518,6 +518,13 @@ class LengthPolicyOptimizer:
                 # Compute final reward: alpha * likelihood - beta * length
                 final_rewards = alpha * final_likelihoods - beta * lengths.float()  # [batch_B]
                 
+                # Debug log: final sequences at episode end
+                final_tokens = optimizer.to_tokens(prompt_data, lengths)  # [batch_B, max_len]
+                for i in range(batch_B):
+                    active_tokens = final_tokens[i, :lengths[i].item()].cpu().tolist()
+                    sequence_text = self.agent.tokenizer.decode(active_tokens, skip_special_tokens=True)
+                    print(f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, len={lengths[i].item()}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'")
+                
                 # Update best prompts based on final reward
                 improve_mask = final_rewards > best_rewards
                 if improve_mask.any():

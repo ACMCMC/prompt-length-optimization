@@ -366,6 +366,10 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             best_indices = losses_reshaped.argmin(dim=1)  # [B]
             
             # Update best tokens with best candidate sequences
+            # Store old tokens and old likelihoods to track changes for logging
+            old_tokens = best_tokens.clone()
+            old_best_lls = best_lls.clone()
+            
             for prompt_idx in range(num_prompts):
                 best_candidate_idx = prompt_idx * search_width + best_indices[prompt_idx].item()
                 best_tokens[prompt_idx] = candidate_sequences[best_candidate_idx]
@@ -377,6 +381,25 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             # Only keep improvements
             improve_mask = current_lls > best_lls
             best_lls = torch.where(improve_mask, current_lls, best_lls)
+            
+            # Debug log: token replacements and likelihood changes (reusing computed values)
+            for prompt_idx in range(num_prompts):
+                if improve_mask[prompt_idx]:
+                    # Find which positions changed (reusing already computed tokens)
+                    changed_positions = (old_tokens[prompt_idx] != best_tokens[prompt_idx]).nonzero(as_tuple=False).squeeze(-1)
+                    if len(changed_positions.shape) == 0:
+                        # Single position changed
+                        changed_positions = changed_positions.unsqueeze(0)
+                    if len(changed_positions) > 0:
+                        for pos_tensor in changed_positions:
+                            pos = pos_tensor.item() if torch.is_tensor(pos_tensor) else pos_tensor
+                            old_token = old_tokens[prompt_idx, pos].item()
+                            new_token = best_tokens[prompt_idx, pos].item()
+                            old_token_str = self.agent.tokenizer.decode([old_token], skip_special_tokens=True)
+                            new_token_str = self.agent.tokenizer.decode([new_token], skip_special_tokens=True)
+                            # Reuse computed likelihoods: change = current_lls - old_best_lls
+                            ll_change = current_lls[prompt_idx].item() - old_best_lls[prompt_idx].item()
+                            print(f"GCG iter {gcg_iter+1} prompt {prompt_idx+1}: pos {pos} '{old_token_str}' -> '{new_token_str}', Δll={ll_change:.4f}")
             
             # Update progress bar
             gcg_iter_bar.set_postfix({'avg_ll': f'{best_lls.mean().item():.4f}'})
