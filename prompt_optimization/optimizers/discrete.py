@@ -52,7 +52,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         
         if add_mask.any():
             add_indices = torch.nonzero(add_mask, as_tuple=False).squeeze(-1)
-            add_positions = lengths[add_indices]
+            add_positions = lengths[add_indices].long()  # Convert to int for indexing
             new_tokens = torch.tensor(
                 [self.agent.get_random_token() for _ in range(len(add_indices))],
                 dtype=torch.long, device=self.device
@@ -190,7 +190,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         all_candidate_sequences = []
         all_update_info = []
         
-        for prompt_idx in range(self.batch_size):
+        # Use actual batch size from prompt_data (may be subset)
+        actual_batch_size = prompt_data.shape[0]
+        for prompt_idx in range(actual_batch_size):
             # Get active positions for this prompt
             active_positions = torch.nonzero(suffix_mask[prompt_idx] == 1, as_tuple=False).squeeze(-1)  # [num_active]
             

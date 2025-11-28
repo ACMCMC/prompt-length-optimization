@@ -52,8 +52,8 @@ train:
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:
     top_k: 32
-    batch_size: 32  # Number of candidates per position
-    max_batch_size: 512  # Maximum batch size for forward passes (to avoid OOM)
+    batch_size: 16  # Number of candidates per position (reduced to avoid OOM)
+    max_batch_size: 64  # Maximum batch size for forward passes (to avoid OOM)
     steps: 3
   
   # GRPO parameters (Group Relative Policy Optimization)

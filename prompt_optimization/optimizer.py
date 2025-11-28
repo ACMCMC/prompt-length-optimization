@@ -193,8 +193,8 @@ class LengthPolicyOptimizer:
         else:
             model_input.update_suffix_tokens(prompt_data)
         
-        # Update lengths from attention mask
-        lengths = model_input.suffix_attention_mask.sum(dim=1)
+        # Update lengths from suffix attention mask (sum of active positions per prompt)
+        lengths = model_input.suffix_attention_mask.sum(dim=1).float()
         
         return prompt_data, lengths
     
@@ -352,7 +352,7 @@ class LengthPolicyOptimizer:
                     # Compute states for policy (inference only, no gradients)
                     # Use last known likelihood (or 0 if not yet computed)
                     states = torch.stack([
-                        lengths.float() / initial_prompt_length,  # normalized length
+                        lengths / initial_prompt_length,  # normalized length
                         last_known_likelihoods,  # last known likelihood (updated when optimize_suffix is called)
                     ], dim=1)  # [batch_B, 2]
                     
@@ -371,6 +371,11 @@ class LengthPolicyOptimizer:
                     policy_actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
                     # Combine: use random actions where explore_mask is True, policy actions otherwise
                     actions = torch.where(explore_mask, random_actions, policy_actions)
+
+                    # # ONLY FOR DEBUGGING: set all actions to 0
+                    # actions = torch.zeros(batch_B, device=device, dtype=torch.long)
+                    # explore_mask = torch.ones(batch_B, device=device, dtype=torch.bool)
+                    # print(f"Step {step+1}: All actions set to 0 (debug mode)")
                     
                     # Compute log_probs: uniform for random actions, policy log_probs for exploitation
                     uniform_log_prob = torch.log(torch.tensor(1.0 / 3.0, device=device))
@@ -388,17 +393,80 @@ class LengthPolicyOptimizer:
                     # Action 0: optimize_suffix - run inner optimization step
                     optimize_mask = (actions == 0)
                     if optimize_mask.any():
-                        # Run optimization for items that selected optimize_suffix
-                        # Note: inner_optimization_step works on entire batch, but we only want to optimize
-                        # items where action==0. For now, we'll optimize all and update likelihoods for all,
-                        # but this could be optimized to only optimize selected items.
-                        prompt_data, step_likelihoods = optimizer.inner_optimization_step(
-                            prompt_data, lengths, step, model_input
+                        # Get indices of prompts to optimize
+                        optimize_indices = torch.nonzero(optimize_mask, as_tuple=False).squeeze(-1).tolist()
+                        print(f"Step {step+1}: Optimizing prompts {[i+1 for i in optimize_indices]} (action=optimize_suffix)")
+                        
+                        # Extract subset for optimization
+                        selected_prompt_data = prompt_data[optimize_indices]  # [num_to_optimize, max_suffix_len]
+                        selected_lengths = lengths[optimize_indices]  # [num_to_optimize]
+                        
+                        # Create subset ModelBatchedInput by indexing into existing tensors
+                        # We'll create a temporary object that references the subset
+                        class SubsetModelInput:
+                            def __init__(self, full_input, indices):
+                                self.original_mode = full_input.original_mode
+                                self.mode = full_input.mode
+                                self.tokenizer = full_input.tokenizer
+                                self.device = full_input.device
+                                self.embedding_layer = full_input.embedding_layer
+                                self.batch_size = len(indices)
+                                self.max_suffix_len = full_input.max_suffix_len
+                                self.max_prefix_len = full_input.max_prefix_len
+                                self.max_completion_len = full_input.max_completion_len
+                                self.pad_id = full_input.pad_id
+                                
+                                # Index into existing tensors
+                                self.prefix_input_ids = full_input.prefix_input_ids[indices]
+                                self.prefix_attention_mask = full_input.prefix_attention_mask[indices]
+                                self.completion_input_ids = full_input.completion_input_ids[indices]
+                                self.completion_attention_mask = full_input.completion_attention_mask[indices]
+                                self.completion_lengths = full_input.completion_lengths[indices]
+                                self.suffix_attention_mask = full_input.suffix_attention_mask[indices]
+                                self.suffix_input_ids = full_input.suffix_input_ids[indices]
+                                
+                                if hasattr(full_input, 'suffix_embeddings') and full_input.suffix_embeddings is not None:
+                                    self.suffix_embeddings = full_input.suffix_embeddings[indices]
+                                
+                                # Store reference to full input for update methods
+                                self._full_input = full_input
+                                self._indices = torch.tensor(indices, device=full_input.device) if not isinstance(indices, torch.Tensor) else indices
+                            
+                            def update_suffix_tokens(self, suffix_tokens):
+                                # Update the full input at the selected indices
+                                # Only update tokens, not attention mask (mask is managed separately by add/remove actions)
+                                # Initialize newly active positions with BOS (matching ModelBatchedInput.update_suffix_tokens behavior)
+                                bos_token_id = self._full_input._get_bos_token_id()
+                                for i, idx in enumerate(self._indices):
+                                    for j in range(self._full_input.max_suffix_len):
+                                        # Only set BOS if: position is active (mask=1) AND token is zero (not yet set)
+                                        if self._full_input.suffix_attention_mask[idx, j] == 1 and suffix_tokens[i, j].item() == 0:
+                                            suffix_tokens[i, j] = bos_token_id
+                                # Update tokens after BOS initialization
+                                self._full_input.suffix_input_ids[self._indices] = suffix_tokens
+                            
+                            def get_model_input_ids_and_attention_mask(self):
+                                # Get from full input and index
+                                base_input_ids, base_attention_mask, completion_start_pos = self._full_input.get_model_input_ids_and_attention_mask()
+                                return base_input_ids[self._indices], base_attention_mask[self._indices], completion_start_pos
+                        
+                        subset_model_input = SubsetModelInput(model_input, optimize_indices)
+                        
+                        # Run optimization on subset
+                        optimized_prompt_data, step_likelihoods = optimizer.inner_optimization_step(
+                            selected_prompt_data, selected_lengths, step, subset_model_input
                         )
+                        
+                        # Merge results back into full batch
+                        prompt_data[optimize_indices] = optimized_prompt_data
+                        
                         # Update last known likelihoods for items that optimized
+                        full_step_likelihoods = last_known_likelihoods.clone()
+                        for i, idx in enumerate(optimize_indices):
+                            full_step_likelihoods[idx] = step_likelihoods[i]
                         last_known_likelihoods = torch.where(
                             optimize_mask,
-                            step_likelihoods,
+                            full_step_likelihoods,
                             last_known_likelihoods
                         )
                     
@@ -407,17 +475,16 @@ class LengthPolicyOptimizer:
                         optimizer, prompt_data, lengths, actions, model_input
                     )
                     
-                    # Update lengths based on suffix attention mask
-                    # Count active suffix positions
-                    active_suffix_counts = model_input.suffix_attention_mask.sum(dim=1)  # [B]
-                    lengths = active_suffix_counts
+                    # Update lengths from suffix attention mask (sum of active positions per prompt)
+                    # This is the actual suffix length: sum of positions where mask == 1
+                    lengths = model_input.suffix_attention_mask.sum(dim=1).float()  # [B]
                     
                     # Compute step-level rewards for logging/debugging (not used for policy updates)
                     # Use last_known_likelihoods for reward computation
-                    step_rewards = alpha * last_known_likelihoods - beta * lengths.float()  # [batch_B]
+                    step_rewards = alpha * last_known_likelihoods - beta * lengths  # [batch_B]
                     
                     # Debug log: likelihoods, lengths, rewards
-                    print(f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, len={lengths.float().mean().item():.1f}, reward={step_rewards.mean().item():.2f}")
+                    print(f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, len={lengths.mean().item():.1f}, reward={step_rewards.mean().item():.2f}")
                     
                     # Update best prompts based on step rewards (for tracking best so far)
                     improve_mask = step_rewards > best_rewards
@@ -426,7 +493,7 @@ class LengthPolicyOptimizer:
                         best_likelihoods = torch.where(improve_mask, last_known_likelihoods, best_likelihoods)
                         # Update best prompts for improved items
                         for i in torch.nonzero(improve_mask, as_tuple=False).squeeze(-1).tolist():
-                            best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
+                            best_prompts[i] = optimizer.clone_prompt(prompt_data, i, int(lengths[i].item()))
                     
                     # Store step data (rewards computed at episode end for policy updates)
                     # Use last_known_likelihoods for tracking (will be replaced with final likelihood at episode end)
@@ -472,7 +539,7 @@ class LengthPolicyOptimizer:
                         # Compute batch averages for logging
                         avg_reward = step_rewards.mean().item()
                         avg_likelihood = last_known_likelihoods.mean().item()
-                        avg_length = lengths.float().mean().item()
+                        avg_length = lengths.mean().item()
                         avg_best_likelihood = best_likelihoods.float().mean().item()
                         
                         # Action distribution: probabilities from policy (before sampling)
@@ -516,14 +583,17 @@ class LengthPolicyOptimizer:
                     )  # [batch_B]
                 
                 # Compute final reward: alpha * likelihood - beta * length
-                final_rewards = alpha * final_likelihoods - beta * lengths.float()  # [batch_B]
+                final_lengths = model_input.suffix_attention_mask.sum(dim=1).float()  # [batch_B]
+                final_rewards = alpha * final_likelihoods - beta * final_lengths  # [batch_B]
                 
                 # Debug log: final sequences at episode end
-                final_tokens = optimizer.to_tokens(prompt_data, lengths)  # [batch_B, max_len]
+                # Use lengths (already computed earlier) for to_tokens, convert final_lengths to int for display
+                final_tokens = optimizer.to_tokens(prompt_data, final_lengths.long())  # [batch_B, max_len]
                 for i in range(batch_B):
-                    active_tokens = final_tokens[i, :lengths[i].item()].cpu().tolist()
+                    len_val = int(final_lengths[i].item())
+                    active_tokens = final_tokens[i, :len_val].cpu().tolist()
                     sequence_text = self.agent.tokenizer.decode(active_tokens, skip_special_tokens=True)
-                    print(f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, len={lengths[i].item()}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'")
+                    print(f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, len={len_val}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'")
                 
                 # Update best prompts based on final reward
                 improve_mask = final_rewards > best_rewards
@@ -532,7 +602,7 @@ class LengthPolicyOptimizer:
                     best_likelihoods = torch.where(improve_mask, final_likelihoods, best_likelihoods)
                     # Update best prompts for improved items
                     for i in torch.nonzero(improve_mask, as_tuple=False).squeeze(-1).tolist():
-                        best_prompts[i] = optimizer.clone_prompt(prompt_data, i, lengths[i].item())
+                        best_prompts[i] = optimizer.clone_prompt(prompt_data, i, int(final_lengths[i].item()))
                 
                 # Assign discounted rewards to all steps in episode
                 # Reward at step t = gamma^(T-1-t) * final_reward
