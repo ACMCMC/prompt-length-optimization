@@ -282,10 +282,14 @@ class LengthPolicyOptimizer:
                 gcg_batch_size = getattr(self, 'gcg_batch_size', None)
                 if gcg_batch_size is None:
                     raise ValueError("gcg_batch_size must be set from YAML config before using discrete mode")
+                gcg_max_batch_size = getattr(self, 'gcg_max_batch_size', None)
+                if gcg_max_batch_size is None:
+                    raise ValueError("gcg_max_batch_size must be set from YAML config before using discrete mode")
                 optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
                     max_suffix_len=max_suffix_len, init_len=init_len,
-                    gcg_steps=gcg_steps, gcg_top_k=gcg_top_k, gcg_batch_size=gcg_batch_size
+                    gcg_steps=gcg_steps, gcg_top_k=gcg_top_k, gcg_batch_size=gcg_batch_size,
+                    gcg_max_batch_size=gcg_max_batch_size
                 )
             
             best_rewards = torch.full((batch_B,), float('-inf'), dtype=torch.float32, device=device)
@@ -411,6 +415,9 @@ class LengthPolicyOptimizer:
                     # Compute step-level rewards for logging/debugging (not used for policy updates)
                     # Use last_known_likelihoods for reward computation
                     step_rewards = alpha * last_known_likelihoods - beta * lengths.float()  # [batch_B]
+                    
+                    # Debug log: likelihoods, lengths, rewards
+                    print(f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, len={lengths.float().mean().item():.1f}, reward={step_rewards.mean().item():.2f}")
                     
                     # Update best prompts based on step rewards (for tracking best so far)
                     improve_mask = step_rewards > best_rewards

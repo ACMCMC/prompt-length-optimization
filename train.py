@@ -11,6 +11,7 @@ import time
 import csv
 import logging
 from datetime import datetime
+from tqdm import tqdm
 from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
 from prompt_optimization.datasets import ToxicChatDatasetManager
 import numpy as np
@@ -57,6 +58,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     gcg_cfg = train_cfg['gcg']
     gcg_top_k = gcg_cfg['top_k']
     gcg_batch_size = gcg_cfg['batch_size']
+    gcg_max_batch_size = gcg_cfg['max_batch_size']
     gcg_steps = gcg_cfg['steps']
     save_path = train_cfg['save_path']
     grpo_cfg = train_cfg.get('grpo') or train_cfg.get('ppo')  # Support both 'grpo' and legacy 'ppo' keys
@@ -287,6 +289,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     optimizer.gcg_steps = gcg_steps
     optimizer.gcg_top_k = gcg_top_k
     optimizer.gcg_batch_size = gcg_batch_size
+    optimizer.gcg_max_batch_size = gcg_max_batch_size
     
     # Prepare metrics output
     metrics_dir = "results"
@@ -587,13 +590,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     # Episode 0: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
     # Episode 1: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
     # etc.
-    for episode_idx in range(episodes_per_prompt):
+    for episode_idx in tqdm(range(episodes_per_prompt), desc="Episodes"):
         print(f"\n{'='*60}")
         print(f"EPISODE {episode_idx + 1}/{episodes_per_prompt}")
         print(f"{'='*60}")
         
         # Process all batches for this episode
-        for batch_start in range(0, len(prompts), batch_size):
+        for batch_start in tqdm(range(0, len(prompts), batch_size), desc=f"Batches (ep {episode_idx+1})", leave=False):
             batch_end = min(batch_start + batch_size, len(prompts))
             batch_prompts = prompts[batch_start:batch_end]
             batch_idx = batch_start // batch_size

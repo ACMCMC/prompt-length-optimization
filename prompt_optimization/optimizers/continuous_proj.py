@@ -246,7 +246,7 @@ class ContinuousPromptOptimizerWithProjection(BasePromptOptimizer):
         
         # Combined loss: negative likelihood (maximize) + projection loss (minimize)
         loss = -likelihoods.mean() + self.projection_weight * proj_loss
-            
+        
         # Gradient descent step
         self.prompt_optimizer.zero_grad()
         loss.backward()
