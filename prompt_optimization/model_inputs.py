@@ -401,4 +401,4 @@ class ModelBatchedInput:
         """
         Get completion start position in the fully batched input.
         """
-        return self.suffix_input_ids.size(-1)
+        return self.get_suffix_start_pos() + self.suffix_input_ids.size(-1)
