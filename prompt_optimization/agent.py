@@ -94,14 +94,7 @@ class PromptRLAgent:
             model_input: ModelBatchedInput instance with all inputs
             requires_grad: Whether to enable gradients
         """
-        B = model_input.batch_size
         device = self.device
-        max_comp_actual = model_input.completion_lengths.max().item()
-
-        if max_comp_actual == 0:
-            return torch.zeros(
-                B, dtype=torch.float32, device=device, requires_grad=requires_grad
-            )
 
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
@@ -163,14 +156,9 @@ class PromptRLAgent:
             else:
                 raise ValueError(f"Invalid mode: {model_input.mode}")
 
-        # Extract logits for completion positions (before each completion token)
-        # Completion starts at completion_start_pos, so we extract from completion_start_pos-1 to completion_start_pos-1+max_comp_actual
-        comp_logits = logits[
-            :, completion_start_pos - 1 : completion_start_pos - 1 + max_comp_actual, :
-        ]  # [B, max_comp_actual, vocab]
-
-        # Extract completion tokens (only actual tokens, not padded)
-        comp_tokens = model_input.completion_input_ids[:, :max_comp_actual]
+        # Extract logits and completion tokens and shift appropriately. We just take the last model_input.completion_token_ids for the logits and completion tokens. For example, if the completions are 12 tokens long, we take the logits and completion tokens for the last 12 tokens.
+        comp_logits = logits[:, completion_start_pos - 1 : -1, :]  # [B, number of completion tokens, vocab]
+        comp_tokens = model_input.completion_input_ids  # [B, number of completion tokens]
 
         # Compute log probabilities
         log_probs = F.log_softmax(comp_logits, dim=-1)
@@ -178,20 +166,13 @@ class PromptRLAgent:
         # Gather token log probs
         token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(
             -1
-        )  # [B, max_comp_actual]
+        )  # [B, number of completion tokens]
 
-        # Mask invalid positions
-        comp_mask = torch.arange(max_comp_actual, device=device).unsqueeze(
-            0
-        ) < model_input.completion_lengths.unsqueeze(-1)
-        masked_log_probs = torch.where(
-            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
-        )
+        # Mask invalid positions by taking the attention mask of the completion tokens and masking the invalid positions.
+        comp_mask = model_input.completion_attention_mask.bool()
+        token_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
 
-        # Sum over completion length
-        likelihoods = masked_log_probs.sum(dim=-1)  # [B]
-
-        return likelihoods
+        return token_log_probs.sum(dim=-1)  # [B]
 
     def get_random_token(self) -> int:
         """

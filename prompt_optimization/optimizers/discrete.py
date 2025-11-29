@@ -77,7 +77,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         return self.agent.get_likelihoods_batch(
             model_input, requires_grad=requires_grad
         )
-
+    
     def apply_length_action(
         self, prompt_data: torch.Tensor, lengths: torch.Tensor, actions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -98,7 +98,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             prompt_data[add_indices, add_positions] = new_tokens
 
         return prompt_data, updated_lengths
-
+    
     def _compute_gradients(
         self,
         prompt_data: torch.Tensor,
@@ -138,96 +138,28 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         # Get concatenated embeddings and attention mask
         # We'll manually construct this to match get_model_input_embeds_and_attention_mask logic
-        max_len = (
-            max(model_input.max_prefix_len, model_input.max_completion_len)
-            if (model_input.max_prefix_len > 0 or model_input.max_completion_len > 0)
-            else model_input.max_suffix_len
-        )
+        max_len = model_input.max_suffix_len
 
-        # Pad prefix embeddings (left padding)
-        if model_input.max_prefix_len > 0:
-            prefix_embeds = self.embedding_layer(
-                model_input.prefix_input_ids
-            )  # [B, max_prefix_len, D]
-            prefix_embeds_padded = torch.zeros(
-                model_input.batch_size, max_len, self.emb_dim, device=self.device
-            )
-            prefix_embeds_padded[:, max_len - model_input.max_prefix_len :] = (
-                prefix_embeds
-            )
-            prefix_mask_padded = torch.zeros(
-                model_input.batch_size, max_len, dtype=torch.long, device=self.device
-            )
-            prefix_mask_padded[:, max_len - model_input.max_prefix_len :] = (
-                model_input.prefix_attention_mask
-            )
-        else:
-            prefix_embeds_padded = torch.zeros(
-                model_input.batch_size, max_len, self.emb_dim, device=self.device
-            )
-            prefix_mask_padded = torch.zeros(
-                model_input.batch_size, max_len, dtype=torch.long, device=self.device
-            )
-
-        # Pad completion embeddings (right padding)
-        if model_input.max_completion_len > 0:
-            completion_embeds = self.embedding_layer(
-                model_input.completion_input_ids
-            )  # [B, max_completion_len, D]
-            completion_embeds_padded = torch.zeros(
-                model_input.batch_size, max_len, self.emb_dim, device=self.device
-            )
-            completion_embeds_padded[:, : model_input.max_completion_len] = (
-                completion_embeds
-            )
-            completion_mask_padded = torch.zeros(
-                model_input.batch_size, max_len, dtype=torch.long, device=self.device
-            )
-            completion_mask_padded[:, : model_input.max_completion_len] = (
-                model_input.completion_attention_mask
-            )
-        else:
-            completion_embeds_padded = torch.zeros(
-                model_input.batch_size, max_len, self.emb_dim, device=self.device
-            )
-            completion_mask_padded = torch.zeros(
-                model_input.batch_size, max_len, dtype=torch.long, device=self.device
-            )
-
-        # Concatenate: prefix (padded) + suffix + completion (padded)
-        inputs_embeds = torch.cat(
-            [prefix_embeds_padded, suffix_embeds, completion_embeds_padded], dim=1
-        )  # [B, seq_len, D]
-        attention_mask = torch.cat(
-            [prefix_mask_padded, suffix_mask, completion_mask_padded], dim=1
-        )  # [B, seq_len]
-
-        completion_start_pos = max_len + model_input.max_suffix_len
+        suffix_input_ids = prompt_data
+        suffix_attention_mask = suffix_mask
 
         # Forward pass with gradients
         outputs = self.agent.model.gpt_neox(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+            input_ids=suffix_input_ids, attention_mask=suffix_attention_mask
         )
         hidden_states = outputs.last_hidden_state  # [B, seq_len, hidden]
         logits = self.agent.model.embed_out(hidden_states)  # [B, seq_len, vocab]
 
         # Compute loss (negative log likelihood of completion)
-        max_comp_len = model_input.completion_lengths.max().item()
-        comp_logits = logits[
-            :, completion_start_pos - 1 : completion_start_pos - 1 + max_comp_len, :
-        ]  # [B, max_comp_len, vocab]
-        comp_tokens = model_input.completion_input_ids[
-            :, :max_comp_len
-        ]  # [B, max_comp_len]
+        comp_logits = logits[:, -model_input.completion_input_ids.size(1) :, :]  # [B, number of completion tokens, vocab]
+        comp_tokens = model_input.completion_input_ids  # [B, number of completion tokens]
 
         log_probs = F.log_softmax(comp_logits, dim=-1)
         token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(
             -1
         )  # [B, max_comp_len]
 
-        comp_mask = torch.arange(max_comp_len, device=self.device).unsqueeze(
-            0
-        ) < model_input.completion_lengths.unsqueeze(-1)
+        comp_mask = model_input.completion_attention_mask.bool()
         masked_log_probs = torch.where(
             comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
         )
@@ -244,7 +176,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             suffix_embeds.grad = None
         del (
             loss,
-            inputs_embeds,
+            suffix_embeds,
+            suffix_input_ids,
             outputs,
             hidden_states,
             logits,
@@ -253,6 +186,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             log_probs,
             token_log_probs,
             masked_log_probs,
+            gradients,
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -679,7 +613,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         tokens = torch.where(length_mask, tokens, torch.zeros_like(tokens))
 
         return tokens
-
+    
     def clone_prompt(
         self, prompt_data: torch.Tensor, idx: int, length: int
     ) -> torch.Tensor:

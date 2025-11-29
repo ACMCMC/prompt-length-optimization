@@ -627,8 +627,6 @@ class LengthPolicyOptimizer:
                                 self.embedding_layer = full_input.embedding_layer
                                 self.batch_size = len(indices)
                                 self.max_suffix_len = full_input.max_suffix_len
-                                self.max_prefix_len = full_input.max_prefix_len
-                                self.max_completion_len = full_input.max_completion_len
                                 self.pad_id = full_input.pad_id
 
                                 # Index into existing tensors
@@ -644,9 +642,6 @@ class LengthPolicyOptimizer:
                                 self.completion_attention_mask = (
                                     full_input.completion_attention_mask[indices]
                                 )
-                                self.completion_lengths = full_input.completion_lengths[
-                                    indices
-                                ]
                                 self.suffix_attention_mask = (
                                     full_input.suffix_attention_mask[indices]
                                 )

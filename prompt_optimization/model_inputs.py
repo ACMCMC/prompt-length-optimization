@@ -86,8 +86,6 @@ class ModelBatchedInput:
 
         self.prefix_input_ids = tokenized["input_ids"].to(self.device)
         self.prefix_attention_mask = tokenized["attention_mask"].to(self.device)
-        self.prefix_lengths = self.prefix_attention_mask.sum(dim=1)
-        self.max_prefix_len = self.prefix_input_ids.shape[1]
 
     def _tokenize_completion(self, completion_texts: List[str]):
         """Tokenize completion texts and create attention masks using tokenizer batching."""
@@ -103,8 +101,6 @@ class ModelBatchedInput:
 
         self.completion_input_ids = tokenized["input_ids"].to(self.device)
         self.completion_attention_mask = tokenized["attention_mask"].to(self.device)
-        self.completion_lengths = self.completion_attention_mask.sum(dim=1)
-        self.max_completion_len = self.completion_input_ids.shape[1]
 
     def _initialize_suffix(self):
         """Initialize suffix with BOS tokens and attention mask."""
@@ -187,30 +183,14 @@ class ModelBatchedInput:
         ], "Embeddings only computed for continuous modes"
 
         # Compute prefix embeddings
-        if self.max_prefix_len > 0:
-            self.prefix_embeddings = self.embedding_layer(
-                self.prefix_input_ids
-            )  # [B, max_prefix_len, D]
-        else:
-            self.prefix_embeddings = torch.empty(
-                self.batch_size,
-                0,
-                self.embedding_layer.weight.shape[1],
-                device=self.device,
-            )
+        self.prefix_embeddings = self.embedding_layer(
+            self.prefix_input_ids
+        )  # [B, max_prefix_len, D]
 
         # Compute completion embeddings
-        if self.max_completion_len > 0:
-            self.completion_embeddings = self.embedding_layer(
-                self.completion_input_ids
-            )  # [B, max_completion_len, D]
-        else:
-            self.completion_embeddings = torch.empty(
-                self.batch_size,
-                0,
-                self.embedding_layer.weight.shape[1],
-                device=self.device,
-            )
+        self.completion_embeddings = self.embedding_layer(
+            self.completion_input_ids
+        )  # [B, max_completion_len, D]
 
         # Compute suffix embeddings from suffix_input_ids
         self.suffix_embeddings = self.embedding_layer(
