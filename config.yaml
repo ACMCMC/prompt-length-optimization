@@ -16,17 +16,17 @@ train:
   
   # Training parameters per prompt
   episodes_per_prompt: 3             # Episodes to train on each prompt
-  steps_per_episode: 25            # Steps per episode (increased for better RL learning)
+  steps_per_episode: 50            # Steps per episode (increased for better RL learning)
   init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
   max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
-  epsilon: 0.5                    # Epsilon for epsilon-greedy exploration (higher = more random exploration)
-  epsilon_decay: 0.95            # Epsilon decay per episode (higher = slower decay, more exploration)
+  epsilon: 0.1                    # Epsilon for epsilon-greedy exploration (lower = less random exploration)
+  epsilon_decay: 0.97            # Epsilon decay per episode (slightly slower decay, but from a lower starting epsilon)
   epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
-  entropy_coef: 0.05              # Entropy bonus coefficient (encourages diverse action distributions)
+  entropy_coef: 0.02              # Entropy bonus coefficient (encourages diverse action distributions; mostly unused if grpo.entropy_coef is set)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
   alpha: 0.5                         # Likelihood weight
   beta: 0.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
@@ -63,7 +63,7 @@ train:
     gamma: 0.99                     # Discount factor
     gae_lambda: 0.95                # GAE lambda parameter
     value_coef: 0.5                 # Value loss coefficient
-    entropy_coef: 0.01              # Entropy bonus coefficient (overrides train.entropy_coef if set)
+    entropy_coef: 0.003             # Entropy bonus coefficient (smaller = less pull toward uniform policy)
     max_grad_norm: 0.5              # Maximum gradient norm for clipping
   
   # Policy network architecture

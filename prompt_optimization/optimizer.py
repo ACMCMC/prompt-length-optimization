@@ -33,31 +33,48 @@ class LengthPolicyOptimizer:
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
         # Simple policy network: state -> action probs
+        # Uses LayerNorm to handle raw log-likelihood values (can be large negative numbers)
         self.state_dim = 2  # [length, likelihood]
         self.policy_net = nn.Sequential(
             nn.Linear(self.state_dim, policy_hidden_size),
+            nn.LayerNorm(policy_hidden_size),  # Normalize activations to handle large input ranges
             nn.ReLU(),
             nn.Linear(policy_hidden_size, 3)  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
         ).to(agent.device)
         
+        # Initialize policy network with small weights for first layer
+        with torch.no_grad():
+            first_layer = self.policy_net[0]
+            if isinstance(first_layer, nn.Linear):
+                # Use smaller initialization for first layer to handle raw log-likelihoods
+                nn.init.xavier_uniform_(first_layer.weight, gain=0.1)  # Smaller gain for stability
+                first_layer.bias.zero_()
+        
         # Value network for GRPO (estimates state values)
-        # Initialize output layer to predict values around typical return scale
-        # This helps the network start in the right range
+        # Uses LayerNorm to handle raw log-likelihood values (can be large negative numbers)
+        # This stabilizes activations without normalizing inputs
         self.value_net = nn.Sequential(
             nn.Linear(self.state_dim, policy_hidden_size),
+            nn.LayerNorm(policy_hidden_size),  # Normalize activations to handle large input ranges
             nn.ReLU(),
             nn.Linear(policy_hidden_size, 1)  # Single value output
         ).to(agent.device)
         
-        # Initialize value network with standard initialization (no bias preset)
-        # Let the network learn the value scale naturally
+        # Initialize value network with small weights for first layer to handle large inputs
+        # This prevents activations from saturating with large negative likelihoods
         with torch.no_grad():
+            # Initialize first layer with smaller weights to handle large input ranges
+            first_layer = self.value_net[0]
+            if isinstance(first_layer, nn.Linear):
+                # Use smaller initialization for first layer to handle raw log-likelihoods
+                nn.init.xavier_uniform_(first_layer.weight, gain=0.1)  # Smaller gain for stability
+                first_layer.bias.zero_()
+            
             # Initialize last layer with standard initialization
-            if len(self.value_net) > 0:
-                last_layer = self.value_net[-1]
-                if isinstance(last_layer, nn.Linear):
-                    # Use standard initialization (bias starts at 0, weights from xavier)
-                    nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
+            last_layer = self.value_net[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
+                last_layer.bias.zero_()
         
         self.max_grad_norm = max_grad_norm
         
@@ -121,7 +138,8 @@ class LengthPolicyOptimizer:
         return returns, advantages
     
     def _compute_grpo_advantages(self, rewards: torch.Tensor, values: torch.Tensor, 
-                                   device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+                                   device: torch.device,
+                                   prompt_indices: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Generalized Advantage Estimation (GAE) with global normalization (GRPO).
         Advantages are normalized across all trajectories in the batch, making the policy
@@ -134,16 +152,33 @@ class LengthPolicyOptimizer:
             
         Returns:
             returns: [T, batch_B] tensor of returns (value targets)
-            advantages: [T, batch_B] tensor of advantages (globally normalized)
+            advantages: [T, batch_B] tensor of advantages
         """
         # Compute GAE for all trajectories
         returns, advantages = self._compute_gae(rewards, values, device)
         
-        # Global normalization: normalize advantages across entire batch
-        # This ensures best trajectories get highest advantages regardless of absolute reward scale
-        advantages_mean = advantages.mean()
-        advantages_std = advantages.std() + 1e-8
-        advantages = (advantages - advantages_mean) / advantages_std
+        # Advantage normalization:
+        # - If prompt_indices is provided, normalize *within each prompt's rollouts* (per-prompt GRPO).
+        # - Otherwise, fall back to global normalization across the whole batch.
+        if prompt_indices is not None:
+            # prompt_indices: [batch_B], mapping each rollout to its original prompt id
+            advantages_norm = advantages.clone()
+            unique_prompts = torch.unique(prompt_indices)
+            for prompt_id in unique_prompts:
+                mask = (prompt_indices == prompt_id)  # [batch_B]
+                if not mask.any():
+                    continue
+                # Slice advantages for this prompt: [T, num_rollouts_for_prompt]
+                adv_subset = advantages[:, mask]
+                adv_mean = adv_subset.mean()
+                adv_std = adv_subset.std() + 1e-8
+                advantages_norm[:, mask] = (adv_subset - adv_mean) / adv_std
+            advantages = advantages_norm
+        else:
+            # Global normalization (legacy behavior)
+            advantages_mean = advantages.mean()
+            advantages_std = advantages.std() + 1e-8
+            advantages = (advantages - advantages_mean) / advantages_std
         
         return returns, advantages
     
@@ -340,8 +375,13 @@ class LengthPolicyOptimizer:
                 self.policy_net.eval()
                 self.value_net.eval()
                 
-                # Track last known likelihood for state representation (initialize to 0)
-                last_known_likelihoods = torch.zeros(batch_B, dtype=torch.float32, device=device)
+                # Track last known likelihood for state representation
+                # Use the *real* initial likelihoods instead of a placeholder 0
+                with torch.no_grad():
+                    initial_likelihoods = optimizer.get_likelihoods(
+                        prompt_data, lengths, model_input, requires_grad=False
+                    )
+                last_known_likelihoods = initial_likelihoods.clone()
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
@@ -360,6 +400,12 @@ class LengthPolicyOptimizer:
                     # Policy network is in eval mode and we're only collecting data
                     with torch.no_grad():
                         action_logits = self.policy_net(states)  # [batch_B, 3]
+                        
+                        # Check for extreme values (safeguard against activation issues with raw log-likelihoods)
+                        if torch.any(torch.isnan(action_logits)) or torch.any(torch.isinf(action_logits)):
+                            logger.warning(f"Policy network produced NaN/Inf values. States range: [{states.min().item():.2f}, {states.max().item():.2f}]")
+                            action_logits = torch.where(torch.isfinite(action_logits), action_logits, torch.zeros_like(action_logits))
+                    
                     # Compute action probabilities (detached, no gradients)
                     action_probs = F.softmax(action_logits / self.temperature, dim=-1).detach()
                     
@@ -452,6 +498,14 @@ class LengthPolicyOptimizer:
                         
                         subset_model_input = SubsetModelInput(model_input, optimize_indices)
                         
+                        # Compute true pre-optimization likelihoods for this RL step
+                        # This ensures our monotonicity check compares against the *current* suffix state,
+                        # not the last_known_likelihoods buffer (which can be 0 at step 1).
+                        subset_model_input.update_suffix_tokens(selected_prompt_data)
+                        prev_step_likelihoods = optimizer.get_likelihoods(
+                            selected_prompt_data, selected_lengths, subset_model_input, requires_grad=False
+                        )
+                        
                         # Run optimization on subset
                         optimized_prompt_data, step_likelihoods = optimizer.inner_optimization_step(
                             selected_prompt_data, selected_lengths, step, subset_model_input
@@ -469,6 +523,13 @@ class LengthPolicyOptimizer:
                             full_step_likelihoods,
                             last_known_likelihoods
                         )
+                        
+                        # Monotonicity warning: compare this step's likelihoods vs previous step's
+                        ll_deltas_step = step_likelihoods - prev_step_likelihoods
+                        if (ll_deltas_step < -1e-6).any():
+                            num_decreased = (ll_deltas_step < 0).sum().item()
+                            min_delta = ll_deltas_step.min().item()
+                            print(f"Warning: optimize_suffix step {step+1} decreased likelihood for {num_decreased} prompts (min Δll={min_delta:.4f}).")
                     
                     # Actions 1 and 2: decrease and increase - apply length changes
                     prompt_data, lengths = self._apply_length_action_with_prefix(
@@ -545,6 +606,11 @@ class LengthPolicyOptimizer:
                         # Action distribution: probabilities from policy (before sampling)
                         policy_action_probs = action_probs.mean(dim=0)  # Average policy probabilities across batch
                         
+                        # Logits statistics: mean and std per action (before softmax)
+                        # These help diagnose if the policy is staying near-uniform (all logits ~0)
+                        logit_means = action_logits.mean(dim=0)  # [3]
+                        logit_stds = action_logits.std(dim=0)    # [3]
+                        
                         # Actual action ratios (what was actually chosen after sampling)
                         action_counts = torch.bincount(actions, minlength=3)
                         action_ratio_optimize = action_counts[0].float() / batch_B
@@ -559,6 +625,12 @@ class LengthPolicyOptimizer:
                             'step/action_prob_optimize': policy_action_probs[0].item(),
                             'step/action_prob_decrease': policy_action_probs[1].item(),
                             'step/action_prob_increase': policy_action_probs[2].item(),
+                            'step/logit_mean_optimize': logit_means[0].item(),
+                            'step/logit_mean_decrease': logit_means[1].item(),
+                            'step/logit_mean_increase': logit_means[2].item(),
+                            'step/logit_std_optimize': logit_stds[0].item(),
+                            'step/logit_std_decrease': logit_stds[1].item(),
+                            'step/logit_std_increase': logit_stds[2].item(),
                             'step/action_ratio_optimize': action_ratio_optimize.item(),
                             'step/action_ratio_decrease': action_ratio_decrease.item(),
                             'step/action_ratio_increase': action_ratio_increase.item(),
@@ -641,10 +713,10 @@ class LengthPolicyOptimizer:
                 with torch.no_grad():
                     old_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
                 
-                # Compute returns and advantages using GAE with global normalization (GRPO)
-                # Advantages are normalized across all trajectories, making policy learn from relative performance
+                # Compute returns and advantages using GAE with per-prompt normalization (GRPO)
+                # Each prompt's rollouts are normalized independently; prompts are not compared to each other.
                 returns, advantages = self._compute_grpo_advantages(
-                    rewards_tensor, old_values, device
+                    rewards_tensor, old_values, device, batch_prompt_indices_for_episode
                 )
                 
                 # Normalize returns for stable value learning (store stats for denormalization)
@@ -663,6 +735,12 @@ class LengthPolicyOptimizer:
                 for epoch in range(self.grpo_epochs):
                     # Recompute log probs and values with current policy
                     action_logits = self.policy_net(states_tensor)  # [T, batch_B, 3]
+                    
+                    # Check for extreme values (safeguard against activation issues with raw log-likelihoods)
+                    if torch.any(torch.isnan(action_logits)) or torch.any(torch.isinf(action_logits)):
+                        logger.warning(f"Policy network produced NaN/Inf values during training. States range: [{states_tensor.min().item():.2f}, {states_tensor.max().item():.2f}]")
+                        action_logits = torch.where(torch.isfinite(action_logits), action_logits, torch.zeros_like(action_logits))
+                    
                     new_action_probs = F.softmax(action_logits / self.temperature, dim=-1)
                     new_log_probs = F.log_softmax(action_logits / self.temperature, dim=-1)
                     
@@ -679,6 +757,13 @@ class LengthPolicyOptimizer:
                     
                     # Value loss (use normalized returns for stable learning)
                     new_values = self.value_net(states_tensor).squeeze(-1)  # [T, batch_B]
+                    
+                    # Check for extreme values (safeguard against activation issues)
+                    if torch.any(torch.isnan(new_values)) or torch.any(torch.isinf(new_values)):
+                        logger.warning(f"Value network produced NaN/Inf values. States range: [{states_tensor.min().item():.2f}, {states_tensor.max().item():.2f}]")
+                        # Replace with zeros to prevent training crash
+                        new_values = torch.where(torch.isfinite(new_values), new_values, torch.zeros_like(new_values))
+                    
                     # Normalize new values to match normalized returns
                     new_values_normalized = (new_values - returns_mean) / returns_std
                     # Compute loss on normalized scale (much smaller, more stable)

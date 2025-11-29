@@ -340,6 +340,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         # Track best likelihoods and tokens
         model_input.update_suffix_tokens(prompt_data)
         best_lls = self.agent.get_likelihoods_batch(model_input, requires_grad=False)
+        initial_lls = best_lls.clone()  # For monotonicity check at the end
         best_tokens = prompt_data.clone()
         
         # GCG iterations
@@ -410,6 +411,14 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         prompt_data = best_tokens.clone()
         model_input.update_suffix_tokens(prompt_data)
         final_likelihoods = self.agent.get_likelihoods_batch(model_input, requires_grad=False)
+        
+        # Monotonicity check: warn if final likelihoods are worse than initial
+        # This should not typically happen if GCG is behaving as a greedy ascent step.
+        ll_deltas = final_likelihoods - initial_lls
+        if (ll_deltas < -1e-6).any():
+            num_decreased = (ll_deltas < 0).sum().item()
+            min_delta = ll_deltas.min().item()
+            print(f"Warning: GCG decreased likelihood for {num_decreased} prompts in this step (min Δll={min_delta:.4f}).")
         
         return prompt_data, final_likelihoods
     
