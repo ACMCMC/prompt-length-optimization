@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+Run a detached GCG sweep over suffix lengths and visualize per-token log-likelihood gains.
+
+The script samples prompts/completions, runs GCG for each suffix length, records the
+starting/ending per-token log-likelihood, and saves a plot plus optional CSV.
+"""
+
+import argparse
+import os
+import random
+from typing import List, Dict, Tuple
+
+import matplotlib.pyplot as plt
+import torch
+import yaml
+
+from prompt_optimization.agent import PromptRLAgent
+from prompt_optimization.model_inputs import ModelBatchedInput
+from prompt_optimization.optimizers.discrete import DiscretePromptOptimizer
+
+
+PROMPT_FIELDS = ["prompt", "instruction", "input", "question"]
+COMPLETION_FIELDS = ["target", "completion", "output", "response", "answer"]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Sweep suffix lengths with GCG and plot per-token log-likelihood."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.yaml",
+        help="Path to training config for defaults.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="advbench",
+        choices=["advbench"],
+        help="Dataset to sample from (AdvBench only for now).",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=64,
+        help="Number of prompt/completion pairs to sample.",
+    )
+    parser.add_argument(
+        "--min-suffix-len",
+        type=int,
+        default=1,
+        help="Minimum suffix length to evaluate.",
+    )
+    parser.add_argument(
+        "--max-suffix-len",
+        type=int,
+        default=32,
+        help="Maximum suffix length to evaluate.",
+    )
+    parser.add_argument(
+        "--gcg-steps",
+        type=int,
+        default=100,
+        help="Number of GCG steps to run per suffix length.",
+    )
+    parser.add_argument(
+        "--gcg-top-k",
+        type=int,
+        default=None,
+        help="Override for GCG top-k (defaults to config value).",
+    )
+    parser.add_argument(
+        "--gcg-batch-size",
+        type=int,
+        default=None,
+        help="Override for GCG batch size (defaults to config value).",
+    )
+    parser.add_argument(
+        "--gcg-max-batch-size",
+        type=int,
+        default=None,
+        help="Override for GCG max batch size (defaults to config value).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Optional model override (defaults to config).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (defaults to config).",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="results/gcg_length_sweep.pdf",
+        help="Path to save the plot (format inferred from extension).",
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        default="results/gcg_length_sweep.csv",
+        help="Optional CSV output path.",
+    )
+    parser.add_argument(
+        "--show-gcg-progress",
+        action="store_true",
+        help="If set, keep tqdm progress bars from the underlying optimizer.",
+    )
+    return parser.parse_args()
+
+
+def load_advbench_pairs(
+    num_samples: int, seed: int, min_len: int, max_len: int
+) -> List[Dict[str, str]]:
+    """Load AdvBench and return prompt/completion dicts."""
+    from datasets import load_dataset
+
+    raw = load_dataset("walledai/AdvBench", split="train")
+    pairs: List[Dict[str, str]] = []
+
+    for example in raw:
+        base = None
+        for key in PROMPT_FIELDS:
+            val = example.get(key)
+            if val:
+                base = val.strip()
+                break
+        if base is None:
+            continue
+        if len(base) < min_len or len(base) > max_len:
+            continue
+
+        completion = None
+        for key in COMPLETION_FIELDS:
+            val = example.get(key)
+            if val:
+                completion = val.strip()
+                break
+        if not completion:
+            continue
+
+        pairs.append({"base": base, "target": completion})
+
+    if len(pairs) < num_samples:
+        raise ValueError(
+            f"Only {len(pairs)} valid AdvBench pairs available, need {num_samples}."
+        )
+
+    rng = random.Random(seed)
+    rng.shuffle(pairs)
+    return pairs[:num_samples]
+
+
+def ensure_dir(path: str) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
+def run_gcg_for_length(
+    agent: PromptRLAgent,
+    prefixes: List[str],
+    completions: List[str],
+    suffix_len: int,
+    gcg_steps: int,
+    gcg_top_k: int,
+    gcg_batch_size: int,
+    gcg_max_batch_size: int,
+    lr_embeddings: float,
+) -> Tuple[float, float]:
+    """Execute GCG for the provided suffix length and return mean per-token LLs."""
+    batch_size = len(prefixes)
+    optimizer = DiscretePromptOptimizer(
+        agent=agent,
+        initial_prompt_length=suffix_len,
+        max_prompt_len=suffix_len,
+        batch_size=batch_size,
+        lr_embeddings=lr_embeddings,
+        max_suffix_len=suffix_len,
+        init_len=suffix_len,
+        gcg_steps=gcg_steps,
+        gcg_top_k=gcg_top_k,
+        gcg_batch_size=gcg_batch_size,
+        gcg_max_batch_size=gcg_max_batch_size,
+    )
+
+    model_input = ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=suffix_len,
+        init_len=suffix_len,
+        mode="discrete",
+    )
+
+    prompt_data, lengths = optimizer.initialize_prompts(model_input)
+    model_input.update_suffix_tokens(prompt_data)
+
+    completion_token_counts = (
+        model_input.completion_attention_mask.sum(dim=1).float().clamp(min=1.0)
+    )
+
+    with torch.no_grad():
+        initial_lls = optimizer.get_likelihoods(
+            prompt_data, lengths, model_input, requires_grad=False
+        )
+    initial_mean = (initial_lls / completion_token_counts).mean().item()
+
+    prompt_data, final_lls = optimizer.inner_optimization_step(
+        prompt_data, lengths, step=0, model_input=model_input
+    )
+    final_mean = (final_lls / completion_token_counts).mean().item()
+
+    return initial_mean, final_mean
+
+
+def main() -> None:
+    args = parse_args()
+
+    with open(args.config, "r") as cfg_file:
+        cfg = yaml.safe_load(cfg_file)
+
+    seed = args.seed or cfg.get("seed", 2262)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    train_cfg = cfg.get("train", {})
+    dataset_cfg = cfg.get("dataset", {})
+    min_prompt_length = train_cfg.get("min_prompt_length", 30)
+    max_prompt_length = train_cfg.get("max_prompt_length", 150)
+    lr_embeddings = train_cfg.get("lr_embeddings", 0.01)
+
+    gcg_cfg = train_cfg.get("gcg", {})
+    gcg_top_k = args.gcg_top_k or gcg_cfg.get("top_k", 64)
+    gcg_batch_size = args.gcg_batch_size or gcg_cfg.get("batch_size", 64)
+    gcg_max_batch_size = args.gcg_max_batch_size or gcg_cfg.get(
+        "max_batch_size", 256
+    )
+
+    if not args.show_gcg_progress:
+        os.environ.setdefault("TQDM_DISABLE", "1")
+
+    if args.dataset.lower() != "advbench":
+        raise ValueError("Only AdvBench is supported in this script.")
+
+    prompt_pairs = load_advbench_pairs(
+        num_samples=args.num_samples,
+        seed=seed,
+        min_len=min_prompt_length,
+        max_len=max_prompt_length,
+    )
+    prefixes = [p["base"] for p in prompt_pairs]
+    completions = [p["target"] for p in prompt_pairs]
+
+    model_name = args.model or cfg.get("model", "EleutherAI/pythia-70m")
+    agent = PromptRLAgent(model_name=model_name)
+
+    print(
+        f"Running GCG sweep on {len(prefixes)} samples "
+        f"(steps={args.gcg_steps}, top_k={gcg_top_k}, batch={gcg_batch_size})"
+    )
+
+    lengths = list(range(args.min_suffix_len, args.max_suffix_len + 1))
+    initial_curve: List[float] = []
+    final_curve: List[float] = []
+
+    for suffix_len in lengths:
+        print(f"Evaluating suffix length {suffix_len}...")
+        init_ll, final_ll = run_gcg_for_length(
+            agent=agent,
+            prefixes=prefixes,
+            completions=completions,
+            suffix_len=suffix_len,
+            gcg_steps=args.gcg_steps,
+            gcg_top_k=gcg_top_k,
+            gcg_batch_size=gcg_batch_size,
+            gcg_max_batch_size=gcg_max_batch_size,
+            lr_embeddings=lr_embeddings,
+        )
+        initial_curve.append(init_ll)
+        final_curve.append(final_ll)
+        print(
+            f"  mean per-token LL: start={init_ll:.3f}, "
+            f"final={final_ll:.3f}, delta={final_ll - init_ll:.3f}"
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    ensure_dir(args.output)
+    plt.figure(figsize=(8, 5))
+    plt.plot(lengths, initial_curve, label="Initial per-token LL", marker="o")
+    plt.plot(lengths, final_curve, label="Final per-token LL", marker="s")
+    plt.xlabel("Suffix length (tokens)")
+    plt.ylabel("Average per-token log-likelihood")
+    plt.title("GCG sweep over suffix lengths")
+    plt.grid(True, linestyle=":", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(args.output)
+    print(f"Saved plot to {args.output}")
+
+    if args.csv:
+        ensure_dir(args.csv)
+        with open(args.csv, "w") as csv_file:
+            csv_file.write("suffix_len,initial_per_token_ll,final_per_token_ll\n")
+            for length, init_ll, final_ll in zip(lengths, initial_curve, final_curve):
+                csv_file.write(f"{length},{init_ll:.6f},{final_ll:.6f}\n")
+        print(f"Wrote metrics to {args.csv}")
+
+
+if __name__ == "__main__":
+    main()
+
