@@ -2,167 +2,189 @@
 RL Agent for prompt optimization: handles model interactions and likelihood computation
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from transformers import GPTNeoXForCausalLM, AutoTokenizer
 import random
 
+
 class PromptRLAgent:
     """Agent that interacts with language model for prompt optimization."""
-    
+
     def __init__(self, model_name="EleutherAI/pythia-70m"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = GPTNeoXForCausalLM.from_pretrained(model_name)
-        
+
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
-        
+
         self.model.to(self.device)
         self.model.eval()
-        
+
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        
+
         self.special_token_ids = {
-            tok for tok in [self.tokenizer.pad_token_id, self.tokenizer.eos_token_id, self.tokenizer.bos_token_id]
+            tok
+            for tok in [
+                self.tokenizer.pad_token_id,
+                self.tokenizer.eos_token_id,
+                self.tokenizer.bos_token_id,
+            ]
             if tok is not None
         }
         self.vocab_size = len(self.tokenizer)
-    
-    def get_likelihoods_batch(self, prompt_embeds: torch.Tensor, completion_tokens: torch.Tensor, 
-                             completion_lengths: torch.Tensor, requires_grad: bool = False,
-                             prefix_tokens: torch.Tensor = None, prefix_lengths: torch.Tensor = None,
-                             attention_mask: torch.Tensor = None) -> torch.Tensor:
+
+    def _project_embeddings_to_tokens(
+        self, embeds: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Batched likelihood computation with prefix + suffix structure.
-        
-        Structure: [padding_left] + [prefix] + [suffix] + [completion] + [padding_right]
-        
+        Project embeddings to nearest token IDs.
+
         Args:
-            prompt_embeds: Suffix embeddings [B, L_suffix, D]
-            completion_tokens: Completion tokens [B, max_comp]
-            completion_lengths: Actual completion lengths [B]
-            prefix_tokens: Prefix tokens [B, max_prefix] (optional, defaults to empty)
-            prefix_lengths: Actual prefix lengths [B] (optional)
-            attention_mask: Attention mask [B, max_seq] (optional, auto-generated if None)
+            embeds: [B, L, D] tensor of embeddings
+            mask: [B, L] attention mask (1 = active, 0 = inactive)
+
+        Returns:
+            token_ids: [B, L] tensor of nearest token IDs
+        """
+        B, L, D = embeds.shape
+        embedding_layer = self.model.get_input_embeddings()
+        vocab_embeds = embedding_layer.weight.detach()  # [vocab_size, D]
+
+        # Flatten for batch processing
+        flat_embeds = embeds.view(B * L, D)  # [B*L, D]
+
+        # Compute L2 distances to all vocabulary embeddings
+        distances = torch.cdist(flat_embeds, vocab_embeds)  # [B*L, vocab_size]
+
+        # Find nearest token ID for each embedding
+        token_ids_flat = distances.argmin(dim=-1)  # [B*L]
+
+        # Reshape back to [B, L]
+        token_ids = token_ids_flat.view(B, L)
+
+        # Mask inactive positions (set to pad_id)
+        pad_id = getattr(self.tokenizer, "pad_token_id", 0)
+        token_ids = torch.where(
+            mask.bool(), token_ids, torch.full_like(token_ids, pad_id)
+        )
+
+        return token_ids
+
+    def get_likelihoods_batch(
+        self, model_input, requires_grad: bool = False
+    ) -> torch.Tensor:
+        """
+        Batched likelihood computation using ModelBatchedInput.
+
+        For continuous_proj mode:
+        - During optimization (requires_grad=True): uses embeddings directly to preserve gradients
+        - For reward computation (requires_grad=False): projects suffix embeddings to nearest token IDs
+        For continuous mode: uses embeddings directly.
+        For discrete mode: uses token IDs directly.
+
+        Args:
+            model_input: ModelBatchedInput instance with all inputs
             requires_grad: Whether to enable gradients
         """
-        B, L_suffix, D = prompt_embeds.shape
         device = self.device
-        embedding_layer = self.model.get_input_embeddings()
-        pad_id = getattr(self.tokenizer, 'pad_token_id', 0)
-        pad_embed = embedding_layer.weight[pad_id] if pad_id is not None else torch.zeros(D, device=device)
-        if not requires_grad:
-            pad_embed = pad_embed.detach()
-        
-        # Handle prefix: default to empty
-        if prefix_tokens is None:
-            prefix_tokens = torch.empty(B, 0, dtype=torch.long, device=device)
-            prefix_lengths = torch.zeros(B, dtype=torch.long, device=device)
-        elif prefix_lengths is None:
-            prefix_lengths = torch.full((B,), prefix_tokens.shape[1], dtype=torch.long, device=device)
-        
-        max_prefix = prefix_tokens.shape[1] if prefix_tokens.numel() > 0 else 0
-        max_comp = completion_tokens.shape[1]
-        
-        # Padding sizes: 32 on left, variable on right
-        padding_left = 32
-        padding_right = max(32, max_comp)  # At least 32, or max completion length
-        
-        # Build full sequence structure
-        max_seq = padding_left + max_prefix + L_suffix + max_comp + padding_right
-        
-        # Initialize with padding
-        inputs_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_seq, 1).to(device)
-        
-        # Position offsets
-        pos_pad_left = padding_left
-        pos_prefix_end = pos_pad_left + max_prefix
-        pos_suffix_end = pos_prefix_end + L_suffix
-        pos_comp_end = pos_suffix_end + max_comp
-        
-        # Fill prefix (if exists)
-        if max_prefix > 0:
-            prefix_embeds = embedding_layer(prefix_tokens)  # [B, max_prefix, D]
-            prefix_mask = torch.arange(max_prefix, device=device).unsqueeze(0) < prefix_lengths.unsqueeze(-1)  # [B, max_prefix]
-            prefix_mask_expanded = prefix_mask.unsqueeze(-1).expand(-1, -1, D)
-            inputs_embeds[:, pos_pad_left:pos_prefix_end, :] = torch.where(
-                prefix_mask_expanded,
-                prefix_embeds,
-                pad_embed.unsqueeze(0).unsqueeze(0).expand(B, max_prefix, -1)
-            )
-        
-        # Fill suffix (prompt_embeds)
-        inputs_embeds[:, pos_prefix_end:pos_suffix_end, :] = prompt_embeds
-        
-        # Fill completion
-        comp_embeds = embedding_layer(completion_tokens)  # [B, max_comp, D]
-        comp_mask = torch.arange(max_comp, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)  # [B, max_comp]
-        comp_mask_expanded = comp_mask.unsqueeze(-1).expand(-1, -1, D)
-        inputs_embeds[:, pos_suffix_end:pos_comp_end, :] = torch.where(
-            comp_mask_expanded,
-            comp_embeds,
-            pad_embed.unsqueeze(0).unsqueeze(0).expand(B, max_comp, -1)
-        )
-        
-        # Build attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.zeros(B, max_seq, dtype=torch.long, device=device)
-            # Mask: 1 for valid tokens, 0 for padding
-            for i in range(B):
-                # Left padding: all 0 (masked)
-                # Prefix: 1 for valid prefix tokens
-                prefix_start = pos_pad_left
-                prefix_end = prefix_start + prefix_lengths[i].item()
-                attention_mask[i, prefix_start:prefix_end] = 1
-                # Suffix: all 1 (all valid)
-                attention_mask[i, pos_prefix_end:pos_suffix_end] = 1
-                # Completion: 1 for valid completion tokens
-                comp_start = pos_suffix_end
-                comp_end = comp_start + completion_lengths[i].item()
-                attention_mask[i, comp_start:comp_end] = 1
-        
-        # Forward pass with attention mask
+
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
-            outputs = self.model.gpt_neox(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-            hidden_states = outputs.last_hidden_state  # [B, max_seq, hidden]
-            logits = self.model.embed_out(hidden_states)  # [B, max_seq, vocab]
-        
-        # Vectorized likelihood computation
-        max_comp = completion_lengths.max().item()
-        if max_comp == 0:
-            return torch.zeros(B, dtype=torch.float32, device=device, requires_grad=requires_grad)
-        
-        # Extract logits for completion positions (before each completion token)
-        comp_logits = logits[:, pos_suffix_end-1:pos_suffix_end-1+max_comp, :]  # [B, max_comp, vocab]
-        
-        # Extract completion tokens
-        comp_tokens = completion_tokens[:, :max_comp]
-        
+
+            # For continuous_proj mode:
+            # - During optimization (requires_grad=True): use embeddings directly to preserve gradients
+            # - For reward computation (requires_grad=False): project to tokens for accurate likelihood
+            if model_input.original_mode == "continuous_proj" and not requires_grad:
+                # Project suffix embeddings to nearest token IDs (for reward computation only)
+                suffix_embeds = model_input.suffix_embeddings  # [B, max_suffix_len, D]
+                suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
+                suffix_token_ids = self._project_embeddings_to_tokens(
+                    suffix_embeds, suffix_mask
+                )  # [B, max_suffix_len]
+
+                # Temporarily store projected suffix tokens in model_input for concatenation
+                # (similar to how discrete mode works)
+                original_suffix_input_ids = model_input.suffix_input_ids
+                model_input.suffix_input_ids = suffix_token_ids
+
+                # Use the same concatenation logic as discrete mode
+                input_ids, attention_mask = (
+                    model_input.get_model_input_ids_and_attention_mask()
+                )
+
+                # Restore original suffix_input_ids (in case it's used elsewhere)
+                model_input.suffix_input_ids = original_suffix_input_ids
+
+                # Use token-based forward pass (like discrete mode)
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+                # Forward pass with attention mask
+                outputs = self.model(
+                    inputs_embeds=inputs_embeds, attention_mask=attention_mask
+                )
+                logits = outputs.logits  # [B, seq_len, vocab]
+            elif model_input.mode == "continuous" or (
+                model_input.original_mode == "continuous_proj" and requires_grad
+            ):
+                inputs_embeds, attention_mask, suffix_mask = (
+                    model_input.get_model_input_embeds_and_attention_mask()
+                )
+                # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
+                # Only suffix embeddings have gradients
+                # Forward pass with attention mask
+                outputs = self.model(
+                    inputs_embeds=inputs_embeds, attention_mask=attention_mask
+                )
+                logits = outputs.logits  # [B, seq_len, vocab]
+            elif model_input.mode == "discrete":
+                # For discrete mode, we need embeddings for forward pass
+                input_ids, attention_mask = (
+                    model_input.get_model_input_ids_and_attention_mask()
+                )
+
+                # Forward pass with attention mask
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits  # [B, seq_len, vocab]
+            else:
+                raise ValueError(f"Invalid mode: {model_input.mode}")
+
+        completion_start_pos = model_input.get_completion_start_pos()
+
+        # Extract logits and completion tokens and shift appropriately. We just take the last model_input.completion_token_ids for the logits and completion tokens. For example, if the completions are 12 tokens long, we take the logits and completion tokens for the last 12 tokens.
+        comp_logits = logits[:, completion_start_pos - 1 : -1, :]  # [B, number of completion tokens, vocab]
+        comp_tokens = model_input.completion_input_ids  # [B, number of completion tokens]
+
         # Compute log probabilities
         log_probs = F.log_softmax(comp_logits, dim=-1)
-        
-        # Gather token log probs
-        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)  # [B, max_comp]
-        
-        # Mask invalid positions
-        comp_mask = torch.arange(max_comp, device=device).unsqueeze(0) < completion_lengths.unsqueeze(-1)
-        masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
-        
-        # Sum over completion length
-        likelihoods = masked_log_probs.sum(dim=-1)  # [B]
-        
-        return likelihoods
-    
-    def get_random_token(self) -> int:
-        """Get a random token ID (excluding special tokens)."""
-        while True:
-            token = random.randint(0, self.vocab_size - 1)
-            if token not in self.special_token_ids:
-                return token
 
+        # Gather token log probs
+        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(
+            -1
+        )  # [B, number of completion tokens]
+
+        # Mask invalid positions by taking the attention mask of the completion tokens and masking the invalid positions.
+        comp_mask = model_input.completion_attention_mask.bool()
+        token_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
+
+        return token_log_probs.sum(dim=-1)  # [B]
+
+    def get_random_token(self) -> int:
+        """
+        Get a random token ID from the vocabulary, excluding special tokens.
+
+        Returns:
+            Random token ID (int)
+        """
+        # Sample from vocabulary, excluding special tokens
+        while True:
+            token_id = random.randint(0, self.vocab_size - 1)
+            if token_id not in self.special_token_ids:
+                return token_id

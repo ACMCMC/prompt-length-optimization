@@ -73,6 +73,11 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
     
     # Plot 1: Likelihood
+    # Use markers if we have few points, otherwise use line
+    if len(steps) <= 3:
+        ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2, marker='o', markersize=8)
+        ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2, marker='s', markersize=8)
+    else:
     ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
     ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
     ax1.set_ylabel('Log Likelihood', fontsize=11)
@@ -82,6 +87,9 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
     
     # Plot 2: Length
     if any(l is not None for l in lengths):
+        if len(steps) <= 3:
+            ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2, marker='o', markersize=8)
+        else:
         ax2.plot(steps, lengths, label='prompt length', color='tab:orange', linewidth=2)
         ax2.set_ylabel('Prompt Length (tokens)', fontsize=11)
         ax2.legend(loc='best')
@@ -90,6 +98,10 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
     
     # Plot 3: Reward
     if any(r is not None for r in rewards):
+        if len(steps) <= 3:
+            ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2, marker='o', markersize=8)
+            ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2, marker='s', markersize=8)
+        else:
         ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2)
         ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2)
         ax3.set_xlabel('Step', fontsize=11)

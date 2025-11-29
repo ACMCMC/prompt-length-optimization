@@ -15,20 +15,27 @@ train:
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 30             # Episodes to train on each prompt
-  steps_per_episode: 150            # Steps per episode (increased for better RL learning)
-  init_len: 32                       # Initial prompt length in tokens
+  episodes_per_prompt: 3             # Episodes to train on each prompt
+  steps_per_episode: 25            # Steps per episode (increased for better RL learning)
+  init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
-  alpha: 1.0                         # Likelihood weight
-  beta: 0.2                          # Length penalty (higher = more compression)
-  projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
+  epsilon: 0.1                    # Epsilon for epsilon-greedy exploration (lower = less random exploration)
+  epsilon_decay: 0.97            # Epsilon decay per episode (slightly slower decay, but from a lower starting epsilon)
+  epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
+  entropy_coef: 0.02              # Entropy bonus coefficient (encourages diverse action distributions; mostly unused if grpo.entropy_coef is set)
+  temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
+  alpha: 0.5                         # Likelihood weight
+  beta: 0.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  projection_weight: 0.5            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 64                      # Prompts per batch for progress tracking
+  batch_size: 16                      # Prompts per batch for progress tracking
+  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for PPO advantage computation
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -36,18 +43,34 @@ train:
   no_plots: false
   plots_format: pdf                  # png|pdf (default: pdf)
 
+  # Wandb logging
+  use_wandb: true                    # Enable wandb logging (default: true)
+  wandb_project: prompt-optimization  # Wandb project name
+
   optimization_mode: discrete
-  gcg_top_k: 32
-  gcg_batch_size: 64
-  gcg_steps: 10
-  # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
-  ppo:
-    epochs: 1
-    clip: 0.2
-    gamma: 0.99
-    gae_lambda: 0.95
-    value_coef: 0.5
-    entropy_coef: 0.01
+  
+  # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
+  gcg:
+    top_k: 64
+    batch_size: 64  # Number of candidates per position (reduced to avoid OOM)
+    max_batch_size: 256  # Maximum batch size for forward passes (to avoid OOM)
+    steps: 5
+  
+  # GRPO parameters (Group Relative Policy Optimization)
+  grpo:
+    epochs: 4                      # Number of GRPO update epochs per episode
+    clip: 0.2                       # GRPO clipping epsilon
+    gamma: 0.99                     # Discount factor
+    gae_lambda: 0.95                # GAE lambda parameter
+    value_coef: 2.0                 # Value loss coefficient (increased to strengthen value learning)
+    entropy_coef: 0.003             # Entropy bonus coefficient (smaller = less pull toward uniform policy)
+    max_grad_norm: 0.5              # Maximum gradient norm for clipping
+  
+  # Policy network architecture
+  policy:
+    hidden_size: 128                 # Hidden layer size for policy and value networks
+    value_init_bias: 0.0        # Initial bias for value network output layer
+    value_init_gain: 0.1            # Initial weight gain for value network output layer
 
 eval:
   # Test dataset parameters
@@ -56,10 +79,11 @@ eval:
   max_prompt_length: 150             # Max test prompt length
   
   # Evaluation parameters
-  init_len: 32                       # Initial prompt length
-  max_policy_steps: 150               # Max policy steps per prompt
-  opt_steps: 15                      # Optimization steps (fewer for dataset eval)
-  log_every_opt: 999                 # Reduce logging
+  init_len: 16                       # Initial prompt length (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
+  max_policy_steps: 25               # Max policy steps per prompt
+  opt_steps: 5                      # Optimization steps (fewer for dataset eval)
+  log_every_opt: 1                 # Reduce logging
   
   # Output
   results_file: results/eval_results.csv
