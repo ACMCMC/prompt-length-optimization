@@ -497,6 +497,10 @@ class LengthPolicyOptimizer:
                         prompt_data, lengths, model_input, requires_grad=False
                     )
                 last_known_likelihoods = initial_likelihoods.clone()
+                # Precompute completion lengths to report per-token likelihoods
+                completion_token_counts = (
+                    model_input.completion_attention_mask.sum(dim=1).float().clamp(min=1.0)
+                )
 
                 step_bar = (
                     trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False)
@@ -771,10 +775,13 @@ class LengthPolicyOptimizer:
                     step_rewards = (
                         alpha * last_known_likelihoods - beta * lengths
                     )  # [batch_B]
+                    likelihoods_per_token = last_known_likelihoods / completion_token_counts
 
                     # Debug log: likelihoods, lengths, rewards
                     logging.debug(
-                        f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, len={lengths.mean().item():.1f}, reward={step_rewards.mean().item():.2f}"
+                        f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, "
+                        f"ll/token={likelihoods_per_token.mean().item():.3f}, "
+                        f"len={lengths.mean().item():.1f}, reward={step_rewards.mean().item():.2f}"
                     )
 
                     # Update best prompts based on step rewards (for tracking best so far)
@@ -811,9 +818,17 @@ class LengthPolicyOptimizer:
                     )  # Truly global step across all batches
                     # Convert to Python floats, handling NaN/Inf
                     likelihoods_list = []
-                    for l in last_known_likelihoods:
+                    likelihoods_per_token_list = []
+                    for l, l_per_token in zip(
+                        last_known_likelihoods, likelihoods_per_token
+                    ):
                         l_val = float(l.item()) if torch.is_tensor(l) else float(l)
-                        # Check if value is NaN or Inf, if so set to 0.0
+                        per_token_val = (
+                            float(l_per_token.item())
+                            if torch.is_tensor(l_per_token)
+                            else float(l_per_token)
+                        )
+                        # Check if values are NaN or Inf, if so set to 0.0
                         if not (
                             isinstance(l_val, (int, float))
                             and l_val == l_val
@@ -821,14 +836,31 @@ class LengthPolicyOptimizer:
                             and l_val != float("-inf")
                         ):
                             l_val = 0.0
+                        if not (
+                            isinstance(per_token_val, (int, float))
+                            and per_token_val == per_token_val
+                            and per_token_val != float("inf")
+                            and per_token_val != float("-inf")
+                        ):
+                            per_token_val = 0.0
                         likelihoods_list.append(l_val)
+                        likelihoods_per_token_list.append(per_token_val)
 
                     # Convert step rewards to list for logging
                     step_rewards_list = [float(r) for r in step_rewards]
                     best_likelihoods_list = []
-                    for l in best_likelihoods:
+                    best_likelihoods_per_token = best_likelihoods / completion_token_counts
+                    best_likelihoods_per_token_list = []
+                    for l, l_per_token in zip(
+                        best_likelihoods, best_likelihoods_per_token
+                    ):
                         l_val = float(l.item()) if torch.is_tensor(l) else float(l)
-                        # Check if value is NaN or Inf, if so set to 0.0
+                        per_token_val = (
+                            float(l_per_token.item())
+                            if torch.is_tensor(l_per_token)
+                            else float(l_per_token)
+                        )
+                        # Check if values are NaN or Inf, if so set to 0.0
                         if not (
                             isinstance(l_val, (int, float))
                             and l_val == l_val
@@ -836,7 +868,15 @@ class LengthPolicyOptimizer:
                             and l_val != float("-inf")
                         ):
                             l_val = 0.0
+                        if not (
+                            isinstance(per_token_val, (int, float))
+                            and per_token_val == per_token_val
+                            and per_token_val != float("inf")
+                            and per_token_val != float("-inf")
+                        ):
+                            per_token_val = 0.0
                         best_likelihoods_list.append(l_val)
+                        best_likelihoods_per_token_list.append(per_token_val)
 
                     traces.append(
                         {
@@ -844,7 +884,9 @@ class LengthPolicyOptimizer:
                             "step": global_step,  # Global step across all episodes
                             "rewards": step_rewards_list,  # Step-level rewards for logging
                             "likelihoods": likelihoods_list,
+                            "likelihoods_per_token": likelihoods_per_token_list,
                             "best_likelihoods": best_likelihoods_list,
+                            "best_likelihoods_per_token": best_likelihoods_per_token_list,
                             "lengths": [int(l) for l in lengths],
                         }
                     )
@@ -854,8 +896,12 @@ class LengthPolicyOptimizer:
                         # Compute batch averages for logging
                         avg_reward = step_rewards.mean().item()
                         avg_likelihood = last_known_likelihoods.mean().item()
+                        avg_likelihood_per_token = likelihoods_per_token.mean().item()
                         avg_length = lengths.mean().item()
                         avg_best_likelihood = best_likelihoods.float().mean().item()
+                        avg_best_likelihood_per_token = (
+                            best_likelihoods_per_token.mean().item()
+                        )
 
                         # Action distribution: probabilities from policy (before sampling)
                         policy_action_probs = action_probs.mean(
@@ -876,8 +922,10 @@ class LengthPolicyOptimizer:
                         step_log_dict = {
                             "step/avg_reward": avg_reward,  # Step-level reward for debugging
                             "step/avg_likelihood": avg_likelihood,
+                            "step/avg_likelihood_per_token": avg_likelihood_per_token,
                             "step/avg_length": avg_length,
                             "step/avg_best_likelihood": avg_best_likelihood,
+                            "step/avg_best_likelihood_per_token": avg_best_likelihood_per_token,
                             "step/action_prob_optimize": policy_action_probs[0].item(),
                             "step/action_prob_decrease": policy_action_probs[1].item(),
                             "step/action_prob_increase": policy_action_probs[2].item(),
@@ -911,6 +959,7 @@ class LengthPolicyOptimizer:
                     final_likelihoods = optimizer.get_likelihoods(
                         prompt_data, lengths, model_input, requires_grad=False
                     )  # [batch_B]
+                final_likelihoods_per_token = final_likelihoods / completion_token_counts
 
                 # Compute final reward: alpha * likelihood - beta * length
                 final_lengths = model_input.suffix_attention_mask.sum(
@@ -932,7 +981,9 @@ class LengthPolicyOptimizer:
                         active_tokens, skip_special_tokens=True
                     )
                     logging.info(
-                        f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, len={len_val}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'"
+                        f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, "
+                        f"ll/token={final_likelihoods_per_token[i].item():.3f}, "
+                        f"len={len_val}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'"
                     )
 
                 # Update best prompts based on final reward
