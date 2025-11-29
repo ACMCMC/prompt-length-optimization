@@ -691,15 +691,24 @@ class LengthPolicyOptimizer:
                                 (
                                     base_input_ids,
                                     base_attention_mask,
-                                    completion_start_pos,
                                 ) = (
                                     self._full_input.get_model_input_ids_and_attention_mask()
                                 )
                                 return (
                                     base_input_ids[self._indices],
                                     base_attention_mask[self._indices],
-                                    completion_start_pos,
                                 )
+
+                            def get_suffix_mask_in_fully_batched_input(self):
+                                return self._full_input.get_suffix_mask_in_fully_batched_input()[
+                                    self._indices
+                                ]
+
+                            def get_suffix_start_pos(self):
+                                return self._full_input.get_suffix_start_pos()
+
+                            def get_completion_start_pos(self):
+                                return self._full_input.get_completion_start_pos()
 
                         subset_model_input = SubsetModelInput(
                             model_input, optimize_indices

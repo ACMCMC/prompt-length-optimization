@@ -295,7 +295,7 @@ class ModelBatchedInput:
 
     def get_model_input_embeds_and_attention_mask(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         """
         Get concatenated embeddings and attention mask for model input (continuous mode only).
 
@@ -303,6 +303,7 @@ class ModelBatchedInput:
             inputs_embeds: Concatenated embeddings [B, seq_len, D]
             attention_mask: Concatenated attention mask [B, seq_len]
             suffix_mask: Mask indicating which positions are suffix (for gradient computation) [B, seq_len]
+            suffix_start_pos: Position where suffix starts in sequence
             completion_start_pos: Position where completion starts in sequence
         """
         assert self.mode in [
@@ -322,9 +323,7 @@ class ModelBatchedInput:
         completion_mask = self.completion_attention_mask
 
         # Create suffix mask: 1 for suffix positions, 0 for prefix/completion
-        suffix_mask = torch.ones(
-            self.batch_size, self.max_suffix_len, dtype=torch.long, device=self.device
-        ).fill_(1)
+        suffix_mask = self.get_suffix_mask_in_fully_batched_input()
 
         # Concatenate: prefix + suffix + completion
         # Detach prefix and completion embeddings (they should not have gradients)
@@ -343,28 +342,8 @@ class ModelBatchedInput:
         attention_mask = torch.cat(
             [prefix_mask, self.suffix_attention_mask, completion_mask], dim=1
         )
-        # Suffix mask: 1 for suffix positions, 0 for prefix/completion
-        suffix_mask = torch.cat(
-            [
-                suffix_mask,
-                suffix_mask,
-                torch.zeros(
-                    self.batch_size,
-                    self.max_suffix_len,
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-            ],
-            dim=1,
-        )
 
-        # Completion starts after prefix and suffix
-        completion_start_pos = self.prefix_input_ids.size(
-            -1
-        ) + self.suffix_input_ids.size(-1)
-
-        # Assert that completion_start_pos is the sum of the lengths of the prefix, and suffix
-        return inputs_embeds, attention_mask, suffix_mask, completion_start_pos
+        return inputs_embeds, attention_mask, suffix_mask
 
     def get_model_input_ids_and_attention_mask(
         self,
@@ -396,9 +375,30 @@ class ModelBatchedInput:
             dim=1,
         )
 
-        # Completion starts after prefix and suffix
-        completion_start_pos = self.prefix_input_ids.size(
-            -1
-        ) + self.suffix_input_ids.size(-1)
+        return input_ids, attention_mask
 
-        return input_ids, attention_mask, completion_start_pos
+    def get_suffix_mask_in_fully_batched_input(self) -> torch.Tensor:
+        """
+        Get suffix mask (not the attention mask, but the mask of the suffix positions) in the fully batched input.
+        This has the shape of the concatenated prefix, suffix and completion.
+        """
+        return torch.cat(
+            [
+                torch.zeros_like(self.prefix_attention_mask),
+                self.suffix_attention_mask,  # This is the mask of the suffix positions
+                torch.zeros_like(self.completion_attention_mask),
+            ],
+            dim=1,
+        )
+
+    def get_suffix_start_pos(self) -> int:
+        """
+        Get suffix start position in the fully batched input.
+        """
+        return self.prefix_input_ids.size(-1)
+
+    def get_completion_start_pos(self) -> int:
+        """
+        Get completion start position in the fully batched input.
+        """
+        return self.suffix_input_ids.size(-1)

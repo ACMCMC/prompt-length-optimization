@@ -116,7 +116,7 @@ class PromptRLAgent:
                 model_input.suffix_input_ids = suffix_token_ids
 
                 # Use the same concatenation logic as discrete mode
-                input_ids, attention_mask, completion_start_pos = (
+                input_ids, attention_mask = (
                     model_input.get_model_input_ids_and_attention_mask()
                 )
 
@@ -134,7 +134,7 @@ class PromptRLAgent:
             elif model_input.mode == "continuous" or (
                 model_input.original_mode == "continuous_proj" and requires_grad
             ):
-                inputs_embeds, attention_mask, suffix_mask, completion_start_pos = (
+                inputs_embeds, attention_mask, suffix_mask = (
                     model_input.get_model_input_embeds_and_attention_mask()
                 )
                 # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
@@ -146,7 +146,7 @@ class PromptRLAgent:
                 logits = outputs.logits  # [B, seq_len, vocab]
             elif model_input.mode == "discrete":
                 # For discrete mode, we need embeddings for forward pass
-                input_ids, attention_mask, completion_start_pos = (
+                input_ids, attention_mask = (
                     model_input.get_model_input_ids_and_attention_mask()
                 )
 
@@ -155,6 +155,8 @@ class PromptRLAgent:
                 logits = outputs.logits  # [B, seq_len, vocab]
             else:
                 raise ValueError(f"Invalid mode: {model_input.mode}")
+
+        completion_start_pos = model_input.get_completion_start_pos()
 
         # Extract logits and completion tokens and shift appropriately. We just take the last model_input.completion_token_ids for the logits and completion tokens. For example, if the completions are 12 tokens long, we take the logits and completion tokens for the last 12 tokens.
         comp_logits = logits[:, completion_start_pos - 1 : -1, :]  # [B, number of completion tokens, vocab]
