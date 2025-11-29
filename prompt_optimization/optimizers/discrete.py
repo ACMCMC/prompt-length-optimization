@@ -15,11 +15,13 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
     def __init__(self, agent, initial_prompt_length: int, max_prompt_len: int,
                  batch_size: int, lr_embeddings: float, max_suffix_len: int = None, init_len: int = None,
-                 top_k: int = 16, candidate_size: int = 32):
+                 top_k: int = 16, candidate_size: int = 32, gcg_steps_per_action: int = 1):
         super().__init__(agent, initial_prompt_length, max_prompt_len, batch_size, lr_embeddings)
         self.embedding_layer = agent.model.get_input_embeddings()
         self.top_k = max(1, int(top_k))
         self.candidate_size = max(1, int(candidate_size))
+        # Number of GCG optimization steps to run before each length action
+        self.gcg_steps_per_action = max(1, int(gcg_steps_per_action))
         # Cache saliency from the latest GCG step for guided add/remove
         self.last_grad_norms = None  # [B, L]
         self.last_topk_idx = None    # [B, L, top_k]
@@ -108,118 +110,124 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                                prefix_lengths: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Batched discrete optimization using the official GCG gradient + sampling update.
+        Runs self.gcg_steps_per_action GCG passes before returning.
         """
         device = self.device
         B = prompt_data.shape[0]
         max_active_len = lengths.max().item()
-        active_tokens = prompt_data[:, :max_active_len]
+        active_tokens = prompt_data[:, :max_active_len].clone()
         embedding_layer = self.embedding_layer
 
-        best_tokens_batch = active_tokens.clone()
         best_ll_batch = torch.full((B,), float("-inf"), device=device)
+        
+        # Run multiple GCG steps
+        for gcg_step in range(self.gcg_steps_per_action):
+            # Evaluate each example separately (closest to reference implementation)
+            for b in range(B):
+                L = lengths[b].item()
+                comp_len = completion_lengths[b].item()
+                if L == 0 or comp_len == 0:
+                    continue
+                control_tokens = active_tokens[b, :L]
+                comp_tokens = completion_tokens[b, :comp_len]
+                # Prefix handling
+                has_prefix = prefix_tokens is not None and prefix_tokens.numel() > 0
+                pref_len = int(prefix_lengths[b].item()) if has_prefix else 0
+                pref_tokens = prefix_tokens[b, :pref_len] if has_prefix else None
 
-        # Evaluate each example separately (closest to reference implementation)
-        for b in range(B):
-            L = lengths[b].item()
-            comp_len = completion_lengths[b].item()
-            if L == 0 or comp_len == 0:
-                continue
-            control_tokens = active_tokens[b, :L]
-            comp_tokens = completion_tokens[b, :comp_len]
-            # Prefix handling
-            has_prefix = prefix_tokens is not None and prefix_tokens.numel() > 0
-            pref_len = int(prefix_lengths[b].item()) if has_prefix else 0
-            pref_tokens = prefix_tokens[b, :pref_len] if has_prefix else None
+                # Build full sequence: prefix + control + completion
+                parts = []
+                if pref_len > 0:
+                    parts.append(pref_tokens)
+                parts.append(control_tokens)
+                parts.append(comp_tokens)
+                input_ids = torch.cat(parts, dim=0)
+                control_slice = slice(pref_len, pref_len + L)
+                target_slice = slice(pref_len + L, pref_len + L + comp_len)
+                loss_slice = slice(pref_len + L - 1, pref_len + L - 1 + comp_len)
 
-            # Build full sequence: prefix + control + completion
-            parts = []
-            if pref_len > 0:
-                parts.append(pref_tokens)
-            parts.append(control_tokens)
-            parts.append(comp_tokens)
-            input_ids = torch.cat(parts, dim=0)
-            control_slice = slice(pref_len, pref_len + L)
-            target_slice = slice(pref_len + L, pref_len + L + comp_len)
-            loss_slice = slice(pref_len + L - 1, pref_len + L - 1 + comp_len)
+                # Compute gradients using official token_gradients
+                self.agent.model.zero_grad(set_to_none=True)
+                grad = token_gradients(self.agent.model, input_ids, control_slice, target_slice, loss_slice)
+                
+                # Cache saliency for guided length actions (only on last GCG step)
+                if gcg_step == self.gcg_steps_per_action - 1:
+                    if self.last_grad_norms is None or self.last_grad_norms.shape[0] != B:
+                        self.last_grad_norms = torch.zeros(B, max_active_len, device=device)
+                        self.last_topk_idx = torch.zeros(B, max_active_len, self.top_k, device=device, dtype=torch.long)
+                    grad_norm = grad.norm(dim=-1)  # [L]
+                    topk_idx_local = (-grad).topk(self.top_k, dim=1).indices  # [L, top_k]
+                    self.last_grad_norms[b, :grad_norm.shape[0]] = grad_norm.detach()
+                    self.last_topk_idx[b, :topk_idx_local.shape[0], :] = topk_idx_local.detach()
 
-            # Compute gradients using official token_gradients
-            self.agent.model.zero_grad(set_to_none=True)
-            grad = token_gradients(self.agent.model, input_ids, control_slice, target_slice, loss_slice)
-            # Cache saliency for guided length actions
-            if self.last_grad_norms is None or self.last_grad_norms.shape[0] != B:
-                self.last_grad_norms = torch.zeros(B, max_active_len, device=device)
-                self.last_topk_idx = torch.zeros(B, max_active_len, self.top_k, device=device, dtype=torch.long)
-            grad_norm = grad.norm(dim=-1)  # [L]
-            topk_idx_local = (-grad).topk(self.top_k, dim=1).indices  # [L, top_k]
-            self.last_grad_norms[b, :grad_norm.shape[0]] = grad_norm.detach()
-            self.last_topk_idx[b, :topk_idx_local.shape[0], :] = topk_idx_local.detach()
+                # Sample candidate controls
+                not_allowed = torch.tensor(list(self.agent.special_token_ids), device=device) if self.agent.special_token_ids else None
+                candidates = sample_control(
+                    control_tokens,
+                    grad,
+                    batch_size=self.candidate_size,
+                    topk=self.top_k,
+                    temp=1,
+                    not_allowed_tokens=not_allowed
+                )
 
-            # Sample candidate controls
-            not_allowed = torch.tensor(list(self.agent.special_token_ids), device=device) if self.agent.special_token_ids else None
-            candidates = sample_control(
-                control_tokens,
-                grad,
-                batch_size=self.candidate_size,
-                topk=self.top_k,
-                temp=1,
-                not_allowed_tokens=not_allowed
-            )
+                # Score candidates with batched likelihood for efficiency
+                cand_embeds = embedding_layer(candidates)  # [K, L, D]
+                comp_tokens_batch = comp_tokens.unsqueeze(0).expand(candidates.shape[0], -1)
+                comp_lengths_batch = torch.full((candidates.shape[0],), comp_len, device=device, dtype=torch.long)
+                if pref_len > 0:
+                    pref_tok_batch = prefix_tokens[b:b+1, :prefix_tokens.shape[1]].expand(candidates.shape[0], -1)
+                    pref_len_batch = prefix_lengths[b:b+1].expand(candidates.shape[0])
+                else:
+                    pref_tok_batch = None
+                    pref_len_batch = None
 
-            # Score candidates with batched likelihood for efficiency
-            cand_embeds = embedding_layer(candidates)  # [K, L, D]
-            comp_tokens_batch = comp_tokens.unsqueeze(0).expand(candidates.shape[0], -1)
-            comp_lengths_batch = torch.full((candidates.shape[0],), comp_len, device=device, dtype=torch.long)
-            if pref_len > 0:
-                pref_tok_batch = prefix_tokens[b:b+1, :prefix_tokens.shape[1]].expand(candidates.shape[0], -1)
-                pref_len_batch = prefix_lengths[b:b+1].expand(candidates.shape[0])
-            else:
-                pref_tok_batch = None
-                pref_len_batch = None
-
-            ll_batch = self.agent.get_likelihoods_batch(
-                cand_embeds,
-                comp_tokens_batch,
-                comp_lengths_batch,
-                requires_grad=False,
-                prefix_tokens=pref_tok_batch,
-                prefix_lengths=pref_len_batch
-            )
-
-            # Compute current likelihood for logging
-            current_ll = self.agent.get_likelihoods_batch(
-                embedding_layer(control_tokens.unsqueeze(0)),
-                comp_tokens.unsqueeze(0),
-                torch.tensor([comp_len], device=device),
-                requires_grad=False,
-                prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
-                prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
-            )[0]
-
-            if ll_batch.numel() > 0:
-                best_idx = torch.argmax(ll_batch)
-                best_tokens_batch[b, :L] = candidates[best_idx]
-                best_ll_batch[b] = ll_batch[best_idx]
-            else:
-                # fallback to original tokens
-                orig_embeds = embedding_layer(control_tokens.unsqueeze(0))
-                orig_ll = self.agent.get_likelihoods_batch(
-                    orig_embeds,
-                    comp_tokens.unsqueeze(0),
-                    torch.tensor([comp_len], device=device),
+                ll_batch = self.agent.get_likelihoods_batch(
+                    cand_embeds,
+                    comp_tokens_batch,
+                    comp_lengths_batch,
                     requires_grad=False,
-                    prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
-                    prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
-                )[0]
-                best_ll_batch[b] = orig_ll
+                    prefix_tokens=pref_tok_batch,
+                    prefix_lengths=pref_len_batch
+                )
 
-            # Log before/after likelihoods for inspection
-            try:
-                print(f"[GCG] idx={b} len={L} pref_len={pref_len} ll_before={current_ll.item():.3f} ll_after={best_ll_batch[b].item():.3f}")
-            except Exception:
-                pass
+                # Compute current likelihood for logging (only on first and last step)
+                if gcg_step == 0 or gcg_step == self.gcg_steps_per_action - 1:
+                    current_ll = self.agent.get_likelihoods_batch(
+                        embedding_layer(control_tokens.unsqueeze(0)),
+                        comp_tokens.unsqueeze(0),
+                        torch.tensor([comp_len], device=device),
+                        requires_grad=False,
+                        prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
+                        prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
+                    )[0]
+
+                if ll_batch.numel() > 0:
+                    best_idx = torch.argmax(ll_batch)
+                    active_tokens[b, :L] = candidates[best_idx]
+                    best_ll_batch[b] = ll_batch[best_idx]
+                else:
+                    # fallback to original tokens
+                    orig_embeds = embedding_layer(control_tokens.unsqueeze(0))
+                    orig_ll = self.agent.get_likelihoods_batch(
+                        orig_embeds,
+                        comp_tokens.unsqueeze(0),
+                        torch.tensor([comp_len], device=device),
+                        requires_grad=False,
+                        prefix_tokens=pref_tok_batch[0:1] if pref_len > 0 else None,
+                        prefix_lengths=pref_len_batch[0:1] if pref_len > 0 else None
+                    )[0]
+                    best_ll_batch[b] = orig_ll
+
+                # Log before/after likelihoods (only on last GCG step to reduce noise)
+                if gcg_step == self.gcg_steps_per_action - 1:
+                    try:
+                        print(f"[GCG] idx={b} len={L} pref_len={pref_len} gcg_steps={self.gcg_steps_per_action} ll_before={current_ll.item():.3f} ll_after={best_ll_batch[b].item():.3f}")
+                    except Exception:
+                        pass
 
         # Update prompt_data with improved tokens
-        prompt_data[:, :max_active_len] = best_tokens_batch
+        prompt_data[:, :max_active_len] = active_tokens
         likelihoods = best_ll_batch
         return prompt_data, likelihoods
 

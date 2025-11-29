@@ -14,25 +14,25 @@ train:
     project: prompt-length-optimization
     run_name: default
   # Dataset parameters
-  max_prompts: 1                  # Number of prompts to train on
+  max_prompts: 8                  # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 5             # Episodes to train on each prompt (debug)
-  steps_per_episode: 10            # Steps per episode (debug)
-  init_len: 8                       # Initial prompt length in tokens (tight cap)
+  episodes_per_prompt: 20            # INCREASED - more episodes = more policy updates
+  steps_per_episode: 50              # REDUCED from 100 - shorter episodes = faster policy learning
+  init_len: 16                       # Initial prompt length in tokens (tight cap)
   
   # Optimization parameters
   lr_embeddings: 0.01
-  lr_policy: 0.0003
+  lr_policy: 0.0003                  # INCREASED for faster learning with short episodes
   alpha: 1.0                         # Likelihood weight
-  beta: 1.0                          # Length penalty (normalized by init_len)
+  beta: 6.0                          # Length penalty - INCREASED from 2.0 to penalize longer prompts more
   projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 1                      # Prompts per batch for progress tracking
+  batch_size: 8                      # Prompts per batch for progress tracking
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -41,17 +41,32 @@ train:
   plots_format: pdf                  # png|pdf (default: pdf)
 
   optimization_mode: discrete
-  gcg_top_k: 8
-  gcg_batch_size: 4
-  gcg_steps: 4
+  gcg_top_k: 32                      # INCREASED from 16 - more token options per position
+  gcg_batch_size: 128                # INCREASED from 32 - 4x more candidates = faster convergence
+  gcg_steps: 5                      # INCREASED from 3 - need more steps to reach good LL (-2 to -5)
   # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
   ppo:
-    epochs: 1
+    epochs: 4                        # INCREASED for larger network (was 2) - more updates per batch
     clip: 0.2
-    gamma: 0.99
-    gae_lambda: 0.95
-    value_coef: 0.5
-    entropy_coef: 0.01
+    gamma: 0.95                      # REDUCED from 0.99 - less accumulation over long episodes
+    gae_lambda: 0.9                  # REDUCED from 0.95 - less variance in advantage estimates
+    value_coef: 0.25                 # REDUCED from 0.5 - don't overweight value loss
+    entropy_coef: 0.25               # INCREASED from 0.15 - encourage more varied actions initially
+    use_complex_network: false       # false=SimplePolicyNetwork (faster, better init), true=ResidualPolicyNetwork
+  
+  # Curriculum exploration for RL policy
+  curriculum:
+    exploration_start: 0.3        # Initial probability of forced random action
+    exploration_end: 0.0        # Final exploration probability  
+    exploration_decay_episodes: 50  # Episodes to decay exploration over
+  
+  # Reward shaping parameters
+  reward_shaping:
+    mode: efficiency                # 'standard', 'efficiency', or 'hybrid'
+    ll_threshold: -5.0              # FIXED: -5 is achievable, was -15 which is too low!
+    hard_cap_ll: -3.0               # FIXED: Hard cap at -3, was -12
+    length_bonus_scale: 1.0         # Extra bonus multiplier for short lengths when LL is good
+  
   reward:
     mode: teacher_forced            # teacher_forced | generation | hybrid
     teacher_weight: 1.0

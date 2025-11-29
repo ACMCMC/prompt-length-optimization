@@ -16,10 +16,233 @@ from prompt_optimization.optimizers import (
     DiscretePromptOptimizer
 )
 
+
+# ============================================================================
+# Complex Neural Network Architectures for Policy/Value Networks
+# ============================================================================
+
+class ResidualBlock(nn.Module):
+    """Residual block with layer normalization for stable training."""
+    
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+        )
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Residual connection: x + f(x)
+        return self.activation(x + self.dropout(self.layers(x)))
+
+
+class FeatureEncoder(nn.Module):
+    """
+    Encodes different groups of state features separately before combining.
+    This allows the network to learn specialized representations for:
+    - Length features (efficiency-related)
+    - Performance features (likelihood-related)
+    - Temporal features (episode progress)
+    - History features (recent action patterns)
+    """
+    
+    def __init__(self, state_dim: int = 9, hidden_dim: int = 64):
+        super().__init__()
+        # Feature group indices (matching state vector layout):
+        # 0: len_norm_scaled (length)
+        # 1: ll_norm (performance)
+        # 2: delta_ll_norm (performance)
+        # 3: best_ll_norm (performance)
+        # 4: step_ratio (temporal)
+        # 5: ll_per_token_norm (length/efficiency)
+        # 6: steps_remaining_norm (temporal)
+        # 7: recent_add_scaled (history)
+        # 8: recent_remove_scaled (history)
+        
+        # Separate encoders for feature groups
+        self.length_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),  # len_norm, ll_per_token
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+        )
+        self.performance_encoder = nn.Sequential(
+            nn.Linear(3, hidden_dim // 4),  # ll, delta_ll, best_ll
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+        )
+        self.temporal_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),  # step_ratio, steps_remaining
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+        )
+        self.history_encoder = nn.Sequential(
+            nn.Linear(2, hidden_dim // 4),  # recent_add, recent_remove
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+        )
+        
+        # Combine all encoded features
+        self.combiner = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Split features into groups
+        length_feats = torch.stack([x[:, 0], x[:, 5]], dim=1)      # len_norm, ll_per_token
+        perf_feats = torch.stack([x[:, 1], x[:, 2], x[:, 3]], dim=1)  # ll, delta_ll, best_ll
+        temporal_feats = torch.stack([x[:, 4], x[:, 6]], dim=1)    # step_ratio, steps_remaining
+        history_feats = torch.stack([x[:, 7], x[:, 8]], dim=1)     # recent_add, recent_remove
+        
+        # Encode each group
+        length_enc = self.length_encoder(length_feats)
+        perf_enc = self.performance_encoder(perf_feats)
+        temporal_enc = self.temporal_encoder(temporal_feats)
+        history_enc = self.history_encoder(history_feats)
+        
+        # Concatenate and combine
+        combined = torch.cat([length_enc, perf_enc, temporal_enc, history_enc], dim=1)
+        return self.combiner(combined)
+
+
+class ResidualPolicyNetwork(nn.Module):
+    """
+    Complex policy network with:
+    - Feature-group encoding
+    - Multiple residual blocks
+    - Layer normalization
+    - Dropout for regularization
+    
+    Architecture: 9 → FeatureEncoder(64) → 256 → ResBlock → ResBlock → 128 → 64 → 3
+    Total params: ~100K (vs ~9K in simple MLP)
+    """
+    
+    def __init__(self, state_dim: int = 9, action_dim: int = 3, 
+                 hidden_dim: int = 256, num_residual_blocks: int = 2, 
+                 dropout: float = 0.1):
+        super().__init__()
+        
+        # Feature encoder (specialized encoding for different feature groups)
+        self.feature_encoder = FeatureEncoder(state_dim, hidden_dim=64)
+        
+        # Input projection from encoded features
+        self.input_proj = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Stack of residual blocks
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, dropout) for _ in range(num_residual_blocks)
+        ])
+        
+        # Output head with gradual dimension reduction
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, action_dim),
+        )
+        
+        # Initialize output layer with small weights for stable initial policy
+        nn.init.orthogonal_(self.output_head[-1].weight, gain=0.01)
+        nn.init.zeros_(self.output_head[-1].bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encode features by group
+        x = self.feature_encoder(x)
+        
+        # Project to hidden dimension
+        x = self.input_proj(x)
+        
+        # Apply residual blocks
+        for block in self.residual_blocks:
+            x = block(x)
+        
+        # Output action logits
+        return self.output_head(x)
+
+
+class ResidualValueNetwork(nn.Module):
+    """
+    Complex value network with similar architecture to policy network.
+    Outputs a single scalar value estimate.
+    
+    Architecture: 9 → FeatureEncoder(64) → 256 → ResBlock → ResBlock → 128 → 64 → 1
+    """
+    
+    def __init__(self, state_dim: int = 9, hidden_dim: int = 256, 
+                 num_residual_blocks: int = 2, dropout: float = 0.1):
+        super().__init__()
+        
+        # Feature encoder (shared architecture with policy)
+        self.feature_encoder = FeatureEncoder(state_dim, hidden_dim=64)
+        
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        
+        # Residual blocks
+        self.residual_blocks = nn.ModuleList([
+            ResidualBlock(hidden_dim, dropout) for _ in range(num_residual_blocks)
+        ])
+        
+        # Value output head
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.LayerNorm(hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+        
+        # Initialize output layer for reasonable initial value estimates
+        nn.init.orthogonal_(self.output_head[-1].weight, gain=1.0)
+        nn.init.zeros_(self.output_head[-1].bias)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Encode features
+        x = self.feature_encoder(x)
+        
+        # Project to hidden dimension
+        x = self.input_proj(x)
+        
+        # Apply residual blocks
+        for block in self.residual_blocks:
+            x = block(x)
+        
+        # Output value estimate
+        return self.output_head(x)
+
+
+# ============================================================================
+# Main Optimizer Class
+# ============================================================================
+
 class LengthPolicyOptimizer:
     """RL optimizer that learns prompt length policy using PPO (or REINFORCE fallback)."""
     
-    def __init__(self, agent: PromptRLAgent, reward_cfg=None):
+    def __init__(self, agent: PromptRLAgent, reward_cfg=None, use_complex_network: bool = False):
         # reward_cfg is accepted for backward compatibility with the GCG branch; it is not used here.
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
@@ -30,22 +253,201 @@ class LengthPolicyOptimizer:
         self.current_epsilon = 0.0
         self.temperature = 1.0
         
-        # Simple policy network: state -> action probs
-        # State features: [len_norm, ll, delta_ll, best_ll, step_ratio]
-        self.state_dim = 5
-        self.policy_net = nn.Sequential(
-            nn.Linear(self.state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 3)  # Actions: 0=remove, 1=keep, 2=add
-        ).to(agent.device)
-        self.value_net = nn.Sequential(
-            nn.Linear(self.state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        ).to(agent.device)
+        # Curriculum exploration parameters
+        self.exploration_start = 0.5   # Initial probability of forced random action
+        self.exploration_end = 0.05    # Final exploration probability
+        self.exploration_decay_episodes = 50  # Episodes to decay exploration
+        self.total_episodes_trained = 0  # Track across all prompts
         
-        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
-        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=3e-4)
+        # Reward shaping parameters
+        self.ll_threshold = -10.0     # LL above this is "good enough" - hard cap on ADD actions
+        self.length_bonus_scale = 2.0 # Extra bonus for short lengths when LL is good
+        
+        # NEW: Efficiency-based reward mode
+        self.reward_mode = 'standard'  # 'standard', 'efficiency', or 'hybrid'
+        self.efficiency_alpha = 1.0   # Weight for LL per token term
+        self.hard_cap_ll = -8.0       # Hard cap: block ADD actions when LL exceeds this
+        
+        # Action history for state representation (track last N actions per item in batch)
+        self.action_history_len = 5
+        
+        # Enhanced policy network: state -> action probs
+        # State features: [len_norm, ll, delta_ll, best_ll, step_ratio, 
+        #                  ll_per_token, steps_remaining_norm, recent_add_ratio, recent_remove_ratio]
+        self.state_dim = 9
+        
+        # Network architecture selection - can be passed from config
+        self.use_complex_network = use_complex_network
+        
+        if self.use_complex_network:
+            # Complex policy network with residual connections and layer normalization
+            self.policy_net = ResidualPolicyNetwork(self.state_dim, 3).to(agent.device)
+            self.value_net = ResidualValueNetwork(self.state_dim).to(agent.device)
+        else:
+            # Simple MLP - faster learning, more responsive to gradients
+            self.policy_net = nn.Sequential(
+                nn.Linear(self.state_dim, 64),
+                nn.Tanh(),  # Tanh instead of ReLU for bounded gradients
+                nn.Linear(64, 32),
+                nn.Tanh(),
+                nn.Linear(32, 3)
+            ).to(agent.device)
+            self.value_net = nn.Sequential(
+                nn.Linear(self.state_dim, 64),
+                nn.Tanh(),
+                nn.Linear(64, 32),
+                nn.Tanh(),
+                nn.Linear(32, 1)
+            ).to(agent.device)
+            # Initialize output layer with larger weights so initial policy isn't uniform
+            nn.init.orthogonal_(self.policy_net[-1].weight, gain=1.0)  # gain=1.0, not 0.01
+            nn.init.zeros_(self.policy_net[-1].bias)
+        
+        # Print network info
+        policy_params = sum(p.numel() for p in self.policy_net.parameters())
+        value_params = sum(p.numel() for p in self.value_net.parameters())
+        print(f"[Network] {'Complex' if self.use_complex_network else 'Simple'} architecture")
+        print(f"[Network] Policy params: {policy_params:,}, Value params: {value_params:,}")
+        
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)  # Increased from 3e-4
+        self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=1e-3)   # Increased from 3e-4
+    
+    def get_exploration_prob(self, episode: int = None, total_episodes: int = None) -> float:
+        """
+        Get current exploration probability based on curriculum schedule.
+        
+        Uses a two-level decay:
+        1. Within-prompt decay: decays from start to end over the episodes of current prompt
+        2. Cross-prompt decay: further reduces exploration as more prompts are trained
+        
+        Args:
+            episode: Current episode index within this prompt (0-indexed)
+            total_episodes: Total episodes for this prompt
+        """
+        # If episode info provided, use within-prompt decay
+        if episode is not None and total_episodes is not None and total_episodes > 0:
+            # Within-prompt progress (0 to 1)
+            within_progress = episode / total_episodes
+            
+            # Cross-prompt decay factor (reduces overall exploration as training progresses)
+            # After exploration_decay_episodes total, cross_factor goes to 0
+            if self.total_episodes_trained >= self.exploration_decay_episodes:
+                cross_factor = 0.0
+            else:
+                cross_factor = 1.0 - (self.total_episodes_trained / self.exploration_decay_episodes)
+            
+            # Combine: start high, decay within prompt, and also decay across prompts
+            # exploration = end + (start - end) * (1 - within_progress) * cross_factor
+            base_range = self.exploration_start - self.exploration_end
+            exploration = self.exploration_end + base_range * (1.0 - within_progress) * cross_factor
+            return max(self.exploration_end, exploration)
+        
+        # Fallback: use total episodes only (legacy behavior)
+        if self.total_episodes_trained >= self.exploration_decay_episodes:
+            return self.exploration_end
+        progress = self.total_episodes_trained / self.exploration_decay_episodes
+        return self.exploration_start + progress * (self.exploration_end - self.exploration_start)
+    
+    def compute_shaped_reward(self, likelihoods: torch.Tensor, lengths: torch.Tensor, 
+                               initial_prompt_length: int, alpha: float, beta: float,
+                               actions: torch.Tensor = None, prev_lengths: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute shaped reward that encourages shorter lengths when LL is 'good enough'.
+        
+        IMPORTANT: Rewards are normalized to roughly [-1, +1] range to prevent
+        exploding value loss in PPO. Raw LL values (-30 to -10) are scaled.
+        
+        NEW: Includes immediate action-based rewards to differentiate actions:
+        - REMOVE (action=0) when LL > threshold: bonus
+        - ADD (action=2) when LL > threshold: penalty
+        - This gives the policy clear signal about which actions are good
+        
+        Supports three reward modes:
+        1. 'standard': R = α * LL_norm - β * length_norm (original)
+        2. 'efficiency': R = α * (LL / length)_norm - β * length_norm (LL per token)
+        3. 'hybrid': Combines efficiency with bonus for short lengths when LL is good
+        """
+        length_norm = lengths.float() / max(1.0, float(initial_prompt_length))
+        
+        # Avoid division by zero
+        safe_lengths = lengths.float().clamp(min=1.0)
+        
+        # Normalization constants for LL (typical range: -35 to -5)
+        LL_MIN = -35.0  # Bad likelihood
+        LL_MAX = -5.0   # Good likelihood
+        LL_RANGE = LL_MAX - LL_MIN  # = 30
+        
+        if self.reward_mode == 'efficiency':
+            ll_per_token = likelihoods / safe_lengths
+            ll_per_token_norm = (ll_per_token + 0.6) * 2.0
+            base_reward = alpha * ll_per_token_norm
+            length_penalty = beta * (length_norm - 1.0).clamp(min=0)
+            length_bonus = beta * (1.0 - length_norm).clamp(min=0)
+            reward = base_reward - length_penalty + length_bonus
+            
+        elif self.reward_mode == 'hybrid':
+            ll_per_token = likelihoods / safe_lengths
+            ll_per_token_norm = (ll_per_token + 0.6) * 2.0
+            base_reward = alpha * ll_per_token_norm
+            length_penalty = beta * (length_norm - 1.0).clamp(min=0)
+            length_bonus = beta * (1.0 - length_norm).clamp(min=0)
+            good_ll_mask = likelihoods > self.ll_threshold
+            extra_bonus = torch.zeros_like(likelihoods)
+            if good_ll_mask.any():
+                under_ratio = (1.0 - length_norm).clamp(min=0)
+                extra_bonus[good_ll_mask] = self.length_bonus_scale * under_ratio[good_ll_mask]
+            reward = base_reward - length_penalty + length_bonus + extra_bonus
+            
+        else:  # 'standard' mode
+            ll_normalized = (likelihoods - LL_MIN) / LL_RANGE * 2.0 - 1.0
+            base_reward = alpha * ll_normalized
+            length_penalty = beta * (length_norm - 1.0).clamp(min=0)
+            length_bonus = beta * (1.0 - length_norm).clamp(min=0)
+            good_ll_mask = likelihoods > self.ll_threshold
+            extra_bonus = torch.zeros_like(likelihoods)
+            if good_ll_mask.any():
+                extra_bonus[good_ll_mask] = self.length_bonus_scale * (1.0 - length_norm[good_ll_mask]).clamp(min=0)
+            reward = base_reward - length_penalty + length_bonus + extra_bonus
+        
+        # ============ NEW: ACTION-BASED REWARD SHAPING ============
+        # Give immediate feedback based on the action taken
+        # This helps the policy learn which actions are good in which states
+        if actions is not None:
+            action_bonus = torch.zeros_like(reward)
+            good_ll_mask = likelihoods > self.ll_threshold
+            
+            # When LL is good enough:
+            # - REMOVE (action=0): reward for making prompt shorter
+            # - KEEP (action=1): small reward for not making it longer
+            # - ADD (action=2): penalty for making it longer unnecessarily
+            remove_mask = (actions == 0) & good_ll_mask
+            keep_mask = (actions == 1) & good_ll_mask
+            add_mask = (actions == 2) & good_ll_mask
+            
+            action_bonus[remove_mask] = 0.5   # Bonus for removing when LL is good
+            action_bonus[keep_mask] = 0.1     # Small bonus for keeping when LL is good
+            action_bonus[add_mask] = -0.3     # Penalty for adding when LL is good
+            
+            # When LL is bad (below threshold):
+            # - ADD might help, so no penalty
+            # - REMOVE might hurt, so no bonus
+            bad_ll_mask = ~good_ll_mask
+            add_bad_mask = (actions == 2) & bad_ll_mask
+            action_bonus[add_bad_mask] = 0.1  # Small encouragement to add when LL is bad
+            
+            reward = reward + action_bonus
+        
+        return reward
+    
+    def should_block_add(self, likelihoods: torch.Tensor) -> torch.Tensor:
+        """
+        Hard cap: return mask indicating which items should NOT be allowed to ADD.
+        When LL exceeds hard_cap_ll, block ADD actions to prevent further growth.
+        
+        Returns:
+            Boolean tensor [B] where True = block ADD action
+        """
+        return likelihoods > self.hard_cap_ll
     
     def _prepare_completions(self, target_completions: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare completion tokens as batched tensors"""
@@ -113,6 +515,7 @@ class LengthPolicyOptimizer:
                                wandb_log_fn=None, global_step_offset: int = 0,
                                log_prompt_indices: Optional[List[int]] = None,
                                gcg_top_k: int = 16, gcg_candidate_size: int = 32,
+                               gcg_steps_per_action: int = 1,
                                base_prompts: Optional[List[str]] = None) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
@@ -171,7 +574,8 @@ class LengthPolicyOptimizer:
             else:  # discrete
                 optimizer: BasePromptOptimizer = DiscretePromptOptimizer(
                     self.agent, initial_prompt_length, max_prompt_len, batch_B, lr_embeddings,
-                    top_k=gcg_top_k, candidate_size=gcg_candidate_size
+                    top_k=gcg_top_k, candidate_size=gcg_candidate_size,
+                    gcg_steps_per_action=gcg_steps_per_action
                 )
             
             # Initialize prompts (suffix)
@@ -203,11 +607,17 @@ class LengthPolicyOptimizer:
                 attention_mask_offset = torch.zeros(batch_B, dtype=torch.long, device=device)
                 prev_ll = torch.zeros(batch_B, device=device)
                 best_ll = torch.full((batch_B,), float("-inf"), device=device)
+                
+                # Initialize action history for this episode [batch_B, action_history_len]
+                action_history = torch.ones(batch_B, self.action_history_len, dtype=torch.long, device=device)  # Start with KEEP
 
                 episode_rewards = []
                 episode_log_probs = []
                 episode_states = []
                 episode_actions = []
+                
+                # Get current exploration probability for curriculum (scales within prompt's episodes)
+                exploration_prob = self.get_exploration_prob(episode=episode, total_episodes=episodes)
                 
                 step_bar = trange(steps_per_episode, desc=f"Episode {episode+1}", leave=False) if episodes > 1 else range(steps_per_episode)
                 for step in step_bar:
@@ -219,37 +629,121 @@ class LengthPolicyOptimizer:
                         prefix_tokens=prefix_tokens, prefix_lengths=prefix_lengths
                     )
                     
-                    # Compute states for policy
+                    # Compute enhanced states for policy
                     step_ratio = step / steps_per_episode
+                    steps_remaining_norm = (steps_per_episode - step) / steps_per_episode
                     len_norm = lengths.float() / initial_prompt_length
                     delta_ll = likelihoods - prev_ll
                     best_ll = torch.maximum(best_ll, likelihoods)
+                    
+                    # Efficiency metric: LL per token (higher = more efficient)
+                    # Clamp lengths to minimum of 1 to avoid division by zero
+                    safe_lengths = lengths.float().clamp(min=1.0)
+                    ll_per_token = likelihoods / safe_lengths
+                    
+                    # Sanitize likelihoods and derived values to prevent NaN/inf in states
+                    # Replace -inf with a large negative value, +inf with large positive, NaN with 0
+                    likelihoods_safe = torch.where(torch.isinf(likelihoods) | torch.isnan(likelihoods),
+                                                   torch.full_like(likelihoods, -50.0), likelihoods)
+                    delta_ll_safe = torch.where(torch.isinf(delta_ll) | torch.isnan(delta_ll),
+                                                torch.zeros_like(delta_ll), delta_ll)
+                    best_ll_safe = torch.where(torch.isinf(best_ll) | torch.isnan(best_ll),
+                                               torch.full_like(best_ll, -50.0), best_ll)
+                    ll_per_token_safe = torch.where(torch.isinf(ll_per_token) | torch.isnan(ll_per_token),
+                                                    torch.full_like(ll_per_token, -5.0), ll_per_token)
+                    
+                    # ========== NORMALIZE STATE FEATURES TO [-1, +1] RANGE ==========
+                    # This helps the policy/value networks learn more effectively
+                    
+                    # len_norm: already in [0, ~2], normalize to [-1, 1] centered at 1.0 (init_len)
+                    len_norm_scaled = (len_norm - 1.0)  # Now centered at 0: negative = shorter, positive = longer
+                    
+                    # likelihood: typical range [-50, 0], normalize to [-1, 1]
+                    # Map -50 -> -1, 0 -> +1
+                    LL_MIN, LL_MAX = -50.0, 0.0
+                    ll_norm = (likelihoods_safe - LL_MIN) / (LL_MAX - LL_MIN) * 2.0 - 1.0
+                    ll_norm = ll_norm.clamp(-1.0, 1.0)
+                    
+                    # delta_ll: typical range [-10, +10], normalize to [-1, 1]
+                    delta_ll_norm = (delta_ll_safe / 10.0).clamp(-1.0, 1.0)
+                    
+                    # best_ll: same normalization as likelihood
+                    best_ll_norm = (best_ll_safe - LL_MIN) / (LL_MAX - LL_MIN) * 2.0 - 1.0
+                    best_ll_norm = best_ll_norm.clamp(-1.0, 1.0)
+                    
+                    # ll_per_token: typical range [-5, 0] for reasonable prompts, normalize
+                    # Map -5 -> -1, 0 -> +1
+                    ll_per_token_norm = (ll_per_token_safe / 2.5 + 1.0).clamp(-1.0, 1.0)
+                    
+                    # Action history features: ratio of recent ADD (2) and REMOVE (0) actions
+                    recent_add_ratio = (action_history == 2).float().mean(dim=1)
+                    recent_remove_ratio = (action_history == 0).float().mean(dim=1)
+                    
+                    # Scale ratios to [-1, 1] centered at 0.5
+                    recent_add_scaled = (recent_add_ratio - 0.5) * 2.0
+                    recent_remove_scaled = (recent_remove_ratio - 0.5) * 2.0
+                    
                     states = torch.stack([
-                        len_norm,          # normalized length
-                        likelihoods,       # current likelihood
-                        delta_ll,          # change from previous step
-                        best_ll,           # running best LL
-                        torch.full((batch_B,), step_ratio, device=device),  # step ratio
-                    ], dim=1)  # [batch_B, state_dim]
-                    prev_ll = likelihoods.detach()
+                        len_norm_scaled,        # 0: normalized length (centered at init_len)
+                        ll_norm,                # 1: current likelihood (normalized)
+                        delta_ll_norm,          # 2: change from previous step (normalized)
+                        best_ll_norm,           # 3: running best LL (normalized)
+                        torch.full((batch_B,), step_ratio * 2.0 - 1.0, device=device),  # 4: step ratio [-1, 1]
+                        ll_per_token_norm,      # 5: efficiency (normalized)
+                        torch.full((batch_B,), steps_remaining_norm * 2.0 - 1.0, device=device),  # 6: time budget [-1, 1]
+                        recent_add_scaled,      # 7: recent ADD frequency [-1, 1]
+                        recent_remove_scaled,   # 8: recent REMOVE frequency [-1, 1]
+                    ], dim=1)  # [batch_B, state_dim=9]
+                    prev_ll = likelihoods_safe.detach()
                     print("states:", states)
                     # Policy forward pass
                     action_logits = self.policy_net(states)  # [batch_B, 3]
                     action_probs = F.softmax(action_logits, dim=-1)
-                    actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    
+                    # Curriculum exploration: force random actions early in training
+                    # Always log the exploration probability (not whether this step was random)
+                    self.current_epsilon = exploration_prob
+                    if exploration_prob > 0 and torch.rand(1).item() < exploration_prob:
+                        # Forced exploration: sample uniformly random action
+                        actions = torch.randint(0, 3, (batch_B,), device=device)
+                    else:
+                        actions = torch.multinomial(action_probs, 1).squeeze(-1)  # [batch_B]
+                    
                     print("actions:", actions)
                     print("action_probs:", action_probs)
+                    print("exploration_prob:", exploration_prob)
                     # Mask "add" when at or above max_prompt_len to prevent runaway growth
                     if hasattr(optimizer, "max_prompt_len"):
                         add_mask = (actions == 2) & (lengths >= optimizer.max_prompt_len)
                         if add_mask.any():
                             actions = actions.clone()
                             actions[add_mask] = 1  # convert to KEEP
+                    
+                    # MINIMUM LENGTH: Block REMOVE actions when at minimum length (1 token)
+                    # This prevents prompts from becoming empty (which causes -inf likelihood)
+                    MIN_PROMPT_LEN = 2  # Minimum prompt length to maintain
+                    remove_blocked = (actions == 0) & (lengths <= MIN_PROMPT_LEN)
+                    if remove_blocked.any():
+                        actions = actions.clone()
+                        actions[remove_blocked] = 1  # Convert to KEEP
+                    
+                    # HARD CAP: Block ADD actions when LL is already good enough
+                    # This prevents the policy from learning "ADD = better LL = higher reward"
+                    hard_cap_mask = self.should_block_add(likelihoods_safe)
+                    add_blocked = (actions == 2) & hard_cap_mask
+                    if add_blocked.any():
+                        actions = actions.clone()
+                        # When LL is good and trying to ADD, convert to KEEP (not REMOVE to avoid over-shrinking)
+                        actions[add_blocked] = 1  # Force KEEP instead of REMOVE
+                        
                     if batch_B == 1:
                         log_probs = F.log_softmax(action_logits, dim=-1)[0, actions].unsqueeze(0)
                     else:
                         log_probs = F.log_softmax(action_logits, dim=-1).gather(1, actions.unsqueeze(1)).squeeze(-1)
                     episode_actions.append(actions)
+                    
+                    # Update action history (shift left and add new action)
+                    action_history = torch.cat([action_history[:, 1:], actions.unsqueeze(1)], dim=1)
                     
                     # Apply length actions and handle prefix shifting
                     prompt_data, lengths, prefix_tokens, prefix_lengths, attention_mask_offset = self._apply_length_action_with_prefix(
@@ -257,9 +751,14 @@ class LengthPolicyOptimizer:
                         attention_mask_offset, max_prefix_size, pad_id
                     )
                 
-                    # Compute rewards (length normalized by initial_prompt_length)
-                    length_norm = lengths.float() / max(1.0, float(initial_prompt_length))
-                    rewards = alpha * likelihoods - beta * length_norm
+                    # Compute shaped rewards (with bonus for short lengths when LL is good)
+                    # Use sanitized likelihoods to avoid NaN rewards
+                    # Pass actions for action-based reward shaping
+                    rewards = self.compute_shaped_reward(likelihoods_safe, lengths, initial_prompt_length, alpha, beta, actions=actions)
+                    
+                    # Sanitize rewards to prevent NaN/inf propagation
+                    rewards = torch.where(torch.isinf(rewards) | torch.isnan(rewards),
+                                         torch.full_like(rewards, -10.0), rewards)
                     
                     # Vectorized best update: only update where reward improved
                     improve_mask = rewards > best_rewards
@@ -390,8 +889,12 @@ class LengthPolicyOptimizer:
                 traces.append({
                     'episode': episode,
                     'rewards': [float(r) for r in rewards_tensor[-1]],
+                    'likelihoods': [float(ll) for ll in likelihoods],  # Final likelihoods at end of episode
                     'lengths': [int(l) for l in lengths]
                 })
+                
+                # Increment total episodes trained (for curriculum exploration decay)
+                self.total_episodes_trained += 1
 
                 # Collect policy metrics for this episode
                 batch_policy_metrics.append({
@@ -403,7 +906,7 @@ class LengthPolicyOptimizer:
                     'policy_loss': float(last_policy_loss),
                     'value_loss': float(last_value_loss),
                     'entropy': float(last_entropy),
-                    'epsilon': 0.0,
+                    'epsilon': exploration_prob,  # Log exploration probability
                     'step': global_step_offset + episode * steps_per_episode
                 })
 
@@ -417,6 +920,7 @@ class LengthPolicyOptimizer:
                             'policy/policy_loss': float(last_policy_loss),
                             'policy/value_loss': float(last_value_loss),
                             'policy/entropy': float(last_entropy),
+                            'policy/exploration_prob': exploration_prob,  # Curriculum exploration
                             'policy/episode': episode,
                             'policy/batch_idx': batch_start // batch_size
                         })

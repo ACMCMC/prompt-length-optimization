@@ -241,7 +241,30 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     
     # Initialize agent and optimizer
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg)
+    
+    # Check if we should use complex network
+    ppo_cfg = train_cfg.get('ppo', {})
+    use_complex_network = ppo_cfg.get('use_complex_network', False)
+    
+    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg, use_complex_network=use_complex_network)
+    print(f"Using {'complex (Residual)' if use_complex_network else 'simple'} policy network")
+    
+    # Set curriculum exploration parameters from config
+    curriculum_cfg = train_cfg.get('curriculum', {})
+    optimizer.exploration_start = curriculum_cfg.get('exploration_start', 0.5)
+    optimizer.exploration_end = curriculum_cfg.get('exploration_end', 0.05)
+    optimizer.exploration_decay_episodes = curriculum_cfg.get('exploration_decay_episodes', 50)
+    
+    # Set reward shaping parameters from config
+    reward_shaping_cfg = train_cfg.get('reward_shaping', {})
+    optimizer.reward_mode = reward_shaping_cfg.get('mode', 'efficiency')  # 'standard', 'efficiency', or 'hybrid'
+    optimizer.ll_threshold = reward_shaping_cfg.get('ll_threshold', -10.0)
+    optimizer.hard_cap_ll = reward_shaping_cfg.get('hard_cap_ll', -8.0)
+    optimizer.length_bonus_scale = reward_shaping_cfg.get('length_bonus_scale', 3.0)
+    
+    print(f"Curriculum exploration: start={optimizer.exploration_start}, end={optimizer.exploration_end}, decay_episodes={optimizer.exploration_decay_episodes}")
+    print(f"Reward shaping: mode={optimizer.reward_mode}, ll_threshold={optimizer.ll_threshold}, hard_cap_ll={optimizer.hard_cap_ll}, length_bonus_scale={optimizer.length_bonus_scale}")
+    
     # Prepare metrics output
     metrics_dir = "results"
     os.makedirs(metrics_dir, exist_ok=True)
@@ -351,7 +374,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
-                gcg_candidate_size=gcg_steps,
+                gcg_candidate_size=gcg_batch_size,
+                gcg_steps_per_action=gcg_steps,
                 base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
@@ -452,7 +476,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
-                gcg_candidate_size=gcg_steps,
+                gcg_candidate_size=gcg_batch_size,
+                gcg_steps_per_action=gcg_steps,
                 base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
@@ -463,17 +488,24 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             # --- batch-level trace logging ---
             try:
                 if traces:
-                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    print(f"Batch traces (total entries={len(traces)}) - showing per-episode metrics:")
                     # If many trace entries, show head/tail to avoid huge logs
                     show_all = len(traces) <= 50
                     entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
                     for t in entries_to_show:
-                        if 'likelihoods' in t:
+                        ep = t.get('episode', '?')
+                        # Format with rewards, likelihoods, and lengths together for clarity
+                        if 'likelihoods' in t and 'rewards' in t and 'lengths' in t:
                             ll = t['likelihoods']
-                            print(f"  Ep {t.get('episode', '?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                            rw = t['rewards']
+                            ln = t['lengths']
+                            print(f"  Ep {ep}: LL={[f'{v:.2f}' for v in ll]}, R={[f'{v:.2f}' for v in rw]}, Len={ln}")
+                        elif 'likelihoods' in t:
+                            ll = t['likelihoods']
+                            print(f"  Ep {ep} likelihoods: {[f'{v:.3f}' for v in ll]}")
                         elif 'best_likelihoods' in t:
                             bl = t['best_likelihoods']
-                            print(f"  Ep {t.get('episode', '?')} step {t.get('step', '?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                            print(f"  Ep {ep} step {t.get('step', '?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
                         else:
                             # generic trace dump
                             print(f"  trace entry: {t}")
@@ -564,7 +596,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 max_suffix_len=max_suffix_len,
                 init_len=init_len,
                 gcg_top_k=gcg_top_k,
-                gcg_candidate_size=gcg_steps,
+                gcg_candidate_size=gcg_batch_size,
+                gcg_steps_per_action=gcg_steps,
                 base_prompts=batch_bases,
                 wandb_log_fn=wandb_cb,
                 global_step_offset=(batch_start // batch_size) * steps_per_episode,
@@ -630,16 +663,23 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             # --- batch-level trace logging for discrete optimizer ---
             try:
                 if traces:
-                    print(f"Batch traces (total entries={len(traces)}) - showing per-step likelihoods/rewards:")
+                    print(f"Batch traces (total entries={len(traces)}) - showing per-episode metrics:")
                     show_all = len(traces) <= 50
                     entries_to_show = traces if show_all else (traces[:10] + traces[-10:])
                     for t in entries_to_show:
-                        if 'best_likelihoods' in t:
+                        ep = t.get('episode', '?')
+                        # Format with rewards, likelihoods, and lengths together for clarity
+                        if 'likelihoods' in t and 'rewards' in t and 'lengths' in t:
+                            ll = t['likelihoods']
+                            rw = t['rewards']
+                            ln = t['lengths']
+                            print(f"  Ep {ep}: LL={[f'{v:.2f}' for v in ll]}, R={[f'{v:.2f}' for v in rw]}, Len={ln}")
+                        elif 'best_likelihoods' in t:
                             bl = t['best_likelihoods']
-                            print(f"  Ep {t.get('episode','?')} step {t.get('step','?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
+                            print(f"  Ep {ep} step {t.get('step','?')} best_likelihoods: {[f'{v:.3f}' for v in bl]}")
                         elif 'likelihoods' in t:
                             ll = t['likelihoods']
-                            print(f"  Ep {t.get('episode','?')} likelihoods: {[f'{v:.3f}' for v in ll]}")
+                            print(f"  Ep {ep} likelihoods: {[f'{v:.3f}' for v in ll]}")
                         else:
                             print(f"  trace entry: {t}")
                     if not show_all:
