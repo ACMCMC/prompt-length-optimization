@@ -9,7 +9,10 @@ from typing import Tuple
 from tqdm import tqdm
 from ..interface import BasePromptOptimizer
 from ..model_inputs import ModelBatchedInput
+import logging
 
+
+logging.basicConfig(level=logging.INFO)
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
     """
@@ -189,7 +192,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_sequences: Full candidate sequences [search_width * B, max_suffix_len]
             update_info: List of (prompt_idx, candidate_idx, pos, new_token) for each update
         """
-        vocab_size = self.embedding_layer.weight.shape[0]
         embedding_weights = self.embedding_layer.weight  # [vocab_size, emb_dim]
 
         # Project gradients onto vocabulary space: grad @ W^T
@@ -527,7 +529,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                                 current_lls[prompt_idx].item()
                                 - old_best_lls[prompt_idx].item()
                             )
-                            print(
+                            logging.debug(
                                 f"GCG iter {gcg_iter+1} prompt {prompt_idx+1}: pos {pos} '{old_token_str}' -> '{new_token_str}', Δll={ll_change:.4f}"
                             )
 
@@ -547,9 +549,14 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         if (ll_deltas < -1e-6).any():
             num_decreased = (ll_deltas < 0).sum().item()
             min_delta = ll_deltas.min().item()
-            print(
+            logging.warning(
                 f"Warning: GCG decreased likelihood for {num_decreased} prompts in this step (min Δll={min_delta:.4f})."
             )
+            
+        # Sanity check: check that all the tokens in the non-active positions are BOS
+        # It's possible that after we increased length, and then decreased it, the non-active positions are not BOS. So just in case if that happens we raise a warning. But we don't fail.
+        if not (prompt_data[suffix_mask == 0] == self.agent.tokenizer.bos_token_id).all():
+            logging.warning("Warning: Tokens in non-active positions are not BOS")
 
         return prompt_data, final_likelihoods
 

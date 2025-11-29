@@ -18,7 +18,7 @@ from prompt_optimization.optimizers import (
     DiscretePromptOptimizer,
 )
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 class LengthPolicyOptimizer:
@@ -482,7 +482,7 @@ class LengthPolicyOptimizer:
                     []
                 )  # Store actions for GRPO importance sampling computation
 
-                logger.info(
+                logging.info(
                     f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_idx + 1}, {steps_per_episode} steps"
                 )
 
@@ -510,7 +510,7 @@ class LengthPolicyOptimizer:
                         or (step + 1) % 10 == 0
                         or step == steps_per_episode - 1
                     ):
-                        logger.info(
+                        logging.info(
                             f"  Step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})"
                         )
 
@@ -542,7 +542,7 @@ class LengthPolicyOptimizer:
                         if torch.any(torch.isnan(action_logits)) or torch.any(
                             torch.isinf(action_logits)
                         ):
-                            logger.warning(
+                            logging.warning(
                                 f"Policy network produced NaN/Inf values. States range: [{states.min().item():.2f}, {states.max().item():.2f}]"
                             )
                             action_logits = torch.where(
@@ -604,7 +604,7 @@ class LengthPolicyOptimizer:
                             .squeeze(-1)
                             .tolist()
                         )
-                        print(
+                        logging.warning(
                             f"Step {step+1}: Optimizing prompts {[i+1 for i in optimize_indices]} (action=optimize_suffix)"
                         )
 
@@ -751,7 +751,7 @@ class LengthPolicyOptimizer:
                         if (ll_deltas_step < -1e-6).any():
                             num_decreased = (ll_deltas_step < 0).sum().item()
                             min_delta = ll_deltas_step.min().item()
-                            print(
+                            logging.warning(
                                 f"Warning: optimize_suffix step {step+1} decreased likelihood for {num_decreased} prompts (min Δll={min_delta:.4f})."
                             )
 
@@ -773,7 +773,7 @@ class LengthPolicyOptimizer:
                     )  # [batch_B]
 
                     # Debug log: likelihoods, lengths, rewards
-                    print(
+                    logging.debug(
                         f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, len={lengths.mean().item():.1f}, reward={step_rewards.mean().item():.2f}"
                     )
 
@@ -931,7 +931,7 @@ class LengthPolicyOptimizer:
                     sequence_text = self.agent.tokenizer.decode(
                         active_tokens, skip_special_tokens=True
                     )
-                    print(
+                    logging.info(
                         f"Episode {episode+1} final seq {i+1}: ll={final_likelihoods[i].item():.2f}, len={len_val}, reward={final_rewards[i].item():.2f}, seq='{sequence_text[:50]}...'"
                     )
 
@@ -1020,7 +1020,7 @@ class LengthPolicyOptimizer:
                     if torch.any(torch.isnan(action_logits)) or torch.any(
                         torch.isinf(action_logits)
                     ):
-                        logger.warning(
+                        logging.warning(
                             f"Policy network produced NaN/Inf values during training. States range: [{states_tensor.min().item():.2f}, {states_tensor.max().item():.2f}]"
                         )
                         action_logits = torch.where(
@@ -1065,7 +1065,7 @@ class LengthPolicyOptimizer:
                     if torch.any(torch.isnan(new_values)) or torch.any(
                         torch.isinf(new_values)
                     ):
-                        logger.warning(
+                        logging.warning(
                             f"Value network produced NaN/Inf values. States range: [{states_tensor.min().item():.2f}, {states_tensor.max().item():.2f}]"
                         )
                         # Replace with zeros to prevent training crash
