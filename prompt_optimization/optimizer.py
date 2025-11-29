@@ -33,8 +33,13 @@ class LengthPolicyOptimizer:
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
         
         # Simple policy network: state -> action probs
+        # State features (4 dims):
+        #   0: normalized length (current_len / initial_len)
+        #   1: current length (tokens)
+        #   2: current log-likelihood
+        #   3: ratio current_ll / initial_ll
         # Uses LayerNorm to handle raw log-likelihood values (can be large negative numbers)
-        self.state_dim = 2  # [length, likelihood]
+        self.state_dim = 4
         self.policy_net = nn.Sequential(
             nn.Linear(self.state_dim, policy_hidden_size),
             nn.LayerNorm(policy_hidden_size),  # Normalize activations to handle large input ranges
@@ -390,11 +395,20 @@ class LengthPolicyOptimizer:
                         logger.info(f"  Step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})")
                     
                     # Compute states for policy (inference only, no gradients)
-                    # Use last known likelihood (or 0 if not yet computed)
+                    # Features:
+                    #   - normalized length: current_len / initial_len
+                    #   - current length (float)
+                    #   - current log-likelihood
+                    #   - ratio current_ll / initial_ll (normalized like length)
+                    lengths_float = lengths.float()
+                    norm_length = lengths_float / float(initial_prompt_length)
+                    ll_ratio = last_known_likelihoods / (initial_likelihoods + 1e-8)
                     states = torch.stack([
-                        lengths / initial_prompt_length,  # normalized length
-                        last_known_likelihoods,  # last known likelihood (updated when optimize_suffix is called)
-                    ], dim=1)  # [batch_B, 2]
+                        norm_length,
+                        lengths_float,
+                        last_known_likelihoods,
+                        ll_ratio,
+                    ], dim=1)  # [batch_B, 4]
                     
                     # Policy forward pass (INFERENCE ONLY - no gradients, no updates)
                     # Policy network is in eval mode and we're only collecting data
