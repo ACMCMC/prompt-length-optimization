@@ -529,6 +529,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     
     def run_batch_optimization(batch_prompts, mode, batch_idx, episode_idx, num_batches):
         """Run batch optimization for a given mode and episode. Returns (results, rewards, traces, policy_metrics)."""
+        prefixes = [p.get('base', '') for p in batch_prompts]
         targets = [p.get('target', '') for p in batch_prompts]
         logger.debug(f"Running batched {mode} optimizer on batch size={len(batch_prompts)}, episode {episode_idx+1}")
         
@@ -553,13 +554,14 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         
         # Run only ONE episode for this batch (we cycle through episodes in the outer loop)
         best_results, best_rewards_batch, traces, policy_metrics = optimizer.optimize_prompts_batch(
+            prefixes=prefixes,
             target_completions=targets,
             episodes=1,  # Only one episode per call
-                        steps_per_episode=steps_per_episode,
-                        initial_prompt_length=init_len,
-                        lr_embeddings=lr_embeddings,
-                        alpha=alpha,
-                        beta=beta,
+            steps_per_episode=steps_per_episode,
+            initial_prompt_length=init_len,
+            lr_embeddings=lr_embeddings,
+            alpha=alpha,
+            beta=beta,
             mode=mode,
             batch_size=batch_size,
             max_suffix_len=max_suffix_len,

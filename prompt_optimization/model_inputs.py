@@ -62,33 +62,20 @@ class ModelBatchedInput:
     
     def _tokenize_prefix(self, prefix_texts: List[str]):
         """Tokenize prefix texts and create attention masks using tokenizer batching."""
-        if not prefix_texts or all(not text for text in prefix_texts):
-            # Empty prefix
-            self.prefix_input_ids = torch.empty(self.batch_size, 0, dtype=torch.long, device=self.device)
-            self.prefix_attention_mask = torch.empty(self.batch_size, 0, dtype=torch.long, device=self.device)
-            self.prefix_lengths = torch.zeros(self.batch_size, dtype=torch.long, device=self.device)
-            self.max_prefix_len = 0
-        else:
-            # Use tokenizer's batch processing with left padding
-            original_padding_side = self.tokenizer.padding_side
-            self.tokenizer.padding_side = 'left'  # Left padding for prefix
-            
-            # Batch tokenize with padding
-            tokenized = self.tokenizer(
-                prefix_texts,
-                add_special_tokens=False,
-                padding=True,
-                return_tensors='pt',
-                truncation=False
-            )
-            
-            # Restore original padding side
-            self.tokenizer.padding_side = original_padding_side
-            
-            self.prefix_input_ids = tokenized['input_ids'].to(self.device)
-            self.prefix_attention_mask = tokenized['attention_mask'].to(self.device)
-            self.prefix_lengths = self.prefix_attention_mask.sum(dim=1)
-            self.max_prefix_len = self.prefix_input_ids.shape[1]
+        # Batch tokenize with padding
+        tokenized = self.tokenizer(
+            prefix_texts,
+            add_special_tokens=False,
+            padding=True,
+            return_tensors='pt',
+            truncation=False,
+            padding_side='left',
+        )
+        
+        self.prefix_input_ids = tokenized['input_ids'].to(self.device)
+        self.prefix_attention_mask = tokenized['attention_mask'].to(self.device)
+        self.prefix_lengths = self.prefix_attention_mask.sum(dim=1)
+        self.max_prefix_len = self.prefix_input_ids.shape[1]
     
     def _tokenize_completion(self, completion_texts: List[str]):
         """Tokenize completion texts and create attention masks using tokenizer batching."""
@@ -324,6 +311,10 @@ class ModelBatchedInput:
         
         # Completion starts after prefix and suffix
         completion_start_pos = max_len + self.max_suffix_len
+
+        # Assert that completion_start_pos is the sum of the lengths of the prefix, and suffix
+        assert completion_start_pos == self.max_prefix_len + self.max_suffix_len, \
+            f"Completion start position is not the sum of the lengths of the prefix and suffix, got {completion_start_pos}, expected {self.max_prefix_len + self.max_suffix_len}"
         
         return inputs_embeds, attention_mask, suffix_mask, completion_start_pos
     
@@ -373,6 +364,10 @@ class ModelBatchedInput:
         
         # Completion starts after prefix and suffix
         completion_start_pos = max_len + self.max_suffix_len
+
+        # Assert that completion_start_pos is the sum of the lengths of the prefix, and suffix
+        assert completion_start_pos == self.max_prefix_len + self.max_suffix_len, \
+            f"Completion start position is not the sum of the lengths of the prefix and suffix, got {completion_start_pos}, expected {self.prefix_input_ids.size(-1) + self.suffix_input_ids.size(-1)}"
         
         return input_ids, attention_mask, completion_start_pos
 

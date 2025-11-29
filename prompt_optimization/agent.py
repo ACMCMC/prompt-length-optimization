@@ -89,43 +89,52 @@ class PromptRLAgent:
         if max_comp_actual == 0:
             return torch.zeros(B, dtype=torch.float32, device=device, requires_grad=requires_grad)
         
-        # For continuous_proj mode: 
-        # - During optimization (requires_grad=True): use embeddings directly to preserve gradients
-        # - For reward computation (requires_grad=False): project to tokens for accurate likelihood
-        if model_input.original_mode == 'continuous_proj' and not requires_grad:
-            # Project suffix embeddings to nearest token IDs (for reward computation only)
-            suffix_embeds = model_input.suffix_embeddings  # [B, max_suffix_len, D]
-            suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
-            suffix_token_ids = self._project_embeddings_to_tokens(suffix_embeds, suffix_mask)  # [B, max_suffix_len]
-            
-            # Temporarily store projected suffix tokens in model_input for concatenation
-            # (similar to how discrete mode works)
-            original_suffix_input_ids = model_input.suffix_input_ids
-            model_input.suffix_input_ids = suffix_token_ids
-            
-            # Use the same concatenation logic as discrete mode
-            input_ids, attention_mask, completion_start_pos = model_input.get_model_input_ids_and_attention_mask()
-            
-            # Restore original suffix_input_ids (in case it's used elsewhere)
-            model_input.suffix_input_ids = original_suffix_input_ids
-            
-            # Use token-based forward pass (like discrete mode)
-            inputs_embeds = self.model.get_input_embeddings()(input_ids)
-        elif model_input.mode == 'continuous' or (model_input.original_mode == 'continuous_proj' and requires_grad):
-            inputs_embeds, attention_mask, suffix_mask, completion_start_pos = model_input.get_model_input_embeds_and_attention_mask()
-            # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
-            # Only suffix embeddings have gradients
-        else:
-            # For discrete mode, we need embeddings for forward pass
-            input_ids, attention_mask, completion_start_pos = model_input.get_model_input_ids_and_attention_mask()
-            inputs_embeds = self.model.get_input_embeddings()(input_ids)
-        
-        # Forward pass with attention mask
         context = torch.enable_grad() if requires_grad else torch.no_grad()
         with context:
-            outputs = self.model.gpt_neox(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-            hidden_states = outputs.last_hidden_state  # [B, seq_len, hidden]
-            logits = self.model.embed_out(hidden_states)  # [B, seq_len, vocab]
+        
+            # For continuous_proj mode: 
+            # - During optimization (requires_grad=True): use embeddings directly to preserve gradients
+            # - For reward computation (requires_grad=False): project to tokens for accurate likelihood
+            if model_input.original_mode == 'continuous_proj' and not requires_grad:
+                # Project suffix embeddings to nearest token IDs (for reward computation only)
+                suffix_embeds = model_input.suffix_embeddings  # [B, max_suffix_len, D]
+                suffix_mask = model_input.suffix_attention_mask  # [B, max_suffix_len]
+                suffix_token_ids = self._project_embeddings_to_tokens(suffix_embeds, suffix_mask)  # [B, max_suffix_len]
+                
+                # Temporarily store projected suffix tokens in model_input for concatenation
+                # (similar to how discrete mode works)
+                original_suffix_input_ids = model_input.suffix_input_ids
+                model_input.suffix_input_ids = suffix_token_ids
+                
+                # Use the same concatenation logic as discrete mode
+                input_ids, attention_mask, completion_start_pos = model_input.get_model_input_ids_and_attention_mask()
+                
+                # Restore original suffix_input_ids (in case it's used elsewhere)
+                model_input.suffix_input_ids = original_suffix_input_ids
+                
+                # Use token-based forward pass (like discrete mode)
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+                # Forward pass with attention mask
+                outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+                logits = outputs.logits  # [B, seq_len, vocab]
+            elif model_input.mode == 'continuous' or (model_input.original_mode == 'continuous_proj' and requires_grad):
+                inputs_embeds, attention_mask, suffix_mask, completion_start_pos = model_input.get_model_input_embeds_and_attention_mask()
+                # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
+                # Only suffix embeddings have gradients
+                # Forward pass with attention mask
+                outputs = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+                logits = outputs.logits  # [B, seq_len, vocab]
+            elif model_input.mode == 'discrete':
+                # For discrete mode, we need embeddings for forward pass
+                input_ids, attention_mask, completion_start_pos = model_input.get_model_input_ids_and_attention_mask()
+
+                # Forward pass with attention mask
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits  # [B, seq_len, vocab]
+            else:
+                raise ValueError(f"Invalid mode: {model_input.mode}")
+        
         
         # Extract logits for completion positions (before each completion token)
         # Completion starts at completion_start_pos, so we extract from completion_start_pos-1 to completion_start_pos-1+max_comp_actual
