@@ -141,12 +141,30 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         )
         logits = outputs.logits  # [B, seq_len, vocab]
 
-        # Compute loss (negative log likelihood of completion)
-        loss = -logits.sum(dim=-1).mean()
+        # Compute completion log-likelihood (match get_likelihoods_batch behavior)
+        completion_start = model_input.get_completion_start_pos()
+        comp_logits = logits[
+            :,
+            completion_start - 1 : -1,
+            :,
+        ]
+        comp_tokens = model_input.completion_input_ids
+        comp_mask = model_input.completion_attention_mask.bool()
+        log_probs = F.log_softmax(comp_logits, dim=-1)
+        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        loss = -masked_log_probs.sum(dim=-1).mean()
 
         # Backward to get gradients
         loss.backward()
         gradients = suffix_embeds.grad.clone()  # [B, max_suffix_len, emb_dim]
+
+        # Zero-out gradients for inactive suffix positions (attention mask = 0)
+        inactive_mask = (model_input.suffix_attention_mask == 0).unsqueeze(-1)
+        if inactive_mask.any():
+            gradients = gradients.masked_fill(inactive_mask, 0.0)
 
         # Clear gradients and intermediate tensors to free memory
         if suffix_embeds.grad is not None:
@@ -378,9 +396,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     -1
                 )  # [chunk_size, max_comp_len]
 
-                comp_mask = torch.arange(candidate_completion_input_ids.size(-1), device=self.device).unsqueeze(
-                    0
-                ) < candidate_completion_input_ids.size(-1)
+                comp_mask = model_input.completion_attention_mask[prompt_indices].bool()
                 masked_log_probs = torch.where(
                     comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
                 )

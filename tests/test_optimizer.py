@@ -18,7 +18,7 @@ def test_optimizer_initialization(optimizer):
     assert optimizer.agent is not None
     assert optimizer.policy_net is not None
     assert optimizer.policy_optimizer is not None
-    assert optimizer.state_dim == 4
+    assert optimizer.state_dim == 5
 
 def test_prepare_completions(optimizer):
     """Test completion preparation"""

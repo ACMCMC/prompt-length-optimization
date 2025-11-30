@@ -56,6 +56,16 @@ class ModelBatchedInput:
         self.max_suffix_len = max_suffix_len
         self.init_len = init_len
         self.pad_id = getattr(tokenizer, "pad_token_id", 0)
+        self.vocab_size = len(tokenizer)
+        self.special_token_ids = {
+            tok
+            for tok in [
+                self.pad_id,
+                tokenizer.eos_token_id,
+                tokenizer.bos_token_id,
+            ]
+            if tok is not None
+        }
 
         # Tokenize prefix and completion
         self._tokenize_prefix(prefix_texts)
@@ -106,7 +116,7 @@ class ModelBatchedInput:
         """Initialize suffix with BOS tokens and attention mask."""
         bos_token_id = self._get_bos_token_id()
 
-        # Initialize suffix input_ids to BOS tokens
+        # Initialize suffix input_ids to BOS tokens (inactive positions stay BOS)
         self.suffix_input_ids = torch.full(
             (self.batch_size, self.max_suffix_len),
             bos_token_id,
@@ -120,6 +130,14 @@ class ModelBatchedInput:
         )
         self.suffix_attention_mask[:, : self.init_len] = 1
 
+        # Replace active positions with random tokens to avoid identical BOS initialization
+        if self.init_len > 0:
+            num_active = self.batch_size * self.init_len
+            random_tokens = self._sample_random_tokens(num_active).view(
+                self.batch_size, self.init_len
+            )
+            self.suffix_input_ids[:, : self.init_len] = random_tokens
+
     def _get_bos_token_id(self) -> int:
         """Get BOS token ID, falling back to EOS if BOS is not available."""
         bos_token_id = (
@@ -130,6 +148,26 @@ class ModelBatchedInput:
         if bos_token_id is None:
             bos_token_id = 0
         return bos_token_id
+
+    def _sample_random_tokens(self, count: int) -> torch.Tensor:
+        """Sample random token IDs excluding known special tokens."""
+        if count <= 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        random_tokens = torch.randint(
+            0, self.vocab_size, (count,), device=self.device, dtype=torch.long
+        )
+        if self.special_token_ids:
+            special_tensor = torch.tensor(
+                list(self.special_token_ids), device=self.device, dtype=torch.long
+            )
+            invalid_mask = torch.isin(random_tokens, special_tensor)
+            while invalid_mask.any():
+                num_invalid = invalid_mask.sum().item()
+                random_tokens[invalid_mask] = torch.randint(
+                    0, self.vocab_size, (num_invalid,), device=self.device, dtype=torch.long
+                )
+                invalid_mask = torch.isin(random_tokens, special_tensor)
+        return random_tokens
 
     def get_bos_embedding(self) -> torch.Tensor:
         """Get BOS token embedding for initialization (continuous mode)."""
@@ -173,6 +211,12 @@ class ModelBatchedInput:
             dtype=torch.long,
             device=self.device,
         )
+        if self.init_len > 0:
+            num_active = self.batch_size * self.init_len
+            random_tokens = self._sample_random_tokens(num_active).view(
+                self.batch_size, self.init_len
+            )
+            suffix_tokens[:, : self.init_len] = random_tokens
         return suffix_tokens
 
     def _compute_embeddings(self):

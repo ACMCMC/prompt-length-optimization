@@ -16,7 +16,7 @@ train:
   
   # Training parameters per prompt
   episodes_per_prompt: 3             # Episodes to train on each prompt
-  steps_per_episode: 25            # Steps per episode (increased for better RL learning)
+  steps_per_episode: 100            # Steps per episode (increased for better RL learning)
   init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
   max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
@@ -52,9 +52,9 @@ train:
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:
     top_k: 64
-    batch_size: 64  # Number of candidates per position (reduced to avoid OOM)
-    max_batch_size: 256  # Maximum batch size for forward passes (to avoid OOM)
-    steps: 5
+    batch_size: 512  # Number of candidates per position
+    max_batch_size: 256  # Maximum batch size for forward passes (to avoid OOM), this modifies the above batch size to limit the number of elements per forward pass
+    steps: 1
   
   # GRPO parameters (Group Relative Policy Optimization)
   grpo:
