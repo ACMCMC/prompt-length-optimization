@@ -116,22 +116,47 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             suffix_mask: Active positions mask [B, max_suffix_len] (1=active, 0=inactive)
 
         Returns:
-            gradients: Gradients w.r.t. embeddings [B, max_suffix_len, emb_dim]
+            gradients: Gradients w.r.t. vocab logits [B, max_suffix_len, vocab_size]
         """
-        # Convert tokens to embeddings with gradients enabled, we use the best tokens because we want to compute the gradients w.r.t. the best tokens.
-        suffix_embeds = self.embedding_layer(best_tokens)
+        vocab_size = self.embedding_layer.weight.shape[0]
+        dtype = self.embedding_layer.weight.dtype
 
-        suffix_embeds.requires_grad_(True)
-        suffix_embeds.retain_grad()  # Required for non-leaf tensors to retain gradients
+        # Build differentiable one-hot representation for suffix tokens
+        suffix_one_hot = torch.zeros(
+            best_tokens.shape[0],
+            self.max_suffix_len,
+            vocab_size,
+            device=self.device,
+            dtype=dtype,
+        )
+        suffix_one_hot.scatter_(2, best_tokens.unsqueeze(-1), 1.0)
+        suffix_one_hot.requires_grad_(True)
+        suffix_one_hot.retain_grad()
 
-        # We need to cat prefix, suffix and completion embeddings and attention masks to be able to do a forward pass and get the logits.
-        prefix_embeds = self.embedding_layer(model_input.prefix_input_ids)
-        completion_embeds = self.embedding_layer(model_input.completion_input_ids)
-        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, completion_embeds], dim=1)
+        suffix_embeds = torch.matmul(
+            suffix_one_hot, self.embedding_layer.weight
+        )  # [B, max_suffix_len, emb_dim]
+
+        # Mask out inactive suffix positions (no contribution to embeddings)
+        suffix_mask = model_input.suffix_attention_mask.unsqueeze(-1).to(dtype)
+        suffix_embeds = suffix_embeds * suffix_mask
+
+        # Prefix and completion embeddings (detached, no gradients)
+        prefix_embeds = self.embedding_layer(model_input.prefix_input_ids).detach()
+        completion_embeds = self.embedding_layer(
+            model_input.completion_input_ids
+        ).detach()
+
+        inputs_embeds = torch.cat(
+            [prefix_embeds, suffix_embeds, completion_embeds], dim=1
+        )
         prefix_attention_mask = model_input.prefix_attention_mask
         completion_attention_mask = model_input.completion_attention_mask
         suffix_attention_mask = model_input.suffix_attention_mask
-        attention_mask = torch.cat([prefix_attention_mask, suffix_attention_mask, completion_attention_mask], dim=1)
+        attention_mask = torch.cat(
+            [prefix_attention_mask, suffix_attention_mask, completion_attention_mask],
+            dim=1,
+        )
 
         # The suffix mask is the mask of the suffix positions in the fully batched input. But it's not the same as the suffix attention mask. The suffix attention mask is the mask of where the model should pay attention to, while the suffix mask is the mask we use ourselves to know which positions are active and thus where we can replace tokens.
 
@@ -159,12 +184,19 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         # Backward to get gradients
         loss.backward()
-        gradients = suffix_embeds.grad.clone()  # [B, max_suffix_len, emb_dim]
+        gradients = suffix_one_hot.grad.clone()  # [B, max_suffix_len, vocab_size]
+
+        # Clear grad reference on one-hot tensor
+        suffix_one_hot.grad = None
 
         # Zero-out gradients for inactive suffix positions (attention mask = 0)
         inactive_mask = (model_input.suffix_attention_mask == 0).unsqueeze(-1)
         if inactive_mask.any():
             gradients = gradients.masked_fill(inactive_mask, 0.0)
+
+        # Normalize gradients per position (avoid divide-by-zero)
+        grad_norm = gradients.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        gradients = gradients / grad_norm
 
         # Clear gradients and intermediate tensors to free memory
         if suffix_embeds.grad is not None:
@@ -202,7 +234,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         Args:
             prompt_data: Current suffix tokens [B, max_suffix_len]
-            gradients: Gradients w.r.t. embeddings [B, max_suffix_len, emb_dim]
+            gradients: Gradients w.r.t. vocab logits [B, max_suffix_len, vocab_size]
             suffix_mask: Active positions mask [B, max_suffix_len]
             n_replace: Number of positions to update per candidate (default 1)
 
@@ -210,15 +242,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_sequences: Full candidate sequences [search_width * B, max_suffix_len]
             update_info: List of (prompt_idx, candidate_idx, pos, new_token) for each update
         """
-        embedding_weights = self.embedding_layer.weight  # [vocab_size, emb_dim]
-
-        # Project gradients onto vocabulary space: grad @ W^T
-        # This gives us gradient w.r.t. each possible token at each position
-        grad_proj = gradients @ embedding_weights.T  # [B, max_suffix_len, vocab_size]
-
         # Get top-k tokens for each position: [B, max_suffix_len, top_k]
         topk_ids = (
-            (-grad_proj).topk(self.gcg_top_k, dim=-1).indices
+            (-gradients).topk(self.gcg_top_k, dim=-1).indices
         )  # [B, max_suffix_len, top_k]
 
         search_width = (
@@ -229,69 +255,55 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         all_candidate_sequences = []
         all_update_info = []
 
-        # Use actual batch size from prompt_data (may be subset)
         actual_batch_size = prompt_data.shape[0]
         for prompt_idx in range(actual_batch_size):
-            # Get active positions for this prompt
             active_positions = torch.nonzero(
                 suffix_mask[prompt_idx] == 1, as_tuple=False
-            ).squeeze(
-                -1
-            )  # [num_active]
+            ).squeeze(-1)
 
-            if len(active_positions) == 0:
+            if active_positions.numel() == 0:
                 continue
 
-            num_active = len(active_positions)
+            num_active = active_positions.shape[0]
 
-            # Start with original sequence, repeat for all candidates
-            original_sequence = prompt_data[
-                prompt_idx : prompt_idx + 1
-            ]  # [1, max_suffix_len]
-            candidate_sequences = original_sequence.repeat(
-                search_width, 1
-            )  # [search_width, max_suffix_len]
+            # Start from current sequence
+            original_sequence = prompt_data[prompt_idx : prompt_idx + 1]
+            candidate_sequences = original_sequence.repeat(search_width, 1)
 
-            # For each candidate, randomly select n_replace positions to update
-            # sampled_ids_pos: [search_width, n_replace] indices into active_positions
-            # We use argsort of random values to randomly sample without replacement
-            random_vals = torch.rand((search_width, num_active), device=self.device)
-            sampled_pos_indices = torch.argsort(random_vals, dim=-1)[
-                ..., :n_replace
-            ]  # [search_width, n_replace]
-            sampled_active_pos = active_positions[
-                sampled_pos_indices
-            ]  # [search_width, n_replace]
+            # Deterministically spaced positions (similar to reference implementation)
+            if search_width == 1:
+                position_indices = torch.zeros(
+                    1, dtype=torch.long, device=self.device
+                )
+            else:
+                position_indices = torch.linspace(
+                    0,
+                    num_active - 1,
+                    steps=search_width,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            selected_positions = active_positions[position_indices]  # [search_width]
 
-            # For each candidate and each position to update, sample a token from top-k
-            # sampled_ids_val: [search_width, n_replace] token IDs
-            # topk_ids[prompt_idx] is [max_suffix_len, top_k]
-            # sampled_active_pos is [search_width, n_replace] - indices into max_suffix_len
-            # We need to gather from topk_ids for each position
-            topk_for_positions = topk_ids[prompt_idx][
-                sampled_active_pos
-            ]  # [search_width, n_replace, top_k]
+            # For each candidate, sample replacement token from top-k of that position
+            topk_for_prompt = topk_ids[prompt_idx]  # [max_suffix_len, top_k]
             random_indices = torch.randint(
-                0, self.gcg_top_k, (search_width, n_replace, 1), device=self.device
+                0, self.gcg_top_k, (search_width, 1), device=self.device
             )
             candidate_tokens = torch.gather(
-                topk_for_positions, 2, random_indices
-            ).squeeze(
-                2
-            )  # [search_width, n_replace]
+                topk_for_prompt[selected_positions], 1, random_indices
+            ).squeeze(-1)
 
-            # Update candidate sequences using scatter
-            # scatter_(dim, index, src) where index and src have same shape
-            candidate_sequences.scatter_(1, sampled_active_pos, candidate_tokens)
+            candidate_sequences.scatter_(
+                1, selected_positions.unsqueeze(-1), candidate_tokens.unsqueeze(-1)
+            )
 
             all_candidate_sequences.append(candidate_sequences)
 
-            # Store update info: (prompt_idx, candidate_idx, pos, new_token)
             for cand_idx in range(search_width):
-                for replace_idx in range(n_replace):
-                    pos = sampled_active_pos[cand_idx, replace_idx].item()
-                    new_token = candidate_tokens[cand_idx, replace_idx].item()
-                    all_update_info.append((prompt_idx, cand_idx, pos, new_token))
+                pos = selected_positions[cand_idx].item()
+                new_token = candidate_tokens[cand_idx].item()
+                all_update_info.append((prompt_idx, cand_idx, pos, new_token))
 
         if len(all_candidate_sequences) == 0:
             return (
@@ -303,7 +315,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         candidate_sequences_tensor = torch.cat(
             all_candidate_sequences, dim=0
-        )  # [search_width * B, max_suffix_len]
+        )  # [search_width * num_prompts, max_suffix_len]
         return candidate_sequences_tensor, all_update_info
 
     def _test_candidates_batch(
@@ -400,9 +412,8 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 masked_log_probs = torch.where(
                     comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
                 )
-                losses = -masked_log_probs.sum(
-                    dim=-1
-                )  # [chunk_size] (negative log likelihood)
+                token_counts = comp_mask.sum(dim=-1).clamp_min(1)
+                losses = -masked_log_probs.sum(dim=-1) / token_counts
 
             all_losses.append(losses.cpu())  # Move to CPU to free GPU memory
 
@@ -512,6 +523,12 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             # Only keep improvements
             improve_mask = current_lls > best_lls
             best_lls = torch.where(improve_mask, current_lls, best_lls)
+
+            # Revert tokens for prompts that did not improve
+            if (~improve_mask).any():
+                keep_mask = improve_mask.unsqueeze(-1)
+                best_tokens = torch.where(keep_mask, best_tokens, old_tokens)
+                model_input.update_suffix_tokens(best_tokens)
 
             # Debug log: token replacements and likelihood changes (reusing computed values)
             for prompt_idx in range(num_prompts):
