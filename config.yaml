@@ -14,7 +14,7 @@ train:
     project: prompt-length-optimization
     run_name: default
   # Dataset parameters
-  max_prompts: 8                  # Number of prompts to train on
+  max_prompts: 32                  # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   
@@ -32,7 +32,7 @@ train:
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 8                      # Prompts per batch for progress tracking
+  batch_size: 16                      # Prompts per batch for progress tracking
   
   # Output
   save_path: models/trained_policy_complex.pt

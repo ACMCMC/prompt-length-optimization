@@ -71,14 +71,11 @@ class PromptRLAgent:
         
         max_prefix = prefix_tokens.shape[1] if prefix_tokens.numel() > 0 else 0
         max_comp = completion_tokens.shape[1]
-        print("max_comp :", max_comp)
-        print("max_prefix :", max_prefix)
-        print("L_suffix :", L_suffix)
+
         # Build full sequence structure with LEFT padding for prefix and RIGHT padding for completion
         # Structure: [left_pad] + [prefix] + [suffix] + [completion] + [right_pad]
         # Total fixed length = max_prefix + L_suffix + max_comp
         max_seq = max_prefix + L_suffix + max_comp
-        print("max_seq :", max_seq)
         # Initialize everything with padding embeddings
         inputs_embeds = pad_embed.unsqueeze(0).unsqueeze(0).repeat(B, max_seq, 1).clone().to(device)
         
@@ -150,7 +147,6 @@ class PromptRLAgent:
         comp_logits = logits[:, pos_comp_start - 1:pos_comp_start - 1 + max_comp_actual, :]  # [B, max_comp_actual, vocab]
         # Extract completion tokens
         comp_tokens = completion_tokens[:, :max_comp_actual]
-        print("comp tokens : ", comp_tokens)
         
         # Compute log probabilities
         log_probs = F.log_softmax(comp_logits, dim=-1)
@@ -164,8 +160,6 @@ class PromptRLAgent:
         
         # Sum over completion length to get total log likelihood
         likelihoods = masked_log_probs.sum(dim=-1)  # [B]
-        print("Likelihoods shape:", likelihoods.shape)
-        print("likelihood : ",likelihoods)
         return likelihoods
     
     def get_random_token(self) -> int:
