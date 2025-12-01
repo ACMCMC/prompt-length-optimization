@@ -45,63 +45,62 @@ class LengthPolicyOptimizer:
         self.agent = agent
         self.emb_dim = agent.model.get_input_embeddings().weight.shape[1]
 
-        # Simple policy network: state -> action probs
-        # State features (5 dims):
-        #   0: normalized length (current_len / initial_len)
-        #   1: current length (tokens)
-        #   2: current log-likelihood
-        #   3: ratio current_ll / initial_ll
-        #   4: percentage of episode elapsed (0 -> 1)
+        # Normalization constants for log-likelihoods (typical range: -35 to -5)
+        self.LL_MIN = -35.0  # Bad likelihood
+        self.LL_MAX = -5.0   # Good likelihood
+        self.LL_RANGE = self.LL_MAX - self.LL_MIN  # = 30
+
+        # Action history for state representation (track last N actions per item in batch)
+        self.action_history_len = 5
+
+        # Enhanced policy network: state -> action probs
+        # State features (9 dims) - all normalized to roughly [-1, 1] range:
+        #   0: len_norm_scaled - normalized length centered at init_len
+        #   1: ll_norm - current likelihood (normalized to [0,1])
+        #   2: delta_ll_norm - change from previous step (normalized)
+        #   3: best_ll_norm - running best LL (normalized)
+        #   4: step_ratio - episode progress [-1, 1]
+        #   5: ll_per_token_norm - efficiency metric (normalized)
+        #   6: steps_remaining_norm - time budget [-1, 1]
+        #   7: recent_add_scaled - recent ADD action frequency [-1, 1]
+        #   8: recent_remove_scaled - recent REMOVE action frequency [-1, 1]
         #
-        # NOTE: We intentionally do NOT use LayerNorm here anymore.
-        # With such a low-dimensional state, LayerNorm was normalizing away most
-        # of the variation across states, making the policy almost state-agnostic
-        # within an episode (nearly constant action_prob_*). We rely instead on
-        # stable returns/advantage normalization and small initial weights.
-        self.state_dim = 5
+        # NOTE: We use Tanh activations for bounded gradients and better stability
+        # with normalized inputs.
+        self.state_dim = 9
         self.policy_net = nn.Sequential(
-            nn.Linear(self.state_dim, policy_hidden_size),
-            nn.ReLU(),
-            nn.Linear(
-                policy_hidden_size, 3
-            ),  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
+            nn.Linear(self.state_dim, 64),
+            nn.Tanh(),  # Tanh instead of ReLU for bounded gradients
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 3),  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
         ).to(agent.device)
 
-        # Initialize policy network with small weights for first layer
+        # Initialize output layer with larger weights so initial policy isn't uniform
         with torch.no_grad():
-            first_layer = self.policy_net[0]
-            if isinstance(first_layer, nn.Linear):
-                # Use smaller initialization for first layer to handle raw log-likelihoods
-                nn.init.xavier_uniform_(
-                    first_layer.weight, gain=0.1
-                )  # Smaller gain for stability
-                first_layer.bias.zero_()
+            nn.init.orthogonal_(self.policy_net[-1].weight, gain=1.0)
+            nn.init.zeros_(self.policy_net[-1].bias)
 
         # Value network for GRPO (estimates state values)
-        # Mirror architecture of policy_net, also without LayerNorm for the same reason.
+        # Mirror architecture of policy_net with Tanh activations
         self.value_net = nn.Sequential(
-            nn.Linear(self.state_dim, policy_hidden_size),
-            nn.ReLU(),
-            nn.Linear(policy_hidden_size, 1),  # Single value output
+            nn.Linear(self.state_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1),  # Single value output
         ).to(agent.device)
 
-        # Initialize value network with small weights for first layer to handle large inputs
-        # This prevents activations from saturating with large negative likelihoods
+        # Initialize value network output layer
         with torch.no_grad():
-            # Initialize first layer with smaller weights to handle large input ranges
-            first_layer = self.value_net[0]
-            if isinstance(first_layer, nn.Linear):
-                # Use smaller initialization for first layer to handle raw log-likelihoods
-                nn.init.xavier_uniform_(
-                    first_layer.weight, gain=0.1
-                )  # Smaller gain for stability
-                first_layer.bias.zero_()
+            nn.init.orthogonal_(self.value_net[-1].weight, gain=value_init_gain)
+            nn.init.zeros_(self.value_net[-1].bias)
 
-            # Initialize last layer with standard initialization
-            last_layer = self.value_net[-1]
-            if isinstance(last_layer, nn.Linear):
-                nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
-                last_layer.bias.zero_()
+        # Print network info
+        policy_params = sum(p.numel() for p in self.policy_net.parameters())
+        value_params = sum(p.numel() for p in self.value_net.parameters())
+        logging.info(f"[Network] Policy params: {policy_params:,}, Value params: {value_params:,}")
+        logging.info(f"[Network] State dim: {self.state_dim}, Action history len: {self.action_history_len}")
 
         self.max_grad_norm = max_grad_norm
 
@@ -491,13 +490,22 @@ class LengthPolicyOptimizer:
                 self.policy_net.eval()
                 self.value_net.eval()
 
-                # Track last known likelihood for state representation
+                # Track likelihoods and action history for enhanced state representation
                 # Use the *real* initial likelihoods instead of a placeholder 0
                 with torch.no_grad():
                     initial_likelihoods = optimizer.get_likelihoods(
                         prompt_data, lengths, model_input, requires_grad=False
                     )
                 last_known_likelihoods = initial_likelihoods.clone()
+                prev_ll = initial_likelihoods.clone()  # For delta_ll computation
+                best_ll = initial_likelihoods.clone()  # Track best LL achieved
+                
+                # Initialize action history (track last N actions per item in batch)
+                # -1 indicates no action taken yet
+                action_history = torch.full(
+                    (batch_B, self.action_history_len), -1, dtype=torch.long, device=device
+                )
+                
                 # Precompute completion lengths to report per-token likelihoods
                 completion_token_counts = (
                     model_input.completion_attention_mask.sum(dim=1).float().clamp(min=1.0)
@@ -519,31 +527,66 @@ class LengthPolicyOptimizer:
                             f"  Step {step+1}/{steps_per_episode} (Episode {episode+1}, Batch {batch_idx + 1})"
                         )
 
-                    # Compute states for policy (inference only, no gradients)
-                    # Features:
-                    #   - normalized length: current_len / initial_len
-                    #   - current length (float)
-                    #   - current log-likelihood
-                    #   - ratio current_ll / initial_ll (normalized like length)
+                    # Compute enhanced states for policy (9 features, all normalized)
+                    # ===== FEATURE COMPUTATION =====
                     lengths_float = lengths.float()
-                    norm_length = lengths_float / float(initial_prompt_length)
-                    ll_ratio = last_known_likelihoods / (initial_likelihoods + 1e-8)
-                    progress = torch.full(
-                        (batch_B,),
-                        step / max(steps_per_episode - 1, 1),
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    states = torch.stack(
-                        [
-                            norm_length,
-                            lengths_float,
-                            last_known_likelihoods,
-                            ll_ratio,
-                            progress,
-                        ],
-                        dim=1,
-                    )  # [batch_B, 5]
+                    safe_lengths = lengths_float.clamp(min=1.0)
+                    
+                    # Feature 0: Length normalized and centered at init_len [-1, 1]
+                    len_norm_scaled = (lengths_float / float(initial_prompt_length) - 1.0)  # centered at 0
+                    
+                    # Feature 1: Current LL normalized to [0, 1]
+                    # Clamp likelihoods to expected range to prevent extreme values
+                    likelihoods_clamped = last_known_likelihoods.clamp(self.LL_MIN, self.LL_MAX)
+                    ll_norm = (likelihoods_clamped - self.LL_MIN) / self.LL_RANGE  # [0, 1]
+                    
+                    # Feature 2: Delta LL (change from previous step) normalized
+                    delta_ll = last_known_likelihoods - prev_ll
+                    delta_ll_norm = delta_ll / 5.0  # Typical delta range is ~[-5, 5]
+                    delta_ll_norm = delta_ll_norm.clamp(-1.0, 1.0)
+                    
+                    # Feature 3: Best LL so far (normalized)
+                    best_ll_clamped = best_ll.clamp(self.LL_MIN, self.LL_MAX)
+                    best_ll_norm = (best_ll_clamped - self.LL_MIN) / self.LL_RANGE
+                    
+                    # Feature 4: Step ratio (progress through episode) [-1, 1]
+                    step_ratio = step / max(steps_per_episode - 1, 1)
+                    
+                    # Feature 5: LL per token (efficiency) normalized
+                    ll_per_token = likelihoods_clamped / safe_lengths
+                    # Typical range: -1.5 to -0.2, normalize to roughly [-1, 1]
+                    ll_per_token_norm = (ll_per_token + 0.85) * 2.0  # center around -0.85
+                    ll_per_token_norm = ll_per_token_norm.clamp(-1.0, 1.0)
+                    
+                    # Feature 6: Steps remaining normalized [-1, 1]
+                    steps_remaining_norm = 1.0 - step_ratio
+                    
+                    # Feature 7 & 8: Recent action frequencies
+                    # Count ADD (action=2) and REMOVE (action=1) in recent history
+                    valid_history_mask = action_history >= 0  # Only count valid actions
+                    valid_count = valid_history_mask.float().sum(dim=1).clamp(min=1.0)
+                    recent_add_ratio = ((action_history == 2) & valid_history_mask).float().sum(dim=1) / valid_count
+                    recent_remove_ratio = ((action_history == 1) & valid_history_mask).float().sum(dim=1) / valid_count
+                    
+                    # Scale ratios to [-1, 1] centered at 0.5
+                    recent_add_scaled = (recent_add_ratio - 0.5) * 2.0
+                    recent_remove_scaled = (recent_remove_ratio - 0.5) * 2.0
+                    
+                    # Build state vector [batch_B, 9]
+                    states = torch.stack([
+                        len_norm_scaled,        # 0: normalized length (centered at init_len)
+                        ll_norm,                # 1: current likelihood (normalized)
+                        delta_ll_norm,          # 2: change from previous step (normalized)
+                        best_ll_norm,           # 3: running best LL (normalized)
+                        torch.full((batch_B,), step_ratio * 2.0 - 1.0, device=device),  # 4: step ratio [-1, 1]
+                        ll_per_token_norm,      # 5: efficiency (normalized)
+                        torch.full((batch_B,), steps_remaining_norm * 2.0 - 1.0, device=device),  # 6: time budget [-1, 1]
+                        recent_add_scaled,      # 7: recent ADD frequency [-1, 1]
+                        recent_remove_scaled,   # 8: recent REMOVE frequency [-1, 1]
+                    ], dim=1)  # [batch_B, state_dim=9]
+                    
+                    # Update prev_ll for next step's delta computation
+                    prev_ll = last_known_likelihoods.clone()
 
                     # Policy forward pass (INFERENCE ONLY - no gradients, no updates)
                     # Policy network is in eval mode and we're only collecting data
@@ -784,6 +827,13 @@ class LengthPolicyOptimizer:
                         alpha * last_known_likelihoods - beta * lengths
                     )  # [batch_B]
                     likelihoods_per_token = last_known_likelihoods / completion_token_counts
+
+                    # Update best_ll tracking (for state feature 3)
+                    best_ll = torch.maximum(best_ll, last_known_likelihoods)
+                    
+                    # Update action history (shift left, add new action at end)
+                    action_history = torch.roll(action_history, shifts=-1, dims=1)
+                    action_history[:, -1] = actions
 
                     # Debug log: likelihoods, lengths, rewards
                     logging.debug(
