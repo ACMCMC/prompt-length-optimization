@@ -1,5 +1,5 @@
 # Configuration for toxic-chat dataset training and evaluation
-model: EleutherAI/pythia-70m
+model: EleutherAI/pythia-410m
 seed: 2262
 
 # Dataset split ratios (must sum to 1.0)
@@ -41,9 +41,9 @@ train:
   plots_format: pdf                  # png|pdf (default: pdf)
 
   optimization_mode: discrete
-  gcg_top_k: 32                      # INCREASED from 16 - more token options per position
-  gcg_batch_size: 128                # INCREASED from 32 - 4x more candidates = faster convergence
-  gcg_steps: 5                      # INCREASED from 3 - need more steps to reach good LL (-2 to -5)
+  gcg_top_k: 16                      # INCREASED from 16 - more token options per position
+  gcg_batch_size: 32                # INCREASED from 32 - 4x more candidates = faster convergence
+  gcg_steps: 10                      # INCREASED from 3 - need more steps to reach good LL (-2 to -5)
   # Set optimization_mode to 'ppo_parallel' to enable batched PPO policy training
   ppo:
     epochs: 4                        # INCREASED for larger network (was 2) - more updates per batch

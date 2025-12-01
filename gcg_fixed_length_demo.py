@@ -50,7 +50,7 @@ def decode_tokens(agent: PromptRLAgent, token_ids: List[int]) -> str:
 
 
 def score_suffix(agent: PromptRLAgent, prefix_ids: List[int], suffix_ids: torch.Tensor,
-                 completion_ids: torch.Tensor) -> torch.Tensor:
+                 completion_ids: torch.Tensor,) -> torch.Tensor:
     """Compute log P(completion | prefix + suffix) for a batch of suffix candidates."""
     device = agent.device
     embedding_layer = agent.model.get_input_embeddings()
@@ -64,6 +64,12 @@ def score_suffix(agent: PromptRLAgent, prefix_ids: List[int], suffix_ids: torch.
         prefix_tensor = pref.unsqueeze(0).expand(suffix_ids.shape[0], -1)
         prefix_lengths = torch.full((suffix_ids.shape[0],), len(prefix_ids), device=device, dtype=torch.long)
     suffix_embeds = embedding_layer(suffix_ids.to(device))
+    print("Scoring suffixes, batch size =", suffix_ids.shape[0])
+    print("Suffix shape:", suffix_ids.shape, "Completion shape:", comp_batch.shape)
+    print("Prefix shape:", prefix_tensor.shape if prefix_tensor is not None else None)
+    print("Prefix lengths:", prefix_lengths)
+    print("Completion shape:", comp_batch.shape)
+    print("Completion lengths:", comp_lengths)
     ll_batch = agent.get_likelihoods_batch(
         suffix_embeds,
         comp_batch,
@@ -72,6 +78,7 @@ def score_suffix(agent: PromptRLAgent, prefix_ids: List[int], suffix_ids: torch.
         prefix_tokens=prefix_tensor,
         prefix_lengths=prefix_lengths,
     )
+    print("Log-likelihoods:", ll_batch)
     return ll_batch
 
 
@@ -229,6 +236,10 @@ def main() -> None:
         print(f"  Full prompt tokens  : {full_prompt_ids}")
         decoded = decode_tokens(agent, full_prompt_ids)
         print(f"  Full prompt text    : {decoded if decoded else '<decoded to empty string>'}")
+        full_sequence_ids = prefix_ids + best["suffix"] + completion_ids
+        print(f"  Full sequence tokens (prefix+suffix+completion): {full_sequence_ids}")
+        full_sequence_text = decode_tokens(agent, full_sequence_ids)
+        print(f"  Full sequence text  : {full_sequence_text if full_sequence_text else '<decoded to empty string>'}")
         if args.print_trace:
             print("\nTrace for best length:")
             for i, v in enumerate(best["trace"], 1):
@@ -293,6 +304,10 @@ def main() -> None:
         print(f"  Full prompt tokens  : {full_prompt_ids}")
         decoded = decode_tokens(agent, full_prompt_ids)
         print(f"  Full prompt text    : {decoded if decoded else '<decoded to empty string>'}")
+        full_sequence_ids = prefix_ids + res["suffix"] + completion_ids
+        print(f"  Full sequence tokens (prefix+suffix+completion): {full_sequence_ids}")
+        full_sequence_text = decode_tokens(agent, full_sequence_ids)
+        print(f"  Full sequence text  : {full_sequence_text if full_sequence_text else '<decoded to empty string>'}")
 
         if args.print_trace:
             print("\nLikelihood trace (per pass):")
