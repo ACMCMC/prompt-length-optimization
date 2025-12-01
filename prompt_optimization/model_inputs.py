@@ -84,6 +84,10 @@ class ModelBatchedInput:
 
     def _tokenize_prefix(self, prefix_texts: List[str]):
         """Tokenize prefix texts and create attention masks using tokenizer batching."""
+        # Save original padding side and set to left for prefix
+        original_padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        self.tokenizer.padding_side = 'left'
+        
         # Batch tokenize with padding
         tokenized = self.tokenizer(
             prefix_texts,
@@ -91,23 +95,31 @@ class ModelBatchedInput:
             padding=True,
             return_tensors="pt",
             truncation=False,
-            padding_side="left",
         )
+        
+        # Restore original padding side
+        self.tokenizer.padding_side = original_padding_side
 
         self.prefix_input_ids = tokenized["input_ids"].to(self.device)
         self.prefix_attention_mask = tokenized["attention_mask"].to(self.device)
 
     def _tokenize_completion(self, completion_texts: List[str]):
         """Tokenize completion texts and create attention masks using tokenizer batching."""
-        # Use tokenizer's batch processing with right padding (default)
+        # Save original padding side and set to right for completion
+        original_padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        self.tokenizer.padding_side = 'right'
+        
+        # Use tokenizer's batch processing with right padding
         tokenized = self.tokenizer(
             completion_texts,
             add_special_tokens=False,
             padding=True,
             return_tensors="pt",
             truncation=False,
-            padding_side="right",
         )
+        
+        # Restore original padding side
+        self.tokenizer.padding_side = original_padding_side
 
         self.completion_input_ids = tokenized["input_ids"].to(self.device)
         self.completion_attention_mask = tokenized["attention_mask"].to(self.device)
