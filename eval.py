@@ -42,8 +42,6 @@ def load_trained_model(model_path):
     grpo_gae_lambda = grpo_cfg.get('gae_lambda', 0.95)
     grpo_value_coef = grpo_cfg.get('value_coef', 0.5)
     policy_hidden_size = policy_cfg.get('hidden_size', 64)
-    value_init_bias = policy_cfg.get('value_init_bias', -1000.0)
-    value_init_gain = policy_cfg.get('value_init_gain', 0.1)
     max_grad_norm = grpo_cfg.get('max_grad_norm', 0.5)
     
     agent = PromptRLAgent(model_name=model_name)
@@ -60,8 +58,6 @@ def load_trained_model(model_path):
         grpo_gae_lambda=grpo_gae_lambda,
         grpo_value_coef=grpo_value_coef,
         policy_hidden_size=policy_hidden_size,
-        value_init_bias=value_init_bias,
-        value_init_gain=value_init_gain,
         max_grad_norm=max_grad_norm
     )
     

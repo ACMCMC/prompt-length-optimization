@@ -520,9 +520,13 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 model_input, requires_grad=False
             )
 
-            # Only keep improvements
+            # Only keep improvements (restore previous tokens for non-improving prompts)
             improve_mask = current_lls > best_lls
-            best_lls = torch.where(improve_mask, current_lls, best_lls)
+            if improve_mask.any():
+                best_lls = torch.where(improve_mask, current_lls, best_lls)
+            best_tokens = torch.where(
+                improve_mask.view(-1, 1), best_tokens, old_tokens
+            )
 
             # Revert tokens for prompts that did not improve
             if (~improve_mask).any():

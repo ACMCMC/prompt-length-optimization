@@ -68,8 +68,6 @@ train:
   # Policy network architecture
   policy:
     hidden_size: 64                  # Hidden layer size for policy and value networks
-    value_init_bias: -1000.0         # Initial bias for value network output layer
-    value_init_gain: 0.1            # Initial weight gain for value network output layer
 
 eval:
   # Test dataset parameters

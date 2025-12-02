@@ -257,8 +257,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     # Policy network architecture parameters
     policy_cfg = train_cfg['policy']
     policy_hidden_size = policy_cfg['hidden_size']
-    value_init_bias = policy_cfg['value_init_bias']
-    value_init_gain = policy_cfg['value_init_gain']
     max_grad_norm = grpo_cfg['max_grad_norm']
     
     optimizer = LengthPolicyOptimizer(
@@ -274,8 +272,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         grpo_gae_lambda=grpo_gae_lambda,
         grpo_value_coef=grpo_value_coef,
         policy_hidden_size=policy_hidden_size,
-        value_init_bias=value_init_bias,
-        value_init_gain=value_init_gain,
         max_grad_norm=max_grad_norm
     )
     

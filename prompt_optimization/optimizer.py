@@ -38,8 +38,6 @@ class LengthPolicyOptimizer:
         grpo_gae_lambda: float,
         grpo_value_coef: float,
         policy_hidden_size: int,
-        value_init_bias: float,
-        value_init_gain: float,
         max_grad_norm: float,
     ):
         self.agent = agent
@@ -67,16 +65,6 @@ class LengthPolicyOptimizer:
             ),  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
         ).to(agent.device)
 
-        # Initialize policy network with small weights for first layer
-        with torch.no_grad():
-            first_layer = self.policy_net[0]
-            if isinstance(first_layer, nn.Linear):
-                # Use smaller initialization for first layer to handle raw log-likelihoods
-                nn.init.xavier_uniform_(
-                    first_layer.weight, gain=0.1
-                )  # Smaller gain for stability
-                first_layer.bias.zero_()
-
         # Value network for GRPO (estimates state values)
         # Mirror architecture of policy_net, also without LayerNorm for the same reason.
         self.value_net = nn.Sequential(
@@ -84,24 +72,6 @@ class LengthPolicyOptimizer:
             nn.ReLU(),
             nn.Linear(policy_hidden_size, 1),  # Single value output
         ).to(agent.device)
-
-        # Initialize value network with small weights for first layer to handle large inputs
-        # This prevents activations from saturating with large negative likelihoods
-        with torch.no_grad():
-            # Initialize first layer with smaller weights to handle large input ranges
-            first_layer = self.value_net[0]
-            if isinstance(first_layer, nn.Linear):
-                # Use smaller initialization for first layer to handle raw log-likelihoods
-                nn.init.xavier_uniform_(
-                    first_layer.weight, gain=0.1
-                )  # Smaller gain for stability
-                first_layer.bias.zero_()
-
-            # Initialize last layer with standard initialization
-            last_layer = self.value_net[-1]
-            if isinstance(last_layer, nn.Linear):
-                nn.init.xavier_uniform_(last_layer.weight, gain=value_init_gain)
-                last_layer.bias.zero_()
 
         self.max_grad_norm = max_grad_norm
 
@@ -906,10 +876,6 @@ class LengthPolicyOptimizer:
                         avg_likelihood = last_known_likelihoods.mean().item()
                         avg_likelihood_per_token = likelihoods_per_token.mean().item()
                         avg_length = lengths.mean().item()
-                        avg_best_likelihood = best_likelihoods.float().mean().item()
-                        avg_best_likelihood_per_token = (
-                            best_likelihoods_per_token.mean().item()
-                        )
 
                         # Action distribution: probabilities from policy (before sampling)
                         policy_action_probs = action_probs.mean(
@@ -932,8 +898,6 @@ class LengthPolicyOptimizer:
                             "step/avg_likelihood": avg_likelihood,
                             "step/avg_likelihood_per_token": avg_likelihood_per_token,
                             "step/avg_length": avg_length,
-                            "step/avg_best_likelihood": avg_best_likelihood,
-                            "step/avg_best_likelihood_per_token": avg_best_likelihood_per_token,
                             "step/action_prob_optimize": policy_action_probs[0].item(),
                             "step/action_prob_decrease": policy_action_probs[1].item(),
                             "step/action_prob_increase": policy_action_probs[2].item(),
@@ -973,8 +937,18 @@ class LengthPolicyOptimizer:
                 final_lengths = model_input.suffix_attention_mask.sum(
                     dim=1
                 ).float()  # [batch_B]
+                # Use normalized per-token log-likelihoods to keep reward magnitudes stable
+                per_token_mean = final_likelihoods_per_token.mean().detach()
+                per_token_std = (
+                    final_likelihoods_per_token.std(unbiased=False).clamp(min=1.0).detach()
+                )
+                normalized_ll_per_token = (
+                    final_likelihoods_per_token - per_token_mean
+                ) / per_token_std
+                max_suffix_len = float(model_input.max_suffix_len)
+                length_ratio = (final_lengths / max_suffix_len).clamp(max=1.0)
                 final_rewards = (
-                    alpha * final_likelihoods - beta * final_lengths
+                    alpha * normalized_ll_per_token - beta * length_ratio
                 )  # [batch_B]
 
                 # Debug log: final sequences at episode end
