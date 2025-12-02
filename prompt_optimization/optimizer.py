@@ -687,10 +687,14 @@ class LengthPolicyOptimizer:
                                 ]
 
                             def get_suffix_start_pos(self):
-                                return self._full_input.get_suffix_start_pos()
+                                return self._full_input.get_suffix_start_pos()[
+                                    self._indices
+                                ]
 
                             def get_completion_start_pos(self):
-                                return self._full_input.get_completion_start_pos()
+                                return self._full_input.get_completion_start_pos()[
+                                    self._indices
+                                ]
 
                         subset_model_input = SubsetModelInput(
                             model_input, optimize_indices

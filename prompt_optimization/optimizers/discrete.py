@@ -118,12 +118,13 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         Returns:
             gradients: Gradients w.r.t. vocab logits [B, max_suffix_len, vocab_size]
         """
+        batch_size = best_tokens.shape[0]
         vocab_size = self.embedding_layer.weight.shape[0]
+        embed_dim = self.embedding_layer.weight.shape[1]
         dtype = self.embedding_layer.weight.dtype
 
-        # Build differentiable one-hot representation for suffix tokens
         suffix_one_hot = torch.zeros(
-            best_tokens.shape[0],
+            batch_size,
             self.max_suffix_len,
             vocab_size,
             device=self.device,
@@ -133,50 +134,68 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         suffix_one_hot.requires_grad_(True)
         suffix_one_hot.retain_grad()
 
-        suffix_embeds = torch.matmul(
-            suffix_one_hot, self.embedding_layer.weight
-        )  # [B, max_suffix_len, emb_dim]
+        prefix_mask = model_input.prefix_attention_mask.bool()
+        suffix_mask = model_input.suffix_attention_mask.bool()
+        completion_mask = model_input.completion_attention_mask.bool()
+        prefix_lengths = prefix_mask.sum(dim=1)
+        suffix_lengths = suffix_mask.sum(dim=1)
+        completion_lengths = completion_mask.sum(dim=1)
+        total_lengths = prefix_lengths + suffix_lengths + completion_lengths
+        max_len = int(total_lengths.max().item()) if batch_size > 0 else 0
 
-        # Mask out inactive suffix positions (no contribution to embeddings)
-        suffix_mask = model_input.suffix_attention_mask.unsqueeze(-1).to(dtype)
-        suffix_embeds = suffix_embeds * suffix_mask
+        inputs_embeds = torch.zeros(
+            (batch_size, max_len, embed_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+        attention_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.long, device=self.device
+        )
+        completion_start_pos = torch.zeros(
+            batch_size, dtype=torch.long, device=self.device
+        )
 
-        # Prefix and completion embeddings (detached, no gradients)
         prefix_embeds = self.embedding_layer(model_input.prefix_input_ids).detach()
         completion_embeds = self.embedding_layer(
             model_input.completion_input_ids
         ).detach()
 
-        inputs_embeds = torch.cat(
-            [prefix_embeds, suffix_embeds, completion_embeds], dim=1
-        )
-        prefix_attention_mask = model_input.prefix_attention_mask
-        completion_attention_mask = model_input.completion_attention_mask
-        suffix_attention_mask = model_input.suffix_attention_mask
-        attention_mask = torch.cat(
-            [prefix_attention_mask, suffix_attention_mask, completion_attention_mask],
-            dim=1,
-        )
+        for idx in range(batch_size):
+            pos = 0
+            prefix_len = int(prefix_lengths[idx].item())
+            if prefix_len > 0:
+                prefix_segment = prefix_embeds[idx][prefix_mask[idx]]
+                inputs_embeds[idx, pos : pos + prefix_len] = prefix_segment
+                attention_mask[idx, pos : pos + prefix_len] = 1
+                pos += prefix_len
 
-        # The suffix mask is the mask of the suffix positions in the fully batched input. But it's not the same as the suffix attention mask. The suffix attention mask is the mask of where the model should pay attention to, while the suffix mask is the mask we use ourselves to know which positions are active and thus where we can replace tokens.
+            suffix_len = int(suffix_lengths[idx].item())
+            if suffix_len > 0:
+                suffix_segment = torch.matmul(
+                    suffix_one_hot[idx, :suffix_len], self.embedding_layer.weight
+                )
+                inputs_embeds[idx, pos : pos + suffix_len] = suffix_segment
+                attention_mask[idx, pos : pos + suffix_len] = 1
+                pos += suffix_len
 
-        # Forward pass
+            completion_start_pos[idx] = pos
+            completion_len = int(completion_lengths[idx].item())
+            if completion_len > 0:
+                completion_segment = completion_embeds[idx][completion_mask[idx]]
+                inputs_embeds[idx, pos : pos + completion_len] = completion_segment
+                attention_mask[idx, pos : pos + completion_len] = 1
+
         outputs = self.agent.model(
             inputs_embeds=inputs_embeds, attention_mask=attention_mask
         )
         logits = outputs.logits  # [B, seq_len, vocab]
 
-        # Compute completion log-likelihood (match get_likelihoods_batch behavior)
-        completion_start = model_input.get_completion_start_pos()
-        comp_logits = logits[
-            :,
-            completion_start - 1 : -1,
-            :,
-        ]
-        comp_tokens = model_input.completion_input_ids
-        comp_mask = model_input.completion_attention_mask.bool()
-        log_probs = F.log_softmax(comp_logits, dim=-1)
-        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)
+        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+            logits,
+            completion_start_pos,
+            model_input.completion_input_ids,
+            completion_mask,
+        )
         masked_log_probs = torch.where(
             comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
         )
@@ -199,21 +218,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         gradients = gradients / grad_norm
 
         # Clear gradients and intermediate tensors to free memory
-        if suffix_embeds.grad is not None:
-            suffix_embeds.grad = None
-        del (
-            loss,
-            outputs,
-            logits,
-            prefix_embeds,
-            suffix_embeds,
-            completion_embeds,
-            inputs_embeds,
-            prefix_attention_mask,
-            suffix_attention_mask,
-            completion_attention_mask,
-            attention_mask,
-        )
+        del (loss, outputs, logits, inputs_embeds, attention_mask)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -339,10 +344,11 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         if total_candidates == 0:
             return torch.empty(0, dtype=torch.float32, device=self.device)
 
-        # Get base concatenated input_ids structure from ModelBatchedInput
-        base_input_ids, base_attention_mask  = (
-            model_input.get_model_input_ids_and_attention_mask()
-        )
+        base_input_ids, base_attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        suffix_start_all = model_input.get_suffix_start_pos()
+        suffix_lengths_all = model_input.suffix_attention_mask.sum(dim=1).long()
+        completion_start_all = model_input.get_completion_start_pos()
+        completion_mask_all = model_input.completion_attention_mask.bool()
 
         all_losses = []
 
@@ -372,11 +378,16 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 prompt_indices
             ].clone()  # [chunk_size, seq_len]
 
-            # Replace suffix tokens with candidate sequences
-            suffix_start_pos = model_input.get_suffix_start_pos()
-            candidate_input_ids[
-                :, suffix_start_pos : suffix_start_pos + self.max_suffix_len
-            ] = chunk_sequences
+            suffix_start_batch = suffix_start_all[prompt_indices]
+            suffix_lengths_batch = suffix_lengths_all[prompt_indices]
+            for row in range(chunk_size):
+                length = int(suffix_lengths_batch[row].item())
+                if length == 0:
+                    continue
+                start = int(suffix_start_batch[row].item())
+                candidate_input_ids[row, start : start + length] = chunk_sequences[
+                    row, :length
+                ]
 
             # Get completion data for each candidate
             candidate_completion_input_ids = model_input.completion_input_ids[
@@ -392,23 +403,14 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 hidden_states = outputs.last_hidden_state
                 logits = self.agent.model.embed_out(hidden_states)
 
-                # Compute losses (negative log likelihood)
-                completion_start_pos = model_input.get_completion_start_pos()
-                comp_logits = logits[
-                    :,
-                    completion_start_pos - 1 : -1,
-                    :,
-                ]  # [chunk_size, max_comp_len, vocab]
-                comp_tokens = candidate_completion_input_ids  # [chunk_size, max_comp_len]
-
-                log_probs = F.log_softmax(comp_logits, dim=-1)
-                token_log_probs = log_probs.gather(
-                    2, comp_tokens.unsqueeze(-1)
-                ).squeeze(
-                    -1
-                )  # [chunk_size, max_comp_len]
-
-                comp_mask = model_input.completion_attention_mask[prompt_indices].bool()
+                comp_start_batch = completion_start_all[prompt_indices]
+                comp_mask_batch = completion_mask_all[prompt_indices]
+                token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+                    logits,
+                    comp_start_batch,
+                    candidate_completion_input_ids,
+                    comp_mask_batch,
+                )
                 masked_log_probs = torch.where(
                     comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
                 )
@@ -423,9 +425,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 outputs,
                 hidden_states,
                 logits,
-                comp_logits,
-                comp_tokens,
-                log_probs,
                 token_log_probs,
                 masked_log_probs,
                 losses,
@@ -527,12 +526,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             best_tokens = torch.where(
                 improve_mask.view(-1, 1), best_tokens, old_tokens
             )
-
-            # Revert tokens for prompts that did not improve
-            if (~improve_mask).any():
-                keep_mask = improve_mask.unsqueeze(-1)
-                best_tokens = torch.where(keep_mask, best_tokens, old_tokens)
-                model_input.update_suffix_tokens(best_tokens)
+            model_input.update_suffix_tokens(best_tokens)
 
             # Debug log: token replacements and likelihood changes (reusing computed values)
             for prompt_idx in range(num_prompts):
@@ -620,3 +614,45 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     ) -> torch.Tensor:
         """Clone a single prompt's tokens."""
         return prompt_data[idx, :length].clone()
+
+    def _completion_token_log_probs_from_logits(
+        self,
+        logits: torch.Tensor,
+        completion_start_pos: torch.Tensor,
+        completion_tokens: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather per-token log probabilities for completion tokens given logits.
+        Returns (token_log_probs, mask).
+        """
+        batch_size = logits.size(0)
+        if batch_size == 0:
+            return logits.new_zeros((0, 0)), completion_mask[:, :0]
+
+        completion_lengths = completion_mask.sum(dim=1)
+        max_len = (
+            int(completion_lengths.max().item()) if completion_lengths.numel() > 0 else 0
+        )
+        if max_len == 0:
+            return logits.new_zeros((batch_size, 0)), completion_mask[:, :0]
+
+        token_log_probs = logits.new_zeros((batch_size, max_len))
+        trimmed_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.bool, device=logits.device
+        )
+
+        for idx in range(batch_size):
+            length = int(completion_lengths[idx].item())
+            if length == 0:
+                continue
+            start = int(completion_start_pos[idx].item())
+            end = start - 1 + length
+            slice_logits = logits[idx, start - 1 : end, :]
+            log_probs = F.log_softmax(slice_logits, dim=-1)
+            tokens = completion_tokens[idx][completion_mask[idx]]
+            gathered = log_probs.gather(1, tokens.unsqueeze(-1)).squeeze(-1)
+            token_log_probs[idx, :length] = gathered
+            trimmed_mask[idx, :length] = True
+
+        return token_log_probs, trimmed_mask
