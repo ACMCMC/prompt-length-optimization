@@ -14,14 +14,14 @@ train:
     project: prompt-length-optimization
     run_name: default
   # Dataset parameters
-  max_prompts: 32                  # Number of prompts to train on
+  max_prompts: 8                  # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
   episodes_per_prompt: 20            # INCREASED - more episodes = more policy updates
   steps_per_episode: 50              # REDUCED from 100 - shorter episodes = faster policy learning
-  init_len: 16                       # Initial prompt length in tokens (tight cap)
+  init_len: 32                       # Initial prompt length in tokens (tight cap)
   
   # Optimization parameters
   lr_embeddings: 0.01
@@ -32,7 +32,7 @@ train:
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 16                      # Prompts per batch for progress tracking
+  batch_size: 8                      # Prompts per batch for progress tracking
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -81,6 +81,13 @@ train:
       do_sample: true
 
 eval:
+  # Weights & Biases logging for eval
+  wandb:
+    enable: true
+    project: prompt-length-optimization
+    run_name: eval-default
+    tags: []
+  
   # Test dataset parameters
   max_test_prompts: 200               # Number of test prompts
   min_prompt_length: 30              # Min test prompt length
@@ -89,8 +96,13 @@ eval:
   # Evaluation parameters
   init_len: 32                       # Initial prompt length
   max_policy_steps: 150               # Max policy steps per prompt
-  opt_steps: 15                      # Optimization steps (fewer for dataset eval)
   log_every_opt: 999                 # Reduce logging
+  
+  # GCG optimization settings for eval (match train for consistency)
+  optimization_mode: discrete
+  gcg_top_k: 16                      # Same as train
+  gcg_batch_size: 32                 # Same as train  
+  gcg_steps: 10                      # Same as train - need enough steps for good LL
   
   # Output
   results_file: results/eval_results.csv

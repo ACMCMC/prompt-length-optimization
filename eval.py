@@ -14,17 +14,110 @@ from prompt_optimization.datasets import ToxicChatDatasetManager
 from prompt_optimization.plotting import plot_eval_trace, save_trace_csv
 import pandas as pd
 
-def load_trained_model(model_path, reward_cfg=None):
-    """Load a trained policy model from disk."""
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
+
+def load_trained_model(model_path, cfg, reward_cfg=None):
+    """Load a trained policy model from disk.
+    
+    Args:
+        model_path: Path to the checkpoint file
+        cfg: Full config dict (to reconstruct optimizer with matching architecture)
+        reward_cfg: Optional reward config override
+    """
     checkpoint = torch.load(model_path, map_location='cpu')
     model_name = checkpoint['model_name']
     
-    # Initialize agent and optimizer  
+    # Initialize agent
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg)
     
-    # Load the trained policy weights
-    optimizer.policy_net.load_state_dict(checkpoint['policy_state_dict'])
+    # Infer network architecture from checkpoint's state_dict
+    policy_state = checkpoint['policy_state_dict']
+    
+    # Get dimensions from first layer: weight shape is [hidden1, state_dim]
+    first_layer_shape = policy_state['0.weight'].shape
+    hidden1 = first_layer_shape[0]
+    state_dim = first_layer_shape[1]
+    
+    # Get second hidden layer size from layer 2
+    hidden2 = policy_state['2.weight'].shape[0]
+    
+    # Get action dim from output layer
+    action_dim = policy_state['4.weight'].shape[0]
+    
+    print(f"[Checkpoint] Detected architecture: state_dim={state_dim}, hidden=[{hidden1}, {hidden2}], actions={action_dim}")
+    
+    # Build matching network architecture
+    policy_net = torch.nn.Sequential(
+        torch.nn.Linear(state_dim, hidden1),
+        torch.nn.Tanh(),
+        torch.nn.Linear(hidden1, hidden2),
+        torch.nn.Tanh(),
+        torch.nn.Linear(hidden2, action_dim)
+    ).to(agent.device)
+    
+    # Build matching value network if present
+    if 'value_state_dict' in checkpoint:
+        value_state = checkpoint['value_state_dict']
+        v_hidden1 = value_state['0.weight'].shape[0]
+        v_hidden2 = value_state['2.weight'].shape[0]
+        value_net = torch.nn.Sequential(
+            torch.nn.Linear(state_dim, v_hidden1),
+            torch.nn.Tanh(),
+            torch.nn.Linear(v_hidden1, v_hidden2),
+            torch.nn.Tanh(),
+            torch.nn.Linear(v_hidden2, 1)
+        ).to(agent.device)
+    else:
+        # Default value network matching policy hidden sizes
+        value_net = torch.nn.Sequential(
+            torch.nn.Linear(state_dim, hidden1),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden1, hidden2),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hidden2, 1)
+        ).to(agent.device)
+    
+    # Load weights
+    policy_net.load_state_dict(policy_state)
+    if 'value_state_dict' in checkpoint:
+        value_net.load_state_dict(checkpoint['value_state_dict'])
+    
+    # Create optimizer with default settings (we'll override the networks)
+    train_cfg = cfg.get('train', {})
+    ppo_cfg = train_cfg.get('ppo', {})
+    use_complex_network = ppo_cfg.get('use_complex_network', False)
+    
+    optimizer = LengthPolicyOptimizer(agent, reward_cfg=reward_cfg, use_complex_network=use_complex_network)
+    
+    # Replace networks with the ones we built from checkpoint
+    optimizer.policy_net = policy_net
+    optimizer.value_net = value_net
+    optimizer.state_dim = state_dim
+    
+    # Recreate optimizers for the new networks
+    optimizer.policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=1e-3)
+    optimizer.value_optimizer = torch.optim.Adam(value_net.parameters(), lr=1e-3)
+    
+    # Set curriculum exploration parameters from config
+    curriculum_cfg = train_cfg.get('curriculum', {})
+    optimizer.exploration_start = curriculum_cfg.get('exploration_start', 0.5)
+    optimizer.exploration_end = curriculum_cfg.get('exploration_end', 0.05)
+    optimizer.exploration_decay_episodes = curriculum_cfg.get('exploration_decay_episodes', 50)
+    
+    # Set reward shaping parameters from config
+    reward_shaping_cfg = train_cfg.get('reward_shaping', {})
+    optimizer.reward_mode = reward_shaping_cfg.get('mode', 'efficiency')
+    optimizer.ll_threshold = reward_shaping_cfg.get('ll_threshold', -10.0)
+    optimizer.hard_cap_ll = reward_shaping_cfg.get('hard_cap_ll', -8.0)
+    optimizer.length_bonus_scale = reward_shaping_cfg.get('length_bonus_scale', 3.0)
+    
+    print(f"Loaded policy: hidden=[{hidden1}, {hidden2}], state_dim={state_dim}")
+    print(f"Reward shaping: mode={optimizer.reward_mode}, ll_threshold={optimizer.ll_threshold}")
     
     return agent, optimizer, checkpoint
 
@@ -85,14 +178,15 @@ def evaluate_prompt(cfg, agent, optimizer):
         best_prompt_tokens = best_prompt
     else:
         best_prompt_tokens = []
-    reward, _ = optimizer._compute_total_reward(
-        teacher_ll=best_likelihood,
-        combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
-        completion_tokens=completion_tokens,
-        current_length=len(best_prompt_tokens),
+    
+    # Use compute_shaped_reward (GCG branch API)
+    reward = optimizer.compute_shaped_reward(
+        likelihoods=torch.tensor([best_likelihood], device=agent.device),
+        lengths=torch.tensor([len(best_prompt_tokens)], device=agent.device),
+        initial_prompt_length=init_len,
         alpha=alpha,
         beta=beta
-    )
+    )[0].item()
     
     # Decode the compressed prompt for display
     try:
@@ -127,9 +221,44 @@ def load_test_prompts(seed=2262, max_samples=20, min_length=30, max_length=200, 
     print(f"Loaded {len(test_prompts)} test prompts (length {min_length}-{max_length} chars)")
     return test_prompts
 
+def init_wandb_eval(cfg, model_path):
+    """Initialize wandb for evaluation run."""
+    if not WANDB_AVAILABLE:
+        print("wandb not installed, skipping logging")
+        return None
+    
+    eval_cfg = cfg.get('eval', {})
+    wandb_cfg = eval_cfg.get('wandb', {})
+    
+    if not wandb_cfg.get('enable', False):
+        print("wandb disabled in config")
+        return None
+    
+    project = wandb_cfg.get('project', cfg.get('train', {}).get('wandb', {}).get('project', 'prompt-length-optimization'))
+    run_name = wandb_cfg.get('run_name', 'eval-' + os.path.basename(model_path).replace('.pt', ''))
+    
+    run = wandb.init(
+        project=project,
+        name=run_name,
+        config={
+            'eval_config': eval_cfg,
+            'model_path': model_path,
+            'model_name': cfg.get('model', 'unknown'),
+        },
+        job_type='eval',
+        tags=['eval'] + wandb_cfg.get('tags', []),
+        reinit=True
+    )
+    print(f"wandb initialized: {run.url}")
+    return run
+
+
 def evaluate_on_dataset(cfg, model_path):
     """Evaluate the trained policy on multiple test examples."""
     eval_cfg = cfg['eval']
+    
+    # Initialize wandb if enabled
+    wandb_run = init_wandb_eval(cfg, model_path)
     
     # Load test parameters
     max_test_prompts = eval_cfg.get('max_test_prompts', 20)
@@ -195,10 +324,16 @@ def evaluate_on_dataset(cfg, model_path):
     if not test_prompts:
         raise ValueError("No test prompts found")
     
-    # Load trained model
+    # Load trained model (pass cfg so optimizer architecture matches training)
     global_reward_cfg = cfg.get('reward', {})
     eval_reward_cfg = eval_cfg.get('reward', cfg.get('train', {}).get('reward', global_reward_cfg))
-    agent, optimizer, checkpoint = load_trained_model(model_path, reward_cfg=eval_reward_cfg)
+    agent, optimizer, checkpoint = load_trained_model(model_path, cfg, reward_cfg=eval_reward_cfg)
+    
+    # IMPORTANT: Disable exploration during evaluation (deterministic policy)
+    optimizer.exploration_start = 0.0
+    optimizer.exploration_end = 0.0
+    optimizer.exploration_decay_episodes = 1
+    print("Exploration disabled for eval (deterministic policy)")
     
     print(f"Loaded model with {len(checkpoint.get('training_rewards', []))} training examples")
     best_reward_val = checkpoint.get('best_reward', None)
@@ -307,7 +442,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps,
+                    gcg_candidate_size=gcg_batch_size,
+                    gcg_steps_per_action=gcg_steps,
                     base_prompts=bases
                 )
             elif opt_mode == 'continuous':
@@ -330,7 +466,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps,
+                    gcg_candidate_size=gcg_batch_size,
+                    gcg_steps_per_action=gcg_steps,
                     base_prompts=bases
                 )
             elif opt_mode == 'discrete':
@@ -353,7 +490,8 @@ def evaluate_on_dataset(cfg, model_path):
                     max_suffix_len=max_suffix_len,
                     init_len=init_len,
                     gcg_top_k=gcg_top_k,
-                    gcg_candidate_size=gcg_steps,
+                    gcg_candidate_size=gcg_batch_size,
+                    gcg_steps_per_action=gcg_steps,
                     base_prompts=bases
                 )
             else:
@@ -421,14 +559,15 @@ def evaluate_on_dataset(cfg, model_path):
                     best_prompt_tokens = best_prompt
                 else:
                     best_prompt_tokens = []
-                reward_value, _ = optimizer._compute_total_reward(
-                    teacher_ll=final_likelihood,
-                    combined_tokens=best_prompt_tokens if best_prompt_tokens else None,
-                    completion_tokens=completion_tokens,
-                    current_length=len(best_prompt_tokens),
+                
+                # Use compute_shaped_reward (GCG branch API)
+                reward_value = optimizer.compute_shaped_reward(
+                    likelihoods=torch.tensor([final_likelihood], device=agent.device),
+                    lengths=torch.tensor([len(best_prompt_tokens)], device=agent.device),
+                    initial_prompt_length=init_len,
                     alpha=alpha,
                     beta=beta
-                )
+                )[0].item()
                 final_reward = float(reward_value)
 
                 try:
@@ -469,6 +608,17 @@ def evaluate_on_dataset(cfg, model_path):
 
                 print(f"Result: {init_len}→{result_row['final_tokens']} tokens ({result_row['compression_ratio']:.1f}% compression)")
                 print(f"Likelihood: {final_likelihood:.3f}, Avg token likelihood: {result_row['avg_likelihood'] if not np.isnan(result_row['avg_likelihood']) else 'N/A'}, Reward: {final_reward:.3f}")
+
+                # Log per-prompt metrics to wandb
+                if wandb_run:
+                    wandb.log({
+                        'prompt_id': global_idx,
+                        'final_tokens': result_row['final_tokens'],
+                        'compression_ratio': result_row['compression_ratio'],
+                        'final_likelihood': float(final_likelihood) if not np.isnan(final_likelihood) else None,
+                        'avg_likelihood': float(result_row['avg_likelihood']) if not np.isnan(result_row['avg_likelihood']) else None,
+                        'final_reward': float(final_reward) if not np.isnan(final_reward) else None,
+                    })
 
                 if save_plots and trace:
                     try:
@@ -533,16 +683,56 @@ def evaluate_on_dataset(cfg, model_path):
     if len(valid_results) != len(results):
         print(f"Failed evaluations: {len(results) - len(valid_results)}")
     
+    # Log summary metrics and results table to wandb
+    if wandb_run:
+        summary_metrics = {
+            'total_prompts': len(results),
+            'valid_prompts': len(valid_results),
+            'failed_prompts': len(results) - len(valid_results),
+        }
+        if len(valid_results) > 0:
+            summary_metrics.update({
+                'mean_compression_ratio': valid_results['compression_ratio'].mean(),
+                'std_compression_ratio': valid_results['compression_ratio'].std(),
+                'mean_final_likelihood': valid_results['final_likelihood'].mean(),
+                'std_final_likelihood': valid_results['final_likelihood'].std(),
+                'mean_final_reward': valid_results['final_reward'].mean(),
+                'std_final_reward': valid_results['final_reward'].std(),
+                'no_compression_count': int((valid_results['compression_ratio'] == 0).sum()),
+                'light_compression_count': int(((valid_results['compression_ratio'] > 0) & (valid_results['compression_ratio'] <= 25)).sum()),
+                'medium_compression_count': int(((valid_results['compression_ratio'] > 25) & (valid_results['compression_ratio'] <= 50)).sum()),
+                'heavy_compression_count': int((valid_results['compression_ratio'] > 50).sum()),
+            })
+        
+        wandb.log(summary_metrics)
+        
+        # Log results as a table
+        results_table = wandb.Table(dataframe=df)
+        wandb.log({'eval_results': results_table})
+        
+        # Save results file as artifact
+        artifact = wandb.Artifact('eval_results', type='results')
+        artifact.add_file(results_file)
+        wandb.log_artifact(artifact)
+        
+        wandb.finish()
+        print(f"wandb run finished")
+    
     return results_file
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config")
     parser.add_argument("--model_path", type=str, help="Path to trained model (overrides config)")
+    parser.add_argument("--max_prompts", type=int, help="Max test prompts (overrides config)")
     args = parser.parse_args()
     
     with open(args.config, 'r') as f:
         cfg = yaml.safe_load(f)
+    
+    # Override max_test_prompts if provided
+    if args.max_prompts:
+        cfg['eval']['max_test_prompts'] = args.max_prompts
     
     # Use provided model path or get from config
     model_path = args.model_path or cfg['train'].get('save_path', 'models/trained_policy.pt')
