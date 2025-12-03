@@ -2,8 +2,10 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 from prompt_optimization.agent import PromptRLAgent
 from prompt_optimization.optimizers.continuous import ContinuousPromptOptimizer
+from prompt_optimization.model_inputs import ModelBatchedInput
 
 
 @pytest.fixture
@@ -18,27 +20,35 @@ def optimizer(agent):
         initial_prompt_length=5,
         max_prompt_len=10,
         batch_size=2,
-        lr_embeddings=0.01
+        lr_embeddings=0.01,
+        max_suffix_len=8,
+        init_len=5,
+    )
+
+
+def _build_model_input(agent, optimizer, prefixes, completions, mode="continuous"):
+    return ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=optimizer.max_suffix_len,
+        init_len=optimizer.initial_prompt_length,
+        mode=mode,
     )
 
 
 def test_likelihood_computation_produces_values(optimizer, agent):
     """Test that likelihood computation actually produces non-zero values."""
-    prompt_data, lengths = optimizer.initialize_prompts()
-    
-    # Create completion tokens
-    completion_texts = ["test completion", "another test"]
-    completion_tokens_list = [agent.tokenizer.encode(t, add_special_tokens=False) for t in completion_texts]
-    max_comp = max(len(ct) for ct in completion_tokens_list)
-    pad_id = getattr(agent.tokenizer, 'pad_token_id', 0)
-    completion_tokens = torch.tensor([
-        ct + [pad_id] * (max_comp - len(ct)) for ct in completion_tokens_list
-    ], dtype=torch.long, device=agent.device)
-    completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=agent.device)
-    
+    prefixes = ["Explain gravity:", "Translate to French:"]
+    completions = [" Gravity pulls.", " Bonjour."]
+    model_input = _build_model_input(agent, optimizer, prefixes, completions)
+    prompt_data, lengths = optimizer.initialize_prompts(model_input)
+
     # Compute likelihoods
     likelihoods = optimizer.get_likelihoods(
-        prompt_data, lengths, completion_tokens, completion_lengths, requires_grad=False
+        prompt_data, lengths, model_input, requires_grad=False
     )
     
     # Likelihoods should be negative (log probabilities) but not zero
@@ -52,21 +62,14 @@ def test_likelihood_computation_produces_values(optimizer, agent):
 
 def test_trace_storage_format(optimizer, agent):
     """Test that traces are stored in the correct format."""
-    prompt_data, lengths = optimizer.initialize_prompts()
-    
-    # Create completion tokens (must match batch_size=2)
-    completion_texts = ["test", "another"]
-    completion_tokens_list = [agent.tokenizer.encode(t, add_special_tokens=False) for t in completion_texts]
-    max_comp = max(len(ct) for ct in completion_tokens_list)
-    pad_id = getattr(agent.tokenizer, 'pad_token_id', 0)
-    completion_tokens = torch.tensor([
-        ct + [pad_id] * (max_comp - len(ct)) for ct in completion_tokens_list
-    ], dtype=torch.long, device=agent.device)
-    completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=agent.device)
+    prefixes = ["Prompt A:", "Prompt B:"]
+    completions = [" sample completion", " another completion"]
+    model_input = _build_model_input(agent, optimizer, prefixes, completions)
+    prompt_data, lengths = optimizer.initialize_prompts(model_input)
     
     # Compute likelihoods
     likelihoods = optimizer.get_likelihoods(
-        prompt_data, lengths, completion_tokens, completion_lengths, requires_grad=False
+        prompt_data, lengths, model_input, requires_grad=False
     )
     
     # Simulate trace storage (as done in optimizer.py)
@@ -119,23 +122,13 @@ def test_trace_storage_format(optimizer, agent):
 
 def test_likelihoods_not_zero_with_bos_initialization(optimizer, agent):
     """Test that BOS initialization doesn't produce zero likelihoods."""
-    prompt_data, lengths = optimizer.initialize_prompts()
-    
-    # Verify initialization uses BOS
-    # (This is tested in other tests, but we want to ensure likelihoods work)
-    
-    # Must match batch_size=2
-    completion_texts = ["hello world", "test completion"]
-    completion_tokens_list = [agent.tokenizer.encode(t, add_special_tokens=False) for t in completion_texts]
-    max_comp = max(len(ct) for ct in completion_tokens_list)
-    pad_id = getattr(agent.tokenizer, 'pad_token_id', 0)
-    completion_tokens = torch.tensor([
-        ct + [pad_id] * (max_comp - len(ct)) for ct in completion_tokens_list
-    ], dtype=torch.long, device=agent.device)
-    completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=agent.device)
+    prefixes = ["Describe BOS usage:", "Another prompt:"]
+    completions = [" hello world", " test completion"]
+    model_input = _build_model_input(agent, optimizer, prefixes, completions)
+    prompt_data, lengths = optimizer.initialize_prompts(model_input)
     
     likelihoods = optimizer.get_likelihoods(
-        prompt_data, lengths, completion_tokens, completion_lengths, requires_grad=False
+        prompt_data, lengths, model_input, requires_grad=False
     )
     
     # Even with BOS tokens, we should get some likelihood (negative log prob)
@@ -145,4 +138,74 @@ def test_likelihoods_not_zero_with_bos_initialization(optimizer, agent):
     assert torch.all(likelihoods < 0.0)
     assert torch.all(likelihoods != 0.0)
     print(f"BOS initialization likelihoods: {likelihoods.tolist()}")
+
+
+@pytest.mark.xfail(
+    reason="Second-half completion likelihoods not yet significantly higher; tracked bug"
+)
+def test_completion_second_half_more_probable(agent):
+    """Split completion log-likelihoods and ensure latter half is at least half as negative."""
+    prefixes = ["Question: 5+7=?\nAnswer:", "Explain the concept of GCG:"]
+    rare_chunk = " qzxvbnm"
+    completions = [
+        rare_chunk * 20 + " the" * 10,
+        rare_chunk * 20 + " easy" * 10,
+    ]
+
+    model_input = ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=0,
+        init_len=0,
+        mode="discrete",
+    )
+
+    input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+    outputs = agent.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+    token_log_probs, comp_mask = agent.compute_completion_log_probs(outputs.logits, model_input)
+    completion_start = model_input.get_completion_start_pos()
+
+    for idx in range(token_log_probs.shape[0]):
+        length = comp_mask[idx].sum().item()
+        if length < 4:
+            continue
+        start = int(completion_start[idx].item())
+        slice_logits = outputs.logits[idx, start - 1 : start - 1 + length, :]
+        log_probs = F.log_softmax(slice_logits, dim=-1)
+        tokens = model_input.completion_input_ids[idx][comp_mask[idx]]
+
+        print(f"\nPrompt {idx}: {prefixes[idx]}")
+        for pos in range(length):
+            token_id = tokens[pos].item()
+            token_text = agent.tokenizer.decode([token_id]).strip().replace("\n", "\\n")
+            assigned_log_prob = log_probs[pos, token_id].item()
+            assigned_prob = torch.exp(log_probs[pos, token_id]).item()
+            topk = log_probs[pos].topk(5)
+            top_tokens = [
+                (
+                    agent.tokenizer.decode([topk.indices[i].item()]).strip().replace("\n", "\\n"),
+                    topk.values[i].item(),
+                )
+                for i in range(5)
+            ]
+            print(
+                f"  token[{pos}]='{token_text}' logp={assigned_log_prob:.4f} "
+                f"p={assigned_prob:.4f} top-5={top_tokens}"
+            )
+
+        half = length // 2
+        first_half = token_log_probs[idx, :half]
+        second_half = token_log_probs[idx, half:length]
+        mean_first = first_half.mean()
+        mean_second = second_half.mean()
+        assert mean_first < 0.0
+        # Later tokens should be closer to 0 (less negative magnitude)
+        assert mean_second >= mean_first  # no worse than first half
+        assert mean_second.abs() <= 0.3 * mean_first.abs()
 

@@ -121,7 +121,6 @@ class PromptRLAgent:
                 input_ids, attention_mask = (
                     model_input.get_model_input_ids_and_attention_mask()
                 )
-                position_ids = model_input.get_position_ids()
 
                 # Restore original suffix_input_ids (in case it's used elsewhere)
                 model_input.suffix_input_ids = original_suffix_input_ids
@@ -133,7 +132,6 @@ class PromptRLAgent:
                 outputs = self.model(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-                    position_ids=position_ids,
                 )
                 logits = outputs.logits  # [B, seq_len, vocab]
             elif model_input.mode == "continuous" or (
@@ -142,14 +140,12 @@ class PromptRLAgent:
                 inputs_embeds, attention_mask, suffix_mask = (
                     model_input.get_model_input_embeds_and_attention_mask()
                 )
-                position_ids = model_input.get_position_ids()
                 # Prefix and completion embeddings are already detached in get_model_input_embeds_and_attention_mask
                 # Only suffix embeddings have gradients
                 # Forward pass with attention mask
                 outputs = self.model(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-                    position_ids=position_ids,
                 )
                 logits = outputs.logits  # [B, seq_len, vocab]
             elif model_input.mode == "discrete":
@@ -157,13 +153,11 @@ class PromptRLAgent:
                 input_ids, attention_mask = (
                     model_input.get_model_input_ids_and_attention_mask()
                 )
-                position_ids = model_input.get_position_ids()
 
                 # Forward pass with attention mask
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    position_ids=position_ids,
                 )
                 logits = outputs.logits  # [B, seq_len, vocab]
             else:

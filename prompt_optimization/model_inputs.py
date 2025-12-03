@@ -69,7 +69,6 @@ class ModelBatchedInput:
         self._cached_suffix_start_pos: Optional[torch.Tensor] = None
         self._cached_completion_start_pos: Optional[torch.Tensor] = None
         self._cached_total_lengths: Optional[torch.Tensor] = None
-        self._cached_position_ids: Optional[torch.Tensor] = None
 
         # Tokenize prefix and completion
         self._tokenize_prefix(prefix_texts)
@@ -91,7 +90,6 @@ class ModelBatchedInput:
         self._cached_suffix_start_pos = None
         self._cached_completion_start_pos = None
         self._cached_total_lengths = None
-        self._cached_position_ids = None
 
     def _tokenize_prefix(self, prefix_texts: List[str]):
         """Tokenize prefix texts and create attention masks using tokenizer batching."""
@@ -450,8 +448,6 @@ class ModelBatchedInput:
         self._cached_suffix_start_pos = suffix_start_pos
         self._cached_completion_start_pos = completion_start_pos
         self._cached_total_lengths = total_lengths
-        position_ids = self._compute_position_ids(attention_mask)
-        self._cached_position_ids = position_ids
 
         return inputs_embeds, attention_mask, suffix_mask
 
@@ -542,15 +538,12 @@ class ModelBatchedInput:
                 input_ids[idx, pos : pos + completion_len] = completion_tokens
                 attention_mask[idx, pos : pos + completion_len] = 1
 
-        position_ids = self._compute_position_ids(attention_mask)
-
         return (
             input_ids,
             attention_mask,
             suffix_start_pos,
             completion_start_pos,
             total_lengths,
-            position_ids,
         )
 
     def get_model_input_ids_and_attention_mask(
@@ -585,7 +578,6 @@ class ModelBatchedInput:
             suffix_start,
             completion_start,
             total_lengths,
-            position_ids,
         ) = self._build_compact_token_inputs(
             self.prefix_input_ids,
             self.prefix_attention_mask,
@@ -600,7 +592,6 @@ class ModelBatchedInput:
             self._cached_suffix_start_pos = suffix_start
             self._cached_completion_start_pos = completion_start
             self._cached_total_lengths = total_lengths
-        self._cached_position_ids = position_ids
 
         return input_ids, attention_mask
 
@@ -633,20 +624,3 @@ class ModelBatchedInput:
         if self._cached_completion_start_pos is None:
             self.get_model_input_ids_and_attention_mask()
         return self._cached_completion_start_pos
-
-    def get_position_ids(self) -> torch.Tensor:
-        """
-        Get contiguous position ids for the compact input layout.
-        """
-        if self._cached_position_ids is None:
-            self.get_model_input_ids_and_attention_mask()
-        return self._cached_position_ids
-
-    @staticmethod
-    def _compute_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
-        position_ids = attention_mask.long().cumsum(dim=1) - 1
-        position_ids = torch.clamp(position_ids, min=0)
-        position_ids = torch.where(
-            attention_mask.bool(), position_ids, torch.zeros_like(position_ids)
-        )
-        return position_ids

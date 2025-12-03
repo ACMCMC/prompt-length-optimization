@@ -185,12 +185,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 inputs_embeds[idx, pos : pos + completion_len] = completion_segment
                 attention_mask[idx, pos : pos + completion_len] = 1
 
-        position_ids = ModelBatchedInput._compute_position_ids(attention_mask)
-
         outputs = self.agent.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            position_ids=position_ids,
         )
         logits = outputs.logits  # [B, seq_len, vocab]
 
@@ -381,9 +378,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_attention_mask = base_attention_mask[
                 prompt_indices
             ].clone()  # [chunk_size, seq_len]
-            candidate_position_ids = ModelBatchedInput._compute_position_ids(
-                candidate_attention_mask
-            )
 
             suffix_start_batch = suffix_start_all[prompt_indices]
             suffix_lengths_batch = suffix_lengths_all[prompt_indices]
@@ -407,7 +401,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 outputs = self.agent.model.gpt_neox(
                     inputs_embeds=inputs_embeds,
                     attention_mask=candidate_attention_mask,
-                    position_ids=candidate_position_ids,
                 )
                 hidden_states = outputs.last_hidden_state
                 logits = self.agent.model.embed_out(hidden_states)
