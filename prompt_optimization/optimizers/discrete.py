@@ -185,8 +185,12 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 inputs_embeds[idx, pos : pos + completion_len] = completion_segment
                 attention_mask[idx, pos : pos + completion_len] = 1
 
+        position_ids = ModelBatchedInput._compute_position_ids(attention_mask)
+
         outputs = self.agent.model(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         logits = outputs.logits  # [B, seq_len, vocab]
 
@@ -308,7 +312,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             for cand_idx in range(search_width):
                 pos = selected_positions[cand_idx].item()
                 new_token = candidate_tokens[cand_idx].item()
-                    all_update_info.append((prompt_idx, cand_idx, pos, new_token))
+                all_update_info.append((prompt_idx, cand_idx, pos, new_token))
 
         if len(all_candidate_sequences) == 0:
             return (
@@ -377,6 +381,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_attention_mask = base_attention_mask[
                 prompt_indices
             ].clone()  # [chunk_size, seq_len]
+            candidate_position_ids = ModelBatchedInput._compute_position_ids(
+                candidate_attention_mask
+            )
 
             suffix_start_batch = suffix_start_all[prompt_indices]
             suffix_lengths_batch = suffix_lengths_all[prompt_indices]
@@ -398,7 +405,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             with torch.no_grad():
                 inputs_embeds = self.embedding_layer(candidate_input_ids)
                 outputs = self.agent.model.gpt_neox(
-                    inputs_embeds=inputs_embeds, attention_mask=candidate_attention_mask
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=candidate_attention_mask,
+                    position_ids=candidate_position_ids,
                 )
                 hidden_states = outputs.last_hidden_state
                 logits = self.agent.model.embed_out(hidden_states)
@@ -522,7 +531,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             # Only keep improvements (restore previous tokens for non-improving prompts)
             improve_mask = current_lls > best_lls
             if improve_mask.any():
-            best_lls = torch.where(improve_mask, current_lls, best_lls)
+                best_lls = torch.where(improve_mask, current_lls, best_lls)
             best_tokens = torch.where(
                 improve_mask.view(-1, 1), best_tokens, old_tokens
             )

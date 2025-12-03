@@ -80,9 +80,18 @@ def _manual_likelihood_with_compact_positions(agent: PromptRLAgent, model_input:
     comp_tokens = model_input.completion_input_ids
     comp_mask = model_input.completion_attention_mask.bool()
 
-    comp_logits = logits[:, completion_start - 1 : -1, :]
-    log_probs = F.log_softmax(comp_logits, dim=-1)
-    token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)
+    token_log_probs = logits.new_zeros(comp_tokens.shape)
+    for idx in range(logits.size(0)):
+        length = comp_mask[idx].sum().item()
+        if length == 0:
+            continue
+        start = completion_start[idx].item() - 1
+        end = start + length
+        comp_logits = logits[idx, start:end, :]
+        log_probs = F.log_softmax(comp_logits, dim=-1)
+        tokens = comp_tokens[idx][comp_mask[idx]]
+        gathered = log_probs.gather(1, tokens.unsqueeze(-1)).squeeze(-1)
+        token_log_probs[idx, :length] = gathered
     masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
     return masked_log_probs.sum(dim=-1)
 
