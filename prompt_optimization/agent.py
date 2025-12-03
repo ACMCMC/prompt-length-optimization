@@ -166,10 +166,6 @@ class PromptRLAgent:
         token_log_probs, comp_mask = self._compute_completion_token_log_probs(
             logits, model_input
         )
-        if token_log_probs.numel() == 0:
-            return torch.zeros(
-                logits.size(0), device=logits.device, dtype=logits.dtype
-            )
         masked_log_probs = torch.where(
             comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
         )
@@ -195,21 +191,11 @@ class PromptRLAgent:
         """
         batch_size = logits.size(0)
         completion_mask = model_input.completion_attention_mask.bool()
-        if batch_size == 0:
-            return (
-                logits.new_zeros((0, 0)),
-                completion_mask[:, :0],
-            )
 
         completion_lengths = completion_mask.sum(dim=1)
         max_completion_len = (
             int(completion_lengths.max().item()) if completion_lengths.numel() > 0 else 0
         )
-        if max_completion_len == 0:
-            return (
-                logits.new_zeros((batch_size, 0)),
-                completion_mask[:, :0],
-            )
 
         token_log_probs = logits.new_zeros((batch_size, max_completion_len))
         trimmed_mask = torch.zeros(
@@ -220,8 +206,6 @@ class PromptRLAgent:
 
         for idx in range(batch_size):
             length = int(completion_lengths[idx].item())
-            if length == 0:
-                continue
             start = int(completion_start_pos[idx].item())
             end = start - 1 + length
             slice_logits = logits[idx, start - 1 : end, :]

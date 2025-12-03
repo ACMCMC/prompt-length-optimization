@@ -571,6 +571,16 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         # Final update
         prompt_data = best_tokens.clone()
+        inactive_mask = (suffix_mask == 0).bool()
+        if inactive_mask.any():
+            # Ensure masked-out suffix positions always hold BOS-equivalent tokens
+            bos_token_id = self.agent.tokenizer.bos_token_id
+            if bos_token_id is None:
+                bos_token_id = self.agent.tokenizer.pad_token_id
+            if bos_token_id is None:
+                bos_token_id = 0
+            prompt_data[inactive_mask] = bos_token_id
+
         model_input.update_suffix_tokens(prompt_data)
         final_likelihoods = self.agent.get_likelihoods_batch(
             model_input, requires_grad=False
@@ -586,11 +596,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 f"Warning: GCG decreased likelihood for {num_decreased} prompts in this step (min Δll={min_delta:.4f})."
             )
             
-        # Sanity check: check that all the tokens in the non-active positions are BOS
-        # It's possible that after we increased length, and then decreased it, the non-active positions are not BOS. So just in case if that happens we raise a warning. But we don't fail.
-        if not (prompt_data[suffix_mask == 0] == self.agent.tokenizer.bos_token_id).all():
-            logging.warning("Warning: Tokens in non-active positions are not BOS")
-
         return prompt_data, final_likelihoods
 
     def to_tokens(
