@@ -19,30 +19,47 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
+
+def _resolve_eval_settings(eval_cfg, train_cfg):
+    """
+    Resolve evaluation-time optimization mode and GCG parameters.
+    Allows eval overrides while defaulting to training config values.
+    """
+    if 'optimization_mode' in eval_cfg:
+        optimization_mode = eval_cfg['optimization_mode']
+    else:
+        optimization_mode = train_cfg['optimization_mode']
+
+    gcg_cfg = dict(train_cfg['gcg'])
+    if 'gcg' in eval_cfg:
+        gcg_cfg.update(eval_cfg['gcg'])
+    return optimization_mode, gcg_cfg
+
+
 def load_trained_model(model_path):
     """Load a trained policy model from disk."""
     checkpoint = torch.load(model_path, map_location='cpu')
     model_name = checkpoint['model_name']
     
-    # Initialize agent and optimizer  
-    # For evaluation, we need to initialize with config values even though we're loading weights
-    # Read from checkpoint config if available, otherwise use defaults from train config
-    train_cfg = checkpoint.get('config', {}).get('train', {})
-    policy_cfg = train_cfg.get('policy', {})
-    grpo_cfg = train_cfg.get('grpo', train_cfg.get('ppo', {}))  # Support both 'grpo' and legacy 'ppo' keys
+    if 'config' not in checkpoint or 'train' not in checkpoint['config']:
+        raise KeyError("Checkpoint missing training configuration.")
+    train_cfg = checkpoint['config']['train']
+    if 'grpo' not in train_cfg:
+        raise KeyError("Checkpoint config missing 'train.grpo'.")
+    policy_cfg = train_cfg['policy']
+    grpo_cfg = train_cfg['grpo']
+    gcg_cfg = train_cfg['gcg']
     
-    epsilon = train_cfg.get('epsilon', 0.3)
-    epsilon_decay = train_cfg.get('epsilon_decay', 0.998)
-    epsilon_min = train_cfg.get('epsilon_min', 0.05)
-    entropy_coef = train_cfg.get('entropy_coef', 0.05)
-    temperature = train_cfg.get('temperature', 1.5)
-    grpo_clip = grpo_cfg.get('clip', 0.2)
-    grpo_epochs = grpo_cfg.get('epochs', 4)
-    grpo_gamma = grpo_cfg.get('gamma', 0.99)
-    grpo_gae_lambda = grpo_cfg.get('gae_lambda', 0.95)
-    grpo_value_coef = grpo_cfg.get('value_coef', 0.5)
-    policy_hidden_size = policy_cfg.get('hidden_size', 64)
-    max_grad_norm = grpo_cfg.get('max_grad_norm', 0.5)
+    epsilon = train_cfg['epsilon']
+    epsilon_decay = train_cfg['epsilon_decay']
+    epsilon_min = train_cfg['epsilon_min']
+    entropy_coef = grpo_cfg['entropy_coef']
+    temperature = train_cfg['temperature']
+    grpo_clip = grpo_cfg['clip']
+    grpo_epochs = grpo_cfg['epochs']
+    grpo_gamma = grpo_cfg['gamma']
+    policy_hidden_size = policy_cfg['hidden_size']
+    max_grad_norm = grpo_cfg['max_grad_norm']
     
     agent = PromptRLAgent(model_name=model_name)
     optimizer = LengthPolicyOptimizer(
@@ -55,11 +72,15 @@ def load_trained_model(model_path):
         grpo_clip=grpo_clip,
         grpo_epochs=grpo_epochs,
         grpo_gamma=grpo_gamma,
-        grpo_gae_lambda=grpo_gae_lambda,
-        grpo_value_coef=grpo_value_coef,
         policy_hidden_size=policy_hidden_size,
         max_grad_norm=max_grad_norm
     )
+    optimizer.projection_weight = train_cfg['projection_weight']
+    optimizer.distance_metric = train_cfg['distance_metric']
+    optimizer.gcg_steps = gcg_cfg['steps']
+    optimizer.gcg_top_k = gcg_cfg['top_k']
+    optimizer.gcg_batch_size = gcg_cfg['batch_size']
+    optimizer.gcg_max_batch_size = gcg_cfg['max_batch_size']
     
     # Load the trained policy weights
     optimizer.policy_net.load_state_dict(checkpoint['policy_state_dict'])
@@ -69,59 +90,38 @@ def load_trained_model(model_path):
 def evaluate_prompt(cfg, agent, optimizer):
     """Evaluate a single prompt and return results."""
     eval_cfg = cfg['eval']
+    train_cfg = cfg['train']
     test_prompt = eval_cfg['test_prompt']
     init_len = eval_cfg['init_len']
-    max_suffix_len = eval_cfg.get('max_suffix_len', 64)
+    max_suffix_len = eval_cfg['max_suffix_len']
     max_policy_steps = eval_cfg['max_policy_steps']
-    optimization_mode = eval_cfg.get('optimization_mode', cfg.get('train', {}).get('optimization_mode', 'continuous'))
-    # Get GCG config from eval or fall back to train config
-    eval_gcg_cfg = eval_cfg.get('gcg', {})
-    train_gcg_cfg = cfg.get('train', {}).get('gcg', {})
-    gcg_cfg = {**train_gcg_cfg, **eval_gcg_cfg}  # eval overrides train
-    gcg_top_k = gcg_cfg.get('top_k', 16)
-    gcg_batch_size = gcg_cfg.get('batch_size', 32)
-    gcg_steps = gcg_cfg.get('steps', 5)
+    optimization_mode, gcg_cfg = _resolve_eval_settings(eval_cfg, train_cfg)
+    gcg_top_k = gcg_cfg['top_k']
+    gcg_batch_size = gcg_cfg['batch_size']
+    gcg_steps = gcg_cfg['steps']
     opt_mode = optimization_mode.lower()
     if 'ppo' in opt_mode:
-        # PPO method removed during refactoring, fall back to standard optimization
-        print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-        best_prompts_batch, best_rewards_batch, _, _ = optimizer.optimize_prompts_batch(
-            target_completions=[test_prompt],
-            episodes=1,
-            steps_per_episode=max_policy_steps,
-            initial_prompt_length=init_len,
-            lr_embeddings=0.01,
-            alpha=cfg.get('train', {}).get('alpha', 1.0),
-            beta=cfg.get('train', {}).get('beta', 0.1),
-            mode='continuous' if 'continuous' in opt_mode else 'discrete',
-            batch_size=1,
-            max_suffix_len=max_suffix_len,
-            init_len=init_len
-        )
-        best_prompt = best_prompts_batch[0] if best_prompts_batch else []
-        completion_tokens = agent.tokenizer.encode(test_prompt, add_special_tokens=False)
-        best_likelihood = agent.get_completion_likelihood(best_prompt, completion_tokens) if best_prompt else 0.0
-    else:
-        # Use optimize_prompt with minimal steps for evaluation
-        best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
-            test_prompt,
-            episodes=1,  # Single episode for evaluation
-            steps_per_episode=max_policy_steps,
-            initial_prompt_length=init_len,
-            lr_embeddings=0.01,
-            lr_policy=0.0003,
-            alpha=cfg.get('train', {}).get('alpha', 1.0),
-            beta=cfg.get('train', {}).get('beta', 0.1),
-            log_every=0,  # No logging during evaluation
-            optimization_mode=optimization_mode,
-            gcg_top_k=gcg_top_k,
-            gcg_batch_size=gcg_batch_size,
-            gcg_steps=gcg_steps
-        )
+        raise ValueError("PPO modes are not supported; use discrete/continuous variants.")
+
+    best_prompt, best_likelihood, trace = optimizer.optimize_prompt(
+        test_prompt,
+        episodes=1,
+        steps_per_episode=max_policy_steps,
+        initial_prompt_length=init_len,
+        lr_embeddings=0.01,
+        lr_policy=0.0003,
+        alpha=train_cfg['alpha'],
+        beta=train_cfg['beta'],
+        log_every=0,
+        optimization_mode=optimization_mode,
+        gcg_top_k=gcg_top_k,
+        gcg_batch_size=gcg_batch_size,
+        gcg_steps=gcg_steps
+    )
     
     # Calculate reward (negative of the combined loss)
-    alpha = cfg.get('train', {}).get('alpha', 1.0)
-    beta = cfg.get('train', {}).get('beta', 0.1)
+    alpha = train_cfg['alpha']
+    beta = train_cfg['beta']
     # Using logarithmic length penalty: log(1 + length) for more penalizing effect
     import math
     reward = alpha * best_likelihood - beta * math.log1p(len(best_prompt))
@@ -159,21 +159,20 @@ def evaluate_prompt(cfg, agent, optimizer):
         'compressed_prompt': compressed_prompt
     }
 
-def load_test_prompts(seed=2262, max_samples=20, min_length=30, max_length=200, ds_cfg=None):
+def load_test_prompts(seed, max_samples, min_length, max_length, ds_cfg):
     """Load test prompts from the toxic-chat dataset using proper split."""
     print(f"Loading test prompts from toxic-chat dataset...")
     
     # Use the dataset manager to get the proper test split
     dataset_manager = ToxicChatDatasetManager(seed=seed)
-    ds_cfg = ds_cfg or {}
     test_prompts = dataset_manager.load_test_set(
         min_length=min_length,
         max_length=max_length,
         max_samples=max_samples,
-        train_ratio=ds_cfg.get('train_ratio', 0.7),
-        val_ratio=ds_cfg.get('val_ratio', 0.15),
-        test_ratio=ds_cfg.get('test_ratio', 0.15),
-        use_cache=True
+        train_ratio=ds_cfg['train_ratio'],
+        val_ratio=ds_cfg['val_ratio'],
+        test_ratio=ds_cfg['test_ratio'],
+        use_cache=True,
     )
     
     print(f"Loaded {len(test_prompts)} test prompts (length {min_length}-{max_length} chars)")
@@ -184,30 +183,27 @@ def evaluate_on_dataset(cfg, model_path):
     eval_cfg = cfg['eval']
     
     # Load test parameters
-    max_test_prompts = eval_cfg.get('max_test_prompts', 20)
-    init_len = eval_cfg.get('init_len', 32)
-    max_policy_steps = eval_cfg.get('max_policy_steps', 50)
-    min_prompt_length = eval_cfg.get('min_prompt_length', 20)
-    max_prompt_length = eval_cfg.get('max_prompt_length', 200)
-    optimization_mode = eval_cfg.get('optimization_mode', cfg.get('train', {}).get('optimization_mode', 'continuous'))
-    # Get GCG config from eval or fall back to train config
-    eval_gcg_cfg = eval_cfg.get('gcg', {})
-    train_gcg_cfg = cfg.get('train', {}).get('gcg', {})
-    gcg_cfg = {**train_gcg_cfg, **eval_gcg_cfg}  # eval overrides train
-    gcg_top_k = gcg_cfg.get('top_k', 16)
-    gcg_batch_size = gcg_cfg.get('batch_size', 32)
-    gcg_steps = gcg_cfg.get('steps', 5)
+    train_cfg = cfg['train']
+    max_test_prompts = eval_cfg['max_test_prompts']
+    init_len = eval_cfg['init_len']
+    max_policy_steps = eval_cfg['max_policy_steps']
+    min_prompt_length = eval_cfg['min_prompt_length']
+    max_prompt_length = eval_cfg['max_prompt_length']
+    optimization_mode, gcg_cfg = _resolve_eval_settings(eval_cfg, train_cfg)
+    gcg_top_k = gcg_cfg['top_k']
+    gcg_batch_size = gcg_cfg['batch_size']
+    gcg_steps = gcg_cfg['steps']
     
-    results_file = eval_cfg.get('results_file', 'results/dataset_eval_results.csv')
+    results_file = eval_cfg['results_file']
     
-    seed = cfg.get('seed', 2262)
-    ds_cfg = cfg.get('dataset', {})
+    seed = cfg['seed']
+    ds_cfg = cfg['dataset']
     
     print(f"Dataset evaluation with {max_test_prompts} test prompts")
     print(f"Model: {model_path}")
     
     # Determine dataset to evaluate (default: toxicchat)
-    dataset_name = eval_cfg.get('dataset', cfg.get('dataset', {}).get('name', 'toxicchat'))
+    dataset_name = eval_cfg['dataset']
 
     # Load test prompts using proper test split or AdvBench if requested
     if dataset_name.lower() == 'advbench':
@@ -261,26 +257,17 @@ def evaluate_on_dataset(cfg, model_path):
         print("Original best training reward: unknown")
     
     # Get alpha and beta for reward calculation
-    alpha = cfg.get('train', {}).get('alpha', 1.0)
-    beta = cfg.get('train', {}).get('beta', 0.1)
-    
-    # Get PPO parameters from config (for backward compatibility, though PPO is removed)
-    ppo_cfg = cfg.get('train', {}).get('ppo', {})
-    ppo_epochs = ppo_cfg.get('epochs', 1)
-    ppo_clip = ppo_cfg.get('clip', 0.2)
-    ppo_gamma = ppo_cfg.get('gamma', 0.99)
-    ppo_lambda = ppo_cfg.get('gae_lambda', 0.95)
-    ppo_value_coef = ppo_cfg.get('value_coef', 0.5)
-    ppo_entropy_coef = ppo_cfg.get('entropy_coef', 0.01)
+    alpha = train_cfg['alpha']
+    beta = train_cfg['beta']
     
     # Check if we should save plots
-    save_plots = not eval_cfg.get('no_plots', True)
-    plots_format = eval_cfg.get('plots_format', 'pdf')
-    plots_prefix = eval_cfg.get('plots_prefix', 'eval')
+    save_plots = not eval_cfg['no_plots']
+    plots_format = eval_cfg['plots_format']
+    plots_prefix = eval_cfg['plots_prefix']
     
     # Evaluate in batches to allow vectorized/batched optimizers
     results = []
-    batch_size = eval_cfg.get('batch_size', cfg.get('train', {}).get('batch_size', 8))
+    batch_size = eval_cfg['batch_size']
 
     def _get_from_batch_list(batch_list, idx_in_batch, default=0.0):
         """Extract value at idx_in_batch from batch-level list."""
@@ -330,95 +317,24 @@ def evaluate_on_dataset(cfg, model_path):
                 raw_inputs.append(tp)
 
         opt_mode = optimization_mode.lower()
+        if opt_mode not in {"continuous", "continuous_proj", "discrete"}:
+            raise ValueError(
+                f"Unsupported optimization mode '{optimization_mode}' for evaluation."
+            )
         try:
-            if 'ppo' in opt_mode:
-                # PPO method removed during refactoring, fall back to standard optimization
-                print(f"Warning: PPO mode requested but not available. Using standard {opt_mode} mode instead.")
-                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
-                    target_completions=targets,
-                    episodes=1,
-                    steps_per_episode=max_policy_steps,
-                    initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
-                    alpha=alpha,
-                    beta=beta,
-                    mode='continuous' if 'continuous' in opt_mode else 'discrete',
-                    batch_size=len(targets),
-                    max_suffix_len=max_suffix_len,
-                    init_len=init_len
-                )
-            elif opt_mode == 'continuous':
-                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
-                    target_completions=targets,
-                    episodes=1,
-                    steps_per_episode=max_policy_steps,
-                    initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
-                    alpha=alpha,
-                    beta=beta,
-                    mode='continuous',
-                    batch_size=len(targets),
-                    max_suffix_len=max_suffix_len,
-                    init_len=init_len
-                )
-            elif opt_mode == 'discrete':
-                best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
-                    target_completions=targets,
-                    episodes=1,
-                    steps_per_episode=max_policy_steps,
-                    initial_prompt_length=init_len,
-                    lr_embeddings=0.01,
-                    alpha=alpha,
-                    beta=beta,
-                    mode='discrete',
-                    batch_size=len(targets),
-                    max_suffix_len=max_suffix_len,
-                    init_len=init_len
-                )
-            else:
-                # fallback: run sequentially
-                best_prompts_batch = []
-                best_rewards_batch = []
-                traces_batch = []
-                for tp in raw_inputs:
-                    if isinstance(tp, dict):
-                        base_text = tp.get('base', '')
-                        target_text = tp.get('target', '')
-                        best_prompt, best_reward, trace = optimizer.optimize_prompt(
-                            target_completion=target_text,
-                            episodes=1,
-                            steps_per_episode=max_policy_steps,
-                            initial_prompt_length=init_len,
-                            lr_embeddings=0.01,
-                            lr_policy=0.0003,
-                            alpha=alpha,
-                            beta=beta,
-                            log_every=0,
-                            optimization_mode=optimization_mode,
-                            gcg_top_k=gcg_top_k,
-                            gcg_batch_size=gcg_batch_size,
-                            gcg_steps=gcg_steps,
-                            base_prompt=base_text
-                        )
-                    else:
-                        best_prompt, best_reward, trace = optimizer.optimize_prompt(
-                            tp,
-                            episodes=1,
-                            steps_per_episode=max_policy_steps,
-                            initial_prompt_length=init_len,
-                            lr_embeddings=0.01,
-                            lr_policy=0.0003,
-                            alpha=alpha,
-                            beta=beta,
-                            log_every=0,
-                            optimization_mode=optimization_mode,
-                            gcg_top_k=gcg_top_k,
-                            gcg_batch_size=gcg_batch_size,
-                            gcg_steps=gcg_steps
-                        )
-                    best_prompts_batch.append(best_prompt)
-                    best_rewards_batch.append(best_reward)
-                    traces_batch.append(trace)
+            best_prompts_batch, best_rewards_batch, traces_batch, _ = optimizer.optimize_prompts_batch(
+                target_completions=targets,
+                episodes=1,
+                steps_per_episode=max_policy_steps,
+                initial_prompt_length=init_len,
+                lr_embeddings=0.01,
+                alpha=alpha,
+                beta=beta,
+                mode=optimization_mode,
+                batch_size=len(targets),
+                max_suffix_len=max_suffix_len,
+                init_len=init_len
+            )
 
             # Unpack batch results
             trace_source = traces_batch if traces_batch is not None else []

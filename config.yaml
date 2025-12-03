@@ -35,7 +35,7 @@ train:
   
   # Parallel processing parameters
   batch_size: 16                      # Prompts per batch for progress tracking
-  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for PPO advantage computation
+  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for GRPO
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -61,14 +61,12 @@ train:
     epochs: 4                      # Number of GRPO update epochs per episode
     clip: 0.2                       # GRPO clipping epsilon
     gamma: 0.99                     # Discount factor
-    gae_lambda: 0.95                # GAE lambda parameter
-    value_coef: 2.0                 # Value loss coefficient (increased to strengthen value learning)
     entropy_coef: 0.003             # Entropy bonus coefficient (smaller = less pull toward uniform policy)
     max_grad_norm: 0.5              # Maximum gradient norm for clipping
   
   # Policy network architecture
   policy:
-    hidden_size: 128                 # Hidden layer size for policy and value networks
+    hidden_size: 128                 # Hidden layer size for policy network
 
 eval:
   # Test dataset parameters
@@ -90,3 +88,5 @@ eval:
   no_plots: false                     # Don't create individual plots
   plots_prefix: eval
   plots_format: pdf                  # png|pdf (for when plots are enabled)
+  batch_size: 16                    # Batch size for evaluation
+  dataset: toxicchat                # Dataset to use during evaluation

@@ -1,8 +1,10 @@
 """Unit tests for PromptRLAgent"""
 
 import torch
+import torch.nn.functional as F
 import pytest
 from prompt_optimization.agent import PromptRLAgent
+from prompt_optimization.model_inputs import ModelBatchedInput
 
 @pytest.fixture
 def agent():
@@ -56,4 +58,53 @@ def test_get_likelihoods_batch_empty_completion(agent):
     
     assert likelihoods.shape == (B,)
     assert likelihoods[0].item() == 0.0
+
+
+def _contiguous_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Construct per-example contiguous position ids based on active tokens."""
+    cumsum = attention_mask.long().cumsum(dim=1) - 1
+    cumsum = torch.clamp(cumsum, min=0)
+    return torch.where(attention_mask.bool(), cumsum, torch.zeros_like(cumsum))
+
+
+def _manual_likelihood_with_compact_positions(agent: PromptRLAgent, model_input: ModelBatchedInput) -> torch.Tensor:
+    input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+    position_ids = _contiguous_position_ids(attention_mask)
+    outputs = agent.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+    )
+    logits = outputs.logits
+    completion_start = model_input.get_completion_start_pos()
+    comp_tokens = model_input.completion_input_ids
+    comp_mask = model_input.completion_attention_mask.bool()
+
+    comp_logits = logits[:, completion_start - 1 : -1, :]
+    log_probs = F.log_softmax(comp_logits, dim=-1)
+    token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(-1)
+    masked_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
+    return masked_log_probs.sum(dim=-1)
+
+
+def test_likelihoods_use_compact_positions(agent):
+    """Ensure likelihood computation matches contiguous position encoding."""
+    prefixes = ["Question: 1+1?\nAnswer:", "Compute 3+4."]
+    completions = [" 2", " 7"]
+    model_input = ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=8,
+        init_len=2,
+        mode="discrete",
+    )
+
+    actual = agent.get_likelihoods_batch(model_input, requires_grad=False)
+    manual = _manual_likelihood_with_compact_positions(agent, model_input)
+
+    assert actual.shape == manual.shape
+    assert torch.allclose(actual, manual, atol=1e-6)
 

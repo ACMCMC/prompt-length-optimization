@@ -35,8 +35,6 @@ class LengthPolicyOptimizer:
         grpo_clip: float,
         grpo_epochs: int,
         grpo_gamma: float,
-        grpo_gae_lambda: float,
-        grpo_value_coef: float,
         policy_hidden_size: int,
         max_grad_norm: float,
     ):
@@ -65,21 +63,10 @@ class LengthPolicyOptimizer:
             ),  # Actions: 0=optimize_suffix, 1=decrease, 2=increase
         ).to(agent.device)
 
-        # Value network for GRPO (estimates state values)
-        # Mirror architecture of policy_net, also without LayerNorm for the same reason.
-        self.value_net = nn.Sequential(
-            nn.Linear(self.state_dim, policy_hidden_size),
-            nn.ReLU(),
-            nn.Linear(policy_hidden_size, 1),  # Single value output
-        ).to(agent.device)
-
         self.max_grad_norm = max_grad_norm
 
-        # Shared optimizer for policy and value networks (GRPO)
-        self.optimizer = optim.Adam(
-            list(self.policy_net.parameters()) + list(self.value_net.parameters()),
-            lr=3e-4,
-        )
+        # Optimizer for policy network parameters only
+        self.policy_optimizer = optim.Adam(self.policy_net.parameters(), lr=3e-4)
 
         # Epsilon-greedy exploration parameters
         self.epsilon = epsilon
@@ -97,95 +84,45 @@ class LengthPolicyOptimizer:
         self.grpo_clip = grpo_clip
         self.grpo_epochs = grpo_epochs
         self.grpo_gamma = grpo_gamma
-        self.grpo_gae_lambda = grpo_gae_lambda
-        self.grpo_value_coef = grpo_value_coef
 
-    def _compute_gae(
-        self, rewards: torch.Tensor, values: torch.Tensor, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute Generalized Advantage Estimation (GAE).
-
-        Args:
-            rewards: [T, batch_B] tensor of rewards
-            values: [T, batch_B] tensor of value estimates
-            device: torch device
-
-        Returns:
-            returns: [T, batch_B] tensor of returns (value targets)
-            advantages: [T, batch_B] tensor of advantages
-        """
-        T, batch_B = rewards.shape
-        returns = torch.zeros_like(rewards)
-        advantages = torch.zeros_like(rewards)
-
-        # Compute next values (for terminal state, next_value = 0)
-        next_values = torch.cat(
-            [values[1:], torch.zeros(1, batch_B, device=device)], dim=0
-        )
-
-        # Compute TD errors: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-        deltas = rewards + self.grpo_gamma * next_values - values
-
-        # Compute GAE advantages: A_t = δ_t + (γλ) * δ_{t+1} + (γλ)^2 * δ_{t+2} + ...
-        gae = 0.0
-        for t in reversed(range(T)):
-            gae = deltas[t] + self.grpo_gamma * self.grpo_gae_lambda * gae
-            advantages[t] = gae
-
-        # Returns are advantages + values
-        returns = advantages + values
-
-        return returns, advantages
-
-    def _compute_grpo_advantages(
+    def _compute_group_advantages(
         self,
         rewards: torch.Tensor,
-        values: torch.Tensor,
-        device: torch.device,
-        prompt_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        prompt_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
-        Compute Generalized Advantage Estimation (GAE) with global normalization (GRPO).
-        Advantages are normalized across all trajectories in the batch, making the policy
-        learn from relative performance rather than absolute reward values.
+        Compute GRPO advantages by subtracting the per-prompt mean reward for each rollout.
 
         Args:
-            rewards: [T, batch_B] tensor of rewards
-            values: [T, batch_B] tensor of value estimates
-            device: torch device
-
-        Returns:
-            returns: [T, batch_B] tensor of returns (value targets)
-            advantages: [T, batch_B] tensor of advantages
+            rewards: [T, batch_B] tensor of discounted rewards.
+            prompt_indices: [batch_B] tensor mapping each rollout to its prompt id.
         """
-        # Compute GAE for all trajectories
-        returns, advantages = self._compute_gae(rewards, values, device)
+        if prompt_indices is None:
+            baseline = rewards.mean(dim=1, keepdim=True)
+            return rewards - baseline
 
-        # Advantage normalization:
-        # - If prompt_indices is provided, normalize *within each prompt's rollouts* (per-prompt GRPO).
-        # - Otherwise, fall back to global normalization across the whole batch.
-        if prompt_indices is not None:
-            # prompt_indices: [batch_B], mapping each rollout to its original prompt id
-            advantages_norm = advantages.clone()
-            unique_prompts = torch.unique(prompt_indices)
-            for prompt_id in unique_prompts:
-                mask = prompt_indices == prompt_id  # [batch_B]
-                if not mask.any():
-                    continue
-                # Slice advantages for this prompt: [T, num_rollouts_for_prompt]
-                adv_subset = advantages[:, mask]
-                adv_mean = adv_subset.mean()
-                adv_std = adv_subset.std() + 1e-8
-                advantages_norm[:, mask] = (adv_subset - adv_mean) / adv_std
-            advantages = advantages_norm
-        else:
-            # Global normalization (legacy behavior)
-            advantages_mean = advantages.mean()
-            advantages_std = advantages.std() + 1e-8
-            advantages = (advantages - advantages_mean) / advantages_std
+        advantages = torch.zeros_like(rewards)
+        unique_prompts = torch.unique(prompt_indices)
+        for prompt_id in unique_prompts:
+            mask = prompt_indices == prompt_id  # [batch_B]
+            if not mask.any():
+                continue
+            prompt_rewards = rewards[:, mask]
+            baseline = prompt_rewards.mean(dim=1, keepdim=True)
+            advantages[:, mask] = prompt_rewards - baseline
+        return advantages
 
-        return returns, advantages
+    @staticmethod
+    def _clipped_policy_loss(
+        ratio: torch.Tensor, advantages: torch.Tensor, clip_epsilon: float
+    ) -> torch.Tensor:
+        """
+        Standard GRPO clipped surrogate loss.
+        """
+        clipped_ratio = torch.clamp(
+            ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon
+        )
+        return -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
 
     def _apply_length_action_with_prefix(
         self,
@@ -444,11 +381,8 @@ class LengthPolicyOptimizer:
                 else:
                     model_input.update_suffix_tokens(prompt_data)
 
-                episode_rewards = []
-                episode_likelihoods = []
                 episode_log_probs = []
                 episode_states = []
-                episode_action_probs = []  # Store for entropy
                 episode_actions = (
                     []
                 )  # Store actions for GRPO importance sampling computation
@@ -459,7 +393,6 @@ class LengthPolicyOptimizer:
 
                 # Set policy to eval mode during episode (no gradients, only inference)
                 self.policy_net.eval()
-                self.value_net.eval()
 
                 # Track last known likelihood for state representation
                 # Use the *real* initial likelihoods instead of a placeholder 0
@@ -787,11 +720,9 @@ class LengthPolicyOptimizer:
 
                     # Store step data (rewards computed at episode end for policy updates)
                     # Use last_known_likelihoods for tracking (will be replaced with final likelihood at episode end)
-                    episode_likelihoods.append(last_known_likelihoods.clone())
                     episode_log_probs.append(log_probs)
                     episode_states.append(states)
-                    episode_action_probs.append(action_probs)  # Store for entropy
-                    episode_actions.append(actions)  # Store actions for PPO
+                    episode_actions.append(actions)
 
                     # Store step-level trace for plotting
                     local_step = episode * steps_per_episode + step
@@ -1004,50 +935,24 @@ class LengthPolicyOptimizer:
                 # Update best_likelihoods in traces with final values
                 for step, trace in enumerate(traces[-T:]):
                     trace["best_likelihoods"] = [float(l) for l in best_likelihoods]
-                    # Keep step-level rewards in trace for debugging (already set during episode)
-                    # Policy updates use episode_rewards_list (final discounted rewards)
-
-                # Update episode_likelihoods with final likelihoods (for consistency, though not used in GRPO)
-                episode_likelihoods = [final_likelihoods.unsqueeze(0) for _ in range(T)]
 
                 # Now we update the policy network using collected episode data
                 # Set to training mode for gradient computation
                 self.policy_net.train()
-                self.value_net.train()
 
                 rewards_tensor = torch.stack(episode_rewards_list)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
                 states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
-                action_probs_tensor = torch.stack(
-                    episode_action_probs
-                )  # [T, batch_B, 3]
                 actions_tensor = torch.stack(episode_actions)  # [T, batch_B]
 
                 # GRPO update with multiple epochs
-                # Compute values for all states (old policy)
-                with torch.no_grad():
-                    old_values = self.value_net(states_tensor).squeeze(
-                        -1
-                    )  # [T, batch_B]
-
-                # Compute returns and advantages using GAE with per-prompt normalization (GRPO)
-                # Each prompt's rollouts are normalized independently; prompts are not compared to each other.
-                returns, advantages = self._compute_grpo_advantages(
-                    rewards_tensor, old_values, device, batch_prompt_indices_for_episode
+                advantages = self._compute_group_advantages(
+                    rewards_tensor, batch_prompt_indices_for_episode
                 )
-
-                # Normalize returns for stable value learning (store stats for denormalization)
-                # Note: advantages are already globally normalized in _compute_grpo_advantages
-                returns_mean = returns.mean()
-                returns_std = returns.std() + 1e-8
-                returns_normalized = (returns - returns_mean) / returns_std
-
-                # Store old log probs for importance sampling ratio
                 old_log_probs = log_probs_tensor.detach()
 
                 # Multiple GRPO epochs
                 final_policy_loss = None
-                final_value_loss = None
                 final_entropy = None
                 for epoch in range(self.grpo_epochs):
                     # Recompute log probs and values with current policy
@@ -1086,38 +991,9 @@ class LengthPolicyOptimizer:
                     )  # [T, batch_B]
 
                     # Compute clipped policy loss
-                    policy_loss_1 = ratio * advantages
-                    policy_loss_2 = (
-                        torch.clamp(ratio, 1.0 - self.grpo_clip, 1.0 + self.grpo_clip)
-                        * advantages
+                    policy_loss = self._clipped_policy_loss(
+                        ratio, advantages, self.grpo_clip
                     )
-                    policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
-
-                    # Value loss (use normalized returns for stable learning)
-                    new_values = self.value_net(states_tensor).squeeze(
-                        -1
-                    )  # [T, batch_B]
-
-                    # Check for extreme values (safeguard against activation issues)
-                    if torch.any(torch.isnan(new_values)) or torch.any(
-                        torch.isinf(new_values)
-                    ):
-                        logging.warning(
-                            f"Value network produced NaN/Inf values. States range: [{states_tensor.min().item():.2f}, {states_tensor.max().item():.2f}]"
-                        )
-                        # Replace with zeros to prevent training crash
-                        new_values = torch.where(
-                            torch.isfinite(new_values),
-                            new_values,
-                            torch.zeros_like(new_values),
-                        )
-
-                    # Normalize new values to match normalized returns
-                    new_values_normalized = (new_values - returns_mean) / returns_std
-                    # Compute loss on normalized scale (much smaller, more stable)
-                    value_loss = F.mse_loss(new_values_normalized, returns_normalized)
-                    # Scale back to original scale for logging (multiply by std^2)
-                    value_loss_scaled = value_loss * (returns_std**2)
 
                     # Entropy bonus
                     entropy = (
@@ -1127,49 +1003,30 @@ class LengthPolicyOptimizer:
                     )
                     entropy_bonus = entropy * self.entropy_coef
 
-                    # Total loss (use normalized value loss for training, but log scaled version)
-                    total_loss = (
-                        policy_loss + self.grpo_value_coef * value_loss - entropy_bonus
-                    )
+                    total_loss = policy_loss - entropy_bonus
 
                     # Update
-                    self.optimizer.zero_grad()
+                    self.policy_optimizer.zero_grad()
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(
-                        list(self.policy_net.parameters())
-                        + list(self.value_net.parameters()),
+                        list(self.policy_net.parameters()),
                         max_norm=self.max_grad_norm,
                     )
-                    self.optimizer.step()
+                    self.policy_optimizer.step()
 
                     # Store final metrics from last epoch (use scaled loss for logging)
                     final_policy_loss = policy_loss.item()
-                    final_value_loss = (
-                        value_loss_scaled.item()
-                    )  # Use scaled loss for logging
                     final_entropy = entropy.item()
 
                 # Track policy metrics for GRPO (after all epochs)
                 avg_reward = rewards_tensor.mean().item()
-                avg_return = returns.mean().item()
+                avg_return = avg_reward
                 avg_advantage = (
                     advantages.mean().item()
-                )  # Should be ~0 after normalization
+                )  # Should be ~0 after per-group centering
                 std_advantage = (
                     advantages.std().item()
-                )  # Should be ~1 after normalization
-
-                # Monitor value predictions vs returns to verify learning
-                # Use final values from last epoch (after updates)
-                with torch.no_grad():
-                    final_values = self.value_net(states_tensor).squeeze(
-                        -1
-                    )  # [T, batch_B]
-                avg_value_pred = final_values.mean().item()
-                avg_return_actual = returns.mean().item()
-                value_pred_error = (
-                    (final_values - returns).abs().mean().item()
-                )  # Mean absolute error
+                )
 
                 batch_policy_metrics.append(
                     {
@@ -1180,11 +1037,8 @@ class LengthPolicyOptimizer:
                         "avg_advantage": avg_advantage,
                         "std_advantage": std_advantage,
                         "policy_loss": final_policy_loss,
-                        "value_loss": final_value_loss,
                         "entropy": final_entropy,
                         "epsilon": self.current_epsilon,
-                        "avg_value_pred": avg_value_pred,
-                        "value_pred_error": value_pred_error,
                     }
                 )
 

@@ -35,7 +35,7 @@ train:
   
   # Parallel processing parameters - SMOKE TEST: batch size 1
   batch_size: 10                       # Batch size 10 for smoke test
-  rollouts_per_prompt: 4               # Number of trajectories (rollouts) per prompt for PPO advantage computation
+  rollouts_per_prompt: 4               # Number of trajectories (rollouts) per prompt for GRPO
   
   # Output
   save_path: models/trained_policy_smoke_test.pt
@@ -60,14 +60,12 @@ train:
     epochs: 4                         # Number of GRPO update epochs per episode
     clip: 0.2                         # GRPO clipping epsilon
     gamma: 0.99                       # Discount factor
-    gae_lambda: 0.95                  # GAE lambda parameter
-    value_coef: 0.5                   # Value loss coefficient
     entropy_coef: 0.01                # Entropy bonus coefficient (overrides train.entropy_coef if set)
     max_grad_norm: 0.5                # Maximum gradient norm for clipping
   
   # Policy network architecture
   policy:
-    hidden_size: 64                  # Hidden layer size for policy and value networks
+    hidden_size: 64                  # Hidden layer size for policy network
 
 eval:
   # Test dataset parameters
@@ -89,4 +87,6 @@ eval:
   no_plots: false                    # Create plots
   plots_prefix: eval
   plots_format: pdf                  # png|pdf (for when plots are enabled)
+  batch_size: 8                      # Batch size for evaluation
+  dataset: toxicchat                # Dataset to use during evaluation
 

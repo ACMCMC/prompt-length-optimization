@@ -308,7 +308,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             for cand_idx in range(search_width):
                 pos = selected_positions[cand_idx].item()
                 new_token = candidate_tokens[cand_idx].item()
-                all_update_info.append((prompt_idx, cand_idx, pos, new_token))
+                    all_update_info.append((prompt_idx, cand_idx, pos, new_token))
 
         if len(all_candidate_sequences) == 0:
             return (
@@ -522,7 +522,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             # Only keep improvements (restore previous tokens for non-improving prompts)
             improve_mask = current_lls > best_lls
             if improve_mask.any():
-                best_lls = torch.where(improve_mask, current_lls, best_lls)
+            best_lls = torch.where(improve_mask, current_lls, best_lls)
             best_tokens = torch.where(
                 improve_mask.view(-1, 1), best_tokens, old_tokens
             )
