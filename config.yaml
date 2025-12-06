@@ -1,5 +1,6 @@
 # Configuration for toxic-chat dataset training and evaluation
-model: EleutherAI/pythia-410m
+# model: EleutherAI/pythia-410m
+model: EleutherAI/pythia-160m
 seed: 2262
 
 # Dataset split ratios (must sum to 1.0)
@@ -10,31 +11,31 @@ dataset:
 
 train:
   # Dataset parameters
-  max_prompts: 256                   # Number of prompts to train on
+  max_prompts: 128                      # Number of prompts to train on
   min_prompt_length: 30              # Minimum prompt length (characters)
   max_prompt_length: 150             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 3             # Episodes to train on each prompt
+  episodes_per_prompt: 20            # Episodes to train on each prompt
   steps_per_episode: 50            # Steps per episode (increased for better RL learning)
-  init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
-  max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
+  init_len: 32                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 64                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
-  lr_policy: 0.001
+  lr_policy: 0.0003
   epsilon: 0.3                    # Epsilon for epsilon-greedy exploration (lower = less random exploration)
   epsilon_decay: 0.97            # Epsilon decay per episode (slightly slower decay, but from a lower starting epsilon)
   epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
   entropy_coef: 0.02              # Entropy bonus coefficient (encourages diverse action distributions; mostly unused if grpo.entropy_coef is set)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
-  alpha: 0.5                         # Likelihood weight
-  beta: 1.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
-  projection_weight: 0.5            # Weight for projection regularization (continuous_proj mode)
+  alpha: 1.0                         # Likelihood weight
+  beta: 6.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 16                      # Prompts per batch for progress tracking
+  batch_size: 4                      # Prompts per batch for progress tracking
   rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for GRPO
   
   # Output
@@ -54,7 +55,7 @@ train:
     top_k: 16
     batch_size: 32 # Number of candidates per position
     max_batch_size: 128  # Maximum batch size for forward passes (to avoid OOM), this modifies the above batch size to limit the number of elements per forward pass
-    steps: 3
+    steps: 10
   
   # GRPO parameters (Group Relative Policy Optimization)
   grpo:
