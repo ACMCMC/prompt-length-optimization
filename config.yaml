@@ -1,5 +1,5 @@
 # Configuration for toxic-chat dataset training and evaluation
-model: EleutherAI/pythia-70m
+model: EleutherAI/pythia-410m
 seed: 2262
 
 # Dataset split ratios (must sum to 1.0)

@@ -11,6 +11,7 @@ from ..model_inputs import ModelBatchedInput
 import logging
 
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -67,11 +68,18 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
 
     grad = one_hot.grad.clone()
     grad = grad / grad.norm(dim=-1, keepdim=True)
+    # Re-enabled normalization to stay aligned with vanilla GCG behavior.
     return grad
 
 
 def sample_control(
-    control_toks, grad, batch_size, topk=256, temp=1, not_allowed_tokens=None
+    control_toks,
+    grad,
+    batch_size,
+    topk=256,
+    temp=1,
+    not_allowed_tokens=None,
+    n_replace=1,
 ):
     """
     Sample candidate control sequences following the official GCG sampling rule.
@@ -84,11 +92,21 @@ def sample_control(
     control_toks = control_toks.to(grad.device)
 
     original_control_toks = control_toks.repeat(batch_size, 1)
-    pos_choices = torch.randint(0, len(control_toks), (batch_size,), device=grad.device)
-    tok_choices = torch.randint(0, topk, (batch_size,), device=grad.device)
-    new_token_val = top_indices[pos_choices, tok_choices].unsqueeze(-1)
-    new_token_pos = pos_choices.unsqueeze(-1)
-    new_control_toks = original_control_toks.scatter_(1, new_token_pos, new_token_val)
+    rand_order = torch.argsort(
+        torch.rand(batch_size, len(control_toks), device=grad.device), dim=-1
+    )
+    sampled_pos = rand_order[:, :n_replace]
+    tok_choices = torch.randint(
+        0, topk, (batch_size, n_replace), device=grad.device
+    )
+    pos_flat = sampled_pos.reshape(-1)
+    choice_flat = tok_choices.reshape(-1)
+    selected_vals = top_indices[pos_flat, choice_flat].reshape(batch_size, n_replace)
+
+    new_control_toks = original_control_toks.clone()
+    new_control_toks.scatter_(
+        1, sampled_pos, selected_vals
+    )
     return new_control_toks
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
@@ -140,8 +158,16 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             if agent.special_token_ids
             else None
         )
+        self.last_grad_norms = None
+        self.last_topk_idx = None
+        self._last_token_grads = None
         self.last_first_token_prob = None
-        self.latest_metrics: dict = {}
+        self.last_avg_token_logprob = None
+        self.completion_grad_monitor_tokens = 5
+        self.completion_grad_monitor_prompts = 2
+        self.last_completion_grad_summary = None
+        self.last_first_token_prob = None
+        self.last_avg_token_logprob = None
 
     def initialize_prompts(
         self, model_input: ModelBatchedInput
@@ -206,57 +232,143 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         tokens = model_input.completion_input_ids[idx]
         return tokens[mask]
 
-    def _compute_prompt_likelihoods(
-        self, model_input: ModelBatchedInput
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _compute_gradients(
+        self,
+        prompt_data: torch.Tensor,
+        model_input: ModelBatchedInput,
+        suffix_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Run the language model on the current batched inputs and return:
-        - Total log-likelihood per prompt
-        - Per-token log probabilities for completion tokens
-        - Completion token mask
+        Helper for tests: compute embedding gradients w.r.t. suffix tokens without diagnostics.
         """
-        input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
-        with torch.no_grad():
-            outputs = self.agent.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            logits = outputs.logits
+        batch_size = prompt_data.shape[0]
+        vocab_size = self.embedding_layer.weight.shape[0]
+        vocab_gradients = torch.zeros(
+            batch_size,
+            self.max_prompt_len,
+            vocab_size,
+            device=self.device,
+            dtype=self.embedding_layer.weight.dtype,
+        )
+        embed_gradients = torch.zeros(
+            batch_size,
+            self.max_prompt_len,
+            self.emb_dim,
+            device=self.device,
+            dtype=self.embedding_layer.weight.dtype,
+        )
 
-        completion_start_pos = model_input.get_completion_start_pos()
-        completion_tokens = model_input.completion_input_ids
-        completion_mask = model_input.completion_attention_mask.bool()
-        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
-            logits, completion_start_pos, completion_tokens, completion_mask
+        for prompt_idx in range(batch_size):
+            active_positions = torch.nonzero(
+                suffix_mask[prompt_idx] == 1, as_tuple=False
+            ).squeeze(-1)
+            length = active_positions.shape[0]
+            completion_len = int(
+                model_input.completion_attention_mask[prompt_idx].sum().item()
+            )
+
+            if length == 0 or completion_len == 0:
+                continue
+
+            prefix_tokens = self._trim_prefix_tokens(model_input, prompt_idx)
+            completion_tokens = self._trim_completion_tokens(model_input, prompt_idx)
+            control_tokens = prompt_data[prompt_idx, :length]
+
+            input_ids = torch.cat(
+                [prefix_tokens, control_tokens, completion_tokens], dim=0
+            )
+            pref_len = prefix_tokens.shape[0]
+            control_slice = slice(pref_len, pref_len + length)
+            target_slice = slice(pref_len + length, pref_len + length + completion_len)
+            loss_slice = slice(pref_len + length - 1, pref_len + length - 1 + completion_len)
+
+            self.agent.model.zero_grad(set_to_none=True)
+            grad_vocab = token_gradients(
+                self.agent.model, input_ids, control_slice, target_slice, loss_slice
+            )
+            vocab_gradients[prompt_idx, :length, :] = grad_vocab
+            grad_embed = grad_vocab @ self.embedding_layer.weight
+            embed_gradients[prompt_idx, :length, :] = grad_embed
+
+        self._last_token_grads = vocab_gradients
+        return embed_gradients
+
+    def _sample_candidates_from_grad(
+        self,
+        prompt_data: torch.Tensor,
+        gradients: torch.Tensor,
+        suffix_mask: torch.Tensor,
+        n_replace: int = 1,
+    ) -> Tuple[torch.Tensor, list]:
+        """
+        Sample candidate sequences using the official sample_control helper (compatibility shim).
+        """
+        del n_replace  # Not used; kept for backward compatibility with tests
+
+        search_width = self.gcg_batch_size
+        candidate_sequences = []
+        update_info = []
+
+        batch_size = prompt_data.shape[0]
+        token_grads = (
+            self._last_token_grads
+            if self._last_token_grads is not None
+            else None
         )
-        # Alignment check: ensure the first completion token prob matches manual extraction
-        first_mask = comp_mask[:, 0]
-        helper_probs = token_log_probs[first_mask, 0]
-        batch_indices = torch.nonzero(first_mask, as_tuple=False).squeeze(-1)
-        manual_probs = []
-        for idx in batch_indices:
-            start = int(completion_start_pos[idx].item())
-            slice_logits = logits[idx, start - 1, :]
-            log_probs = F.log_softmax(slice_logits, dim=-1)
-            token_id = completion_tokens[idx][completion_mask[idx]][0]
-            manual_probs.append(log_probs[token_id].exp().item())
-        manual_probs_tensor = torch.tensor(
-            manual_probs, device=self.device, dtype=helper_probs.dtype
-        )
-        diff = torch.max(torch.abs(manual_probs_tensor - helper_probs.exp()))
-        if diff > 1e-5:
-            logger.warning(
-                "First-token prob mismatch detected (max diff=%.6f). Manual=%s Helper=%s",
-                diff.item(),
-                manual_probs_tensor.tolist(),
-                helper_probs.exp().tolist(),
-        )
-        masked_log_probs = torch.where(
-            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
-        )
-        likelihoods = masked_log_probs.sum(dim=-1)
-        avg_per_token_logprob = masked_log_probs.sum() / comp_mask.sum().clamp(min=1)
-        return likelihoods, token_log_probs, comp_mask, avg_per_token_logprob
+
+        for prompt_idx in range(batch_size):
+            active_positions = torch.nonzero(
+                suffix_mask[prompt_idx] == 1, as_tuple=False
+            ).squeeze(-1)
+            length = active_positions.shape[0]
+            if length == 0:
+                continue
+
+            if token_grads is not None:
+                grad_for_sampling = token_grads[prompt_idx, :length, :]
+            else:
+                # Fallback: approximate vocab gradients by projecting embedding grads back via pseudo-inverse
+                embed_grad = gradients[prompt_idx, :length, :]
+                embedding_weights = self.embedding_layer.weight  # [vocab, emb_dim]
+                pseudo_inverse = torch.pinverse(embedding_weights)
+                grad_for_sampling = embed_grad @ pseudo_inverse.t()
+
+            control_tokens = prompt_data[prompt_idx, :length]
+            candidates = sample_control(
+                control_tokens,
+                grad_for_sampling,
+                batch_size=search_width,
+                topk=self.gcg_top_k,
+                temp=1,
+                not_allowed_tokens=self.not_allowed_tokens,
+                n_replace=1,
+            )
+
+            padded = prompt_data[prompt_idx : prompt_idx + 1].repeat(
+                search_width, 1
+            )
+            padded[:, :length] = candidates
+            candidate_sequences.append(padded)
+
+            for cand_idx in range(search_width):
+                diff_positions = (
+                    (control_tokens != candidates[cand_idx])
+                    .nonzero(as_tuple=False)
+                    .squeeze(-1)
+                )
+                pos = diff_positions[0].item() if diff_positions.numel() > 0 else 0
+                new_token = candidates[cand_idx, pos].item()
+                update_info.append((prompt_idx, cand_idx, pos, new_token))
+
+        if len(candidate_sequences) == 0:
+            return (
+                torch.empty(
+                    0, self.max_prompt_len, dtype=torch.long, device=self.device
+                ),
+                [],
+            )
+
+        return torch.cat(candidate_sequences, dim=0), update_info
 
     def _test_candidates_batch(
         self,
@@ -363,6 +475,33 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             self.device
         )  # [total_candidates] (move back to device)
 
+    def _compute_prompt_likelihoods(
+        self, model_input: ModelBatchedInput
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run a forward pass and return (completion log-likelihoods, per-token log probs,
+        completion mask, overall average per-token log probability).
+        """
+        input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        with torch.no_grad():
+            logits = self.agent.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+        completion_start_pos = model_input.get_completion_start_pos()
+        completion_tokens = model_input.completion_input_ids
+        completion_mask = model_input.completion_attention_mask.bool()
+        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+            logits, completion_start_pos, completion_tokens, completion_mask
+        )
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        likelihoods = masked_log_probs.sum(dim=-1)
+        avg_log_prob = masked_log_probs.sum() / comp_mask.sum().clamp(min=1)
+        return likelihoods, token_log_probs, comp_mask, avg_log_prob
+
     def inner_optimization_step(
         self,
         prompt_data: torch.Tensor,
@@ -392,15 +531,21 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         # Track best likelihoods and tokens
         model_input.update_suffix_tokens(prompt_data)
-        best_lls, _, _, _ = self._compute_prompt_likelihoods(model_input)
+        (
+            best_lls,
+            initial_token_log_probs,
+            initial_comp_mask,
+            _,
+        ) = self._compute_prompt_likelihoods(model_input)
         initial_lls = best_lls.clone()  # For monotonicity check at the end
         best_tokens = prompt_data.clone()
         accumulated_ll_delta = torch.zeros(1, device=self.device)
-
         self.last_first_token_prob = None
         self.last_avg_token_logprob = None
+
         gcg_iter_bar = tqdm(range(self.gcg_steps), desc="GCG", leave=False)
-        self.latest_metrics = {}  # reset metrics for this run
+        prev_token_log_probs = None
+        prev_comp_mask = None
         for gcg_iter in gcg_iter_bar:
             # Ensure latest tokens are reflected in model_input before scoring candidates
             model_input.update_suffix_tokens(best_tokens)
@@ -408,6 +553,10 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_sequences = []
             candidate_prompt_indices = []
             active_prompt_indices = []
+            grad_monitor_data = []
+            monitor_prompt_limit = min(
+                self.completion_grad_monitor_prompts, batch_size
+            )
 
             for prompt_idx in range(batch_size):
                 length = int(lengths[prompt_idx].item())
@@ -437,10 +586,44 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     pref_len + length - 1 + completion_tokens.shape[0],
                 )
 
+                if (
+                    completion_len > 0
+                    and len(grad_monitor_data) < monitor_prompt_limit
+                ):
+                    grad_monitor_data.append(
+                        self._collect_completion_grad_stats(
+                            input_ids,
+                            control_slice,
+                            target_slice,
+                            loss_slice,
+                            completion_tokens.shape[0],
+                        )
+                    )
+
                 self.agent.model.zero_grad(set_to_none=True)
                 grad = token_gradients(
                     self.agent.model, input_ids, control_slice, target_slice, loss_slice
                 )  # [length, vocab]
+
+                if gcg_iter == self.gcg_steps - 1:
+                    if (
+                        self.last_grad_norms is None
+                        or self.last_grad_norms.shape[0] != batch_size
+                    ):
+                        self.last_grad_norms = torch.zeros(
+                            batch_size, self.max_prompt_len, device=self.device
+                        )
+                        self.last_topk_idx = torch.zeros(
+                            batch_size,
+                            self.max_prompt_len,
+                            self.gcg_top_k,
+                            device=self.device,
+                            dtype=torch.long,
+                        )
+                    grad_norm = grad.norm(dim=-1)
+                    topk_idx_local = (-grad).topk(self.gcg_top_k, dim=1).indices
+                    self.last_grad_norms[prompt_idx, :length] = grad_norm.detach()
+                    self.last_topk_idx[prompt_idx, :length, :] = topk_idx_local.detach()
 
                 candidates = sample_control(
                     control_tokens,
@@ -459,6 +642,22 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 candidate_sequences.append(padded_candidates)
                 candidate_prompt_indices.extend([prompt_idx] * self.gcg_batch_size)
                 active_prompt_indices.append(prompt_idx)
+
+            if grad_monitor_data:
+                summary = self._summarize_completion_grad_stats(grad_monitor_data)
+                self.last_completion_grad_summary = summary
+                summary_str = ", ".join(
+                    f"t{idx}:mean={vals['mean']:.3e},max={vals['max']:.3e}"
+                    for idx, vals in summary.items()
+                )
+                logger.info(
+                    "Completion grad monitor (iter %d, first %d prompts): %s",
+                    gcg_iter + 1,
+                    len(grad_monitor_data),
+                    summary_str,
+                )
+            else:
+                self.last_completion_grad_summary = None
 
             if len(candidate_sequences) == 0:
                 break
@@ -487,19 +686,9 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 best_tokens[prompt_idx] = candidate_tensor[best_candidate_idx]
 
             model_input.update_suffix_tokens(best_tokens)
-            (
-                current_lls,
-                token_log_probs,
-                comp_mask,
-                avg_log_prob_batch,
-            ) = self._compute_prompt_likelihoods(model_input)
-
-            # Debug metrics: average per-token log prob and first-token probability (in [0, 1])
-            avg_log_prob = float("nan")
-            total_tokens = comp_mask.sum().item()
-            if total_tokens > 0:
-                valid_token_log_probs = token_log_probs[comp_mask]
-                avg_log_prob = valid_token_log_probs.mean().item()
+            current_lls, token_log_probs, comp_mask, avg_log_prob = (
+                self._compute_prompt_likelihoods(model_input)
+            )
 
             avg_first_prob = float("nan")
             if comp_mask.shape[1] > 0:
@@ -509,27 +698,26 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     avg_first_prob = first_probs.mean().item()
 
             self.last_first_token_prob = avg_first_prob
-            self.last_avg_token_logprob = avg_log_prob_batch.item()
+            self.last_avg_token_logprob = avg_log_prob.item()
             logger.info(
                 "GCG iter %d: avg per-token logprob=%.4f, avg first completion prob=%.4f",
                 gcg_iter + 1,
                 self.last_avg_token_logprob,
                 avg_first_prob,
             )
-            self.latest_metrics["avg_first_completion_prob"] = avg_first_prob
 
+            step_delta = torch.zeros_like(current_lls)
             improve_mask = current_lls > best_lls
             if improve_mask.any():
                 best_lls = torch.where(improve_mask, current_lls, best_lls)
+                step_delta = torch.where(
+                    improve_mask, current_lls - old_best_lls, torch.zeros_like(current_lls)
+                )
+                accumulated_ll_delta += step_delta.sum()
             best_tokens = torch.where(
                 improve_mask.view(-1, 1), best_tokens, old_tokens
             )
             model_input.update_suffix_tokens(best_tokens)
-
-            step_delta = torch.where(
-                improve_mask, current_lls - old_best_lls, torch.zeros_like(current_lls)
-            )
-            accumulated_ll_delta += step_delta.sum()
 
             for block_idx, prompt_idx in enumerate(active_prompt_indices):
                 if not improve_mask[prompt_idx]:
@@ -576,7 +764,12 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             prompt_data[inactive_mask] = bos_token_id
 
         model_input.update_suffix_tokens(prompt_data)
-        final_likelihoods, _, _, _ = self._compute_prompt_likelihoods(model_input)
+        (
+            final_likelihoods,
+            final_token_log_probs,
+            final_comp_mask,
+            _,
+        ) = self._compute_prompt_likelihoods(model_input)
 
         # Monotonicity check: warn if final likelihoods are worse than initial
         # This should not typically happen if GCG is behaving as a greedy ascent step.
@@ -589,6 +782,17 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 f"Accumulated LL delta {accumulated_ll_delta.item():.6f} "
                 f"does not match final improvement {total_final_delta.item():.6f}"
             )
+        common_mask = initial_comp_mask & final_comp_mask
+        token_deltas = final_token_log_probs - initial_token_log_probs
+        if common_mask.any():
+            decreased_mask = token_deltas[common_mask] < -1e-6
+            if decreased_mask.any():
+                pct = 100.0 * decreased_mask.float().mean().item()
+                worst_token_delta = token_deltas[common_mask][decreased_mask].min().item()
+                logger.warning(
+                    f"Per-token log-prob decreased for {pct:.2f}% of completion tokens (min Δ={worst_token_delta:.6f})."
+                )
+
         if (ll_deltas < -1e-6).any():
             num_decreased = (ll_deltas < 0).sum().item()
             min_delta = ll_deltas.min().item()
@@ -597,6 +801,30 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             )
             
         return prompt_data, final_likelihoods
+
+    def _compute_prompt_likelihoods(
+        self, model_input: ModelBatchedInput
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return completion log-likelihoods plus per-token log probs."""
+        input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        with torch.no_grad():
+            logits = self.agent.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+        completion_start_pos = model_input.get_completion_start_pos()
+        completion_tokens = model_input.completion_input_ids
+        completion_mask = model_input.completion_attention_mask.bool()
+        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+            logits, completion_start_pos, completion_tokens, completion_mask
+        )
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        likelihoods = masked_log_probs.sum(dim=-1)
+        avg_log_prob = masked_log_probs.sum() / comp_mask.sum().clamp(min=1)
+        return likelihoods, token_log_probs, comp_mask, avg_log_prob
 
     def to_tokens(
         self, prompt_data: torch.Tensor, lengths: torch.Tensor
@@ -621,6 +849,65 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     ) -> torch.Tensor:
         """Clone a single prompt's tokens."""
         return prompt_data[idx, :length].clone()
+
+    def _collect_completion_grad_stats(
+        self,
+        input_ids: torch.Tensor,
+        control_slice: slice,
+        target_slice: slice,
+        loss_slice: slice,
+        completion_len: int,
+    ):
+        """Compute gradient norms for the first few completion tokens (diagnostics)."""
+        stats = []
+        tokens_to_check = min(
+            self.completion_grad_monitor_tokens, completion_len
+        )
+        for offset in range(tokens_to_check):
+            token_target_slice = slice(
+                target_slice.start + offset, target_slice.start + offset + 1
+            )
+            token_loss_slice = slice(
+                loss_slice.start + offset, loss_slice.start + offset + 1
+            )
+            self.agent.model.zero_grad(set_to_none=True)
+            grad_vocab = token_gradients(
+                self.agent.model,
+                input_ids,
+                control_slice,
+                token_target_slice,
+                token_loss_slice,
+            )
+            grad_norms = grad_vocab.norm(dim=-1)
+            stats.append(
+                {
+                    "offset": offset,
+                    "mean": grad_norms.mean().item(),
+                    "max": grad_norms.max().item(),
+                }
+            )
+        return stats
+
+    @staticmethod
+    def _summarize_completion_grad_stats(grad_monitor_data):
+        """Aggregate gradient stats across monitored prompts."""
+        summary = {}
+        if not grad_monitor_data:
+            return summary
+        max_tokens = max(len(item) for item in grad_monitor_data)
+        for token_idx in range(max_tokens):
+            means = []
+            maxes = []
+            for prompt_stats in grad_monitor_data:
+                if token_idx < len(prompt_stats):
+                    means.append(prompt_stats[token_idx]["mean"])
+                    maxes.append(prompt_stats[token_idx]["max"])
+            if means:
+                summary[token_idx] = {
+                    "mean": sum(means) / len(means),
+                    "max": max(maxes),
+                }
+        return summary
 
     def _completion_token_log_probs_from_logits(
         self,
