@@ -3,7 +3,11 @@
 import torch
 import pytest
 from prompt_optimization.agent import PromptRLAgent
-from prompt_optimization.optimizers.discrete import DiscretePromptOptimizer
+from prompt_optimization.optimizers.discrete import (
+    DiscretePromptOptimizer,
+    token_gradients,
+    sample_control,
+)
 from prompt_optimization.model_inputs import ModelBatchedInput
 
 
@@ -207,8 +211,7 @@ def test_gcg_preserves_prompt_structure(agent, gcg_optimizer):
 
 def test_gcg_gradient_computation(agent, gcg_optimizer):
     """
-    Test that GCG can compute gradients w.r.t. token embeddings.
-    This verifies the core gradient-based candidate sampling mechanism.
+    Verify gradients from token_gradients are finite and well-shaped for a real prompt.
     """
     prefix_text = "Test gradient"
     completion_text = "computation"
@@ -225,27 +228,41 @@ def test_gcg_gradient_computation(agent, gcg_optimizer):
     )
     
     prompt_data, lengths = gcg_optimizer.initialize_prompts(model_input)
-    suffix_mask = model_input.suffix_attention_mask
-    
-    # Test gradient computation
-    gradients = gcg_optimizer._compute_gradients(prompt_data, model_input, suffix_mask)
-    
-    # Verify gradients shape: [B, max_suffix_len, emb_dim]
-    assert gradients.shape == (gcg_optimizer.batch_size, gcg_optimizer.max_suffix_len, gcg_optimizer.emb_dim), \
-        f"Gradients should have shape [B, max_suffix_len, emb_dim], got {gradients.shape}"
-    
-    # Verify gradients are finite
+    length = int(lengths[0].item())
+    assert length > 0, "Suffix should contain active tokens for gradient computation"
+
+    prefix_tokens = model_input.prefix_input_ids[0][
+        model_input.prefix_attention_mask[0].bool()
+    ]
+    completion_tokens = model_input.completion_input_ids[0][
+        model_input.completion_attention_mask[0].bool()
+    ]
+    control_tokens = prompt_data[0, :length]
+
+    input_ids = torch.cat(
+        [prefix_tokens, control_tokens, completion_tokens],
+        dim=0,
+    )
+    pref_len = prefix_tokens.shape[0]
+    completion_len = completion_tokens.shape[0]
+    control_slice = slice(pref_len, pref_len + length)
+    target_slice = slice(pref_len + length, pref_len + length + completion_len)
+    loss_slice = slice(pref_len + length - 1, pref_len + length - 1 + completion_len)
+
+    agent.model.zero_grad(set_to_none=True)
+    gradients = token_gradients(
+        agent.model, input_ids, control_slice, target_slice, loss_slice
+    )
+
+    vocab_size = agent.model.get_input_embeddings().weight.shape[0]
+    assert gradients.shape == (length, vocab_size)
     assert torch.all(torch.isfinite(gradients)), "All gradients should be finite"
-    
-    # Verify gradients are not all zero (at least some should be non-zero)
-    assert not torch.allclose(gradients, torch.zeros_like(gradients)), \
-        "Gradients should not be all zero"
+    assert not torch.allclose(gradients, torch.zeros_like(gradients))
 
 
 def test_gcg_candidate_sampling(agent, gcg_optimizer):
     """
-    Test that GCG can sample candidates from gradients.
-    This verifies the candidate generation mechanism.
+    Ensure sample_control proposes valid candidate sequences using real gradients.
     """
     prefix_text = "Test sampling"
     completion_text = "candidates"
@@ -262,28 +279,50 @@ def test_gcg_candidate_sampling(agent, gcg_optimizer):
     )
     
     prompt_data, lengths = gcg_optimizer.initialize_prompts(model_input)
-    suffix_mask = model_input.suffix_attention_mask
-    
-    # Compute gradients
-    gradients = gcg_optimizer._compute_gradients(prompt_data, model_input, suffix_mask)
-    
-    # Sample candidates
-    candidate_sequences, update_info = gcg_optimizer._sample_candidates_from_grad(
-        prompt_data, gradients, suffix_mask, n_replace=1
+    length = int(lengths[0].item())
+
+    prefix_tokens = model_input.prefix_input_ids[0][
+        model_input.prefix_attention_mask[0].bool()
+    ]
+    completion_tokens = model_input.completion_input_ids[0][
+        model_input.completion_attention_mask[0].bool()
+    ]
+    control_tokens = prompt_data[0, :length]
+
+    input_ids = torch.cat(
+        [prefix_tokens, control_tokens, completion_tokens],
+        dim=0,
     )
-    
-    # Verify candidate sequences shape: [search_width * B, max_suffix_len]
-    search_width = gcg_optimizer.gcg_batch_size
-    expected_shape = (search_width * gcg_optimizer.batch_size, gcg_optimizer.max_suffix_len)
-    assert candidate_sequences.shape == expected_shape, \
-        f"Candidate sequences should have shape {expected_shape}, got {candidate_sequences.shape}"
-    
-    # Verify all tokens are valid
+    pref_len = prefix_tokens.shape[0]
+    completion_len = completion_tokens.shape[0]
+    control_slice = slice(pref_len, pref_len + length)
+    target_slice = slice(pref_len + length, pref_len + length + completion_len)
+    loss_slice = slice(pref_len + length - 1, pref_len + length - 1 + completion_len)
+
+    agent.model.zero_grad(set_to_none=True)
+    gradients = token_gradients(
+        agent.model, input_ids, control_slice, target_slice, loss_slice
+    )
+
+    candidates = sample_control(
+        control_tokens,
+        gradients,
+        batch_size=gcg_optimizer.gcg_batch_size,
+        topk=gcg_optimizer.gcg_top_k,
+        temp=1,
+        not_allowed_tokens=gcg_optimizer.not_allowed_tokens,
+    )
+
+    assert candidates.shape == (
+        gcg_optimizer.gcg_batch_size,
+        length,
+    ), "Candidates should match batch size and active length"
+
     vocab_size = agent.model.get_input_embeddings().weight.shape[0]
-    assert torch.all(candidate_sequences >= 0), "All candidate tokens should be non-negative"
-    assert torch.all(candidate_sequences < vocab_size), \
-        f"All candidate tokens should be within vocabulary size (vocab_size={vocab_size})"
-    
-    # Verify update_info is not empty
-    assert len(update_info) > 0, "Update info should not be empty"
+    assert torch.all(candidates >= 0) and torch.all(
+        candidates < vocab_size
+    ), "Candidate tokens must be valid vocab IDs"
+    assert torch.any(
+        candidates != control_tokens.unsqueeze(0)
+    ), "At least one candidate should differ from the control tokens"
 

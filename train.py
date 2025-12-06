@@ -510,7 +510,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         except Exception:
             logger.debug(f"  (could not pretty-print {mode_name} traces)")
     
-    def run_batch_optimization(batch_prompts, mode, batch_idx, episode_idx, num_batches):
+    def run_batch_optimization(batch_prompts, mode, batch_idx, episode_idx, num_batches, global_step_offset=None):
         """Run batch optimization for a given mode and episode. Returns (results, rewards, traces, policy_metrics)."""
         prefixes = [p.get('base', '') for p in batch_prompts]
         targets = [p.get('target', '') for p in batch_prompts]
@@ -527,10 +527,9 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             wandb_log_fn = log_to_wandb
             logger.info(f"Wandb logging enabled for batch optimization")
 
-        # Compute global step offset for this batch and episode to ensure monotonic step numbers
-        # Structure: Episode 0 (all batches), then Episode 1 (all batches), etc.
-        # Formula: episode * num_batches * steps_per_episode + batch_idx * steps_per_episode
-        global_step_offset = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
+        if global_step_offset is None:
+            # Default to deterministic ordering based on episode/batch indices
+            global_step_offset = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode
         
         # Get rollouts_per_prompt from config
         rollouts_per_prompt = train_cfg['rollouts_per_prompt']
@@ -571,6 +570,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     # Episode 0: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
     # Episode 1: Batch 0, Batch 1, Batch 2, ... (update policy after each batch)
     # etc.
+    next_global_step = 0
     for episode_idx in tqdm(range(episodes_per_prompt), desc="Episodes"):
         print(f"\n{'='*60}")
         print(f"EPISODE {episode_idx + 1}/{episodes_per_prompt}")
@@ -592,15 +592,11 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 # Run batch optimization with the mapped mode (only 1 episode)
                 mode = mode_map[opt_mode]
                 best_results, best_rewards_batch, traces, policy_metrics = run_batch_optimization(
-                    batch_prompts, mode, batch_idx, episode_idx, num_batches
+                    batch_prompts, mode, batch_idx, episode_idx, num_batches, global_step_offset=next_global_step
                 )
                 
-                # Calculate the last step of this episode for logging policy/batch metrics
-                # This ensures we log at the same step as the last step-level metric
-                # We add a small offset to ensure it's logged after all step-level metrics
-                last_episode_step = episode_idx * num_batches * steps_per_episode + batch_idx * steps_per_episode + steps_per_episode - 1
-                # Use the next step to ensure it's after all step-level metrics for this episode
-                policy_batch_step = last_episode_step + 1
+                # Calculate the step used for policy/batch metrics (one after the last step-level metric)
+                policy_batch_step = next_global_step + steps_per_episode
                 
                 # Log traces
                 log_traces(traces, mode)
@@ -678,6 +674,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     best_results, best_rewards_batch, traces, batch_prompts,
                     batch_start, batch_size, metrics_path, episodes_per_prompt
                 )
+                next_global_step = policy_batch_step + 1
             else:
                 # Unknown mode - log error and skip batch
                 logger.error(
