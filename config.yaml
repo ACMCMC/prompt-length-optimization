@@ -29,7 +29,7 @@ train:
   entropy_coef: 0.02              # Entropy bonus coefficient (encourages diverse action distributions; mostly unused if grpo.entropy_coef is set)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
   alpha: 0.5                         # Likelihood weight
-  beta: -1.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  beta: 1.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
   projection_weight: 0.5            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
