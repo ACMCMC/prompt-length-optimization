@@ -400,30 +400,47 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         candidate_completion_input_ids = model_input.completion_input_ids[prompt_indices]
 
+        if (
+            self.gcg_max_batch_size is None
+            or self.gcg_max_batch_size <= 0
+        ):
+            raise ValueError("gcg_max_batch_size must be a positive integer")
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+        losses = []
         with torch.no_grad():
-            inputs_embeds = self.embedding_layer(candidate_input_ids)
-            outputs = self.agent.model.gpt_neox(
-                inputs_embeds=inputs_embeds,
-                attention_mask=candidate_attention_mask,
-            )
-            hidden_states = outputs.last_hidden_state
-            logits = self.agent.model.embed_out(hidden_states)
+            for start in range(0, total_candidates, self.gcg_max_batch_size):
+                end = min(start + self.gcg_max_batch_size, total_candidates)
+                inputs_embeds = self.embedding_layer(candidate_input_ids[start:end])
+                outputs = self.agent.model.gpt_neox(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=candidate_attention_mask[start:end],
+                )
+                hidden_states = outputs.last_hidden_state
+                logits = self.agent.model.embed_out(hidden_states)
 
-            comp_start_batch = completion_start_all[prompt_indices]
-            comp_mask_batch = completion_mask_all[prompt_indices]
-            token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
-                logits,
-                comp_start_batch,
-                candidate_completion_input_ids,
-                comp_mask_batch,
-            )
-            masked_log_probs = torch.where(
-                comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
-            )
-            token_counts = comp_mask.sum(dim=-1).clamp_min(1)
-            losses = -masked_log_probs.sum(dim=-1) / token_counts
+                idx_slice = slice(start, end)
+                comp_start_batch = completion_start_all[prompt_indices[idx_slice]]
+                comp_mask_batch = completion_mask_all[prompt_indices[idx_slice]]
+                token_log_probs, comp_mask = (
+                    self._completion_token_log_probs_from_logits(
+                        logits,
+                        comp_start_batch,
+                        candidate_completion_input_ids[idx_slice],
+                        comp_mask_batch,
+                    )
+                )
+                masked_log_probs = torch.where(
+                    comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+                )
+                token_counts = comp_mask.sum(dim=-1).clamp_min(1)
+                chunk_losses = -masked_log_probs.sum(dim=-1) / token_counts
+                losses.append(chunk_losses)
 
-        return losses
+        return torch.cat(losses, dim=0)
 
     def _compute_prompt_likelihoods(
         self, model_input: ModelBatchedInput
@@ -495,6 +512,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_sequences = []
             candidate_prompt_indices = []
             active_prompt_indices = []
+            active_completion_lengths = []
 
             for prompt_idx in range(batch_size):
                 length = int(lengths[prompt_idx].item())
@@ -546,6 +564,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 candidate_sequences.append(padded_candidates)
                 candidate_prompt_indices.extend([prompt_idx] * self.gcg_batch_size)
                 active_prompt_indices.append(prompt_idx)
+                active_completion_lengths.append(completion_len)
             if len(candidate_sequences) == 0:
                 break
 
@@ -564,11 +583,28 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             best_indices = losses_reshaped.argmin(dim=1)
 
             old_tokens = best_tokens.clone()
-            for block_idx, prompt_idx in enumerate(active_prompt_indices):
-                best_candidate_idx = (
-                    block_idx * search_width + best_indices[block_idx].item()
+            if num_active > 0:
+                completion_lengths_tensor = torch.tensor(
+                    active_completion_lengths,
+                    dtype=torch.float32,
+                    device=self.device,
                 )
-                best_tokens[prompt_idx] = candidate_tensor[best_candidate_idx]
+                candidate_losses = losses_reshaped[
+                    torch.arange(num_active, device=self.device), best_indices
+                ]
+                candidate_lls = -candidate_losses * completion_lengths_tensor
+                active_prompt_tensor = torch.tensor(
+                    active_prompt_indices, dtype=torch.long, device=self.device
+                )
+                current_lls_subset = best_lls[active_prompt_tensor]
+                accepted_mask = candidate_lls > current_lls_subset
+
+                for block_idx, prompt_idx in enumerate(active_prompt_indices):
+                    if bool(accepted_mask[block_idx].item()):
+                        best_candidate_idx = (
+                            block_idx * search_width + best_indices[block_idx].item()
+                        )
+                        best_tokens[prompt_idx] = candidate_tensor[best_candidate_idx]
 
             model_input.update_suffix_tokens(best_tokens)
             current_lls, token_log_probs, comp_mask, avg_log_prob = (
