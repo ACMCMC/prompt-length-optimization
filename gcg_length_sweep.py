@@ -7,6 +7,7 @@ starting/ending per-token log-likelihood, and saves a plot plus optional CSV.
 """
 
 import argparse
+import logging
 import os
 import random
 from typing import List, Dict, Tuple
@@ -20,8 +21,51 @@ from prompt_optimization.model_inputs import ModelBatchedInput
 from prompt_optimization.optimizers.discrete import DiscretePromptOptimizer
 
 
+PLOT_PALETTE = {
+    "color_1": "#007ACC",
+    "color_2": "#C200D6",
+    "color_3": "#D50000",
+}
+PLOT_COLORS = list(PLOT_PALETTE.values())
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
 PROMPT_FIELDS = ["prompt", "instruction", "input", "question"]
 COMPLETION_FIELDS = ["target", "completion", "output", "response", "answer"]
+
+
+def setup_plot_style():
+    """Set up consistent plotting style across all plots."""
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+
+    font_path = "IBMPlexSans-Regular.ttf"
+    try:
+        font_manager.fontManager.addfont(font_path)
+        prop = font_manager.FontProperties(fname=font_path)
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["font.sans-serif"] = [prop.get_name()]
+        sns.set_style(
+            "whitegrid",
+            {"font.family": ["sans-serif"], "font.sans-serif": [prop.get_name()]},
+        )
+    except Exception as e:
+        logger.warning(f"Could not load IBM Plex Sans font from {font_path}: {e}")
+        logger.info("Falling back to default font")
+
+    sns.set_theme(style="whitegrid")
+    sns.set_context("notebook", font_scale=1.2)
+    plt.rcParams.update(
+        {
+            "figure.dpi": 100,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+            "font.family": "sans-serif",
+        }
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gcg-steps",
         type=int,
-        default=100,
+        default=128,
         help="Number of GCG steps to run per suffix length.",
     )
     parser.add_argument(
@@ -227,6 +271,9 @@ def run_gcg_for_length(
 def main() -> None:
     args = parse_args()
 
+    if not args.output.lower().endswith(".pdf"):
+        raise ValueError("Output plot must be a PDF file (use .pdf extension).")
+
     with open(args.config, "r") as cfg_file:
         cfg = yaml.safe_load(cfg_file)
 
@@ -254,6 +301,11 @@ def main() -> None:
 
     if args.dataset.lower() != "advbench":
         raise ValueError("Only AdvBench is supported in this script.")
+
+    if args.min_suffix_len == 1 and args.max_suffix_len == 32:
+        if args.gcg_steps != 128:
+            logger.info("Overriding GCG steps to 128 for sweep across lengths 1-32.")
+        args.gcg_steps = 128
 
     prompt_pairs = load_advbench_pairs(
         num_samples=args.num_samples,
@@ -299,9 +351,22 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     ensure_dir(args.output)
+    setup_plot_style()
     plt.figure(figsize=(8, 5))
-    plt.plot(lengths, initial_curve, label="Initial per-token LL", marker="o")
-    plt.plot(lengths, final_curve, label="Final per-token LL", marker="s")
+    plt.plot(
+        lengths,
+        initial_curve,
+        label="Initial per-token LL",
+        marker="o",
+        color=PLOT_PALETTE["color_1"],
+    )
+    plt.plot(
+        lengths,
+        final_curve,
+        label="Final per-token LL",
+        marker="s",
+        color=PLOT_PALETTE["color_3"],
+    )
     plt.xlabel("Suffix length (tokens)")
     plt.ylabel("Average per-token log-likelihood")
     plt.title("GCG sweep over suffix lengths")
