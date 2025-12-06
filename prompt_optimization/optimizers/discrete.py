@@ -9,7 +9,6 @@ from tqdm import tqdm
 from ..interface import BasePromptOptimizer
 from ..model_inputs import ModelBatchedInput
 import logging
-import time
 
 
 logging.basicConfig(level=logging.INFO)
@@ -490,10 +489,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         gcg_iter_bar = tqdm(range(self.gcg_steps), desc="GCG", leave=False)
         for gcg_iter in gcg_iter_bar:
-            iter_start = time.perf_counter()
-            sampling_time = 0.0
-            eval_time = 0.0
-            update_time = 0.0
             # Ensure latest tokens are reflected in model_input before scoring candidates
             model_input.update_suffix_tokens(best_tokens)
 
@@ -501,7 +496,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             candidate_prompt_indices = []
             active_prompt_indices = []
 
-            sampling_start = time.perf_counter()
             for prompt_idx in range(batch_size):
                 length = int(lengths[prompt_idx].item())
                 completion_len = int(
@@ -552,16 +546,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 candidate_sequences.append(padded_candidates)
                 candidate_prompt_indices.extend([prompt_idx] * self.gcg_batch_size)
                 active_prompt_indices.append(prompt_idx)
-            sampling_time = time.perf_counter() - sampling_start
             if len(candidate_sequences) == 0:
-                logger.info(
-                    "GCG iter %d timing: sampling=%.3fs, eval=%.3fs, update=%.3fs, total=%.3fs",
-                    gcg_iter + 1,
-                    sampling_time,
-                    0.0,
-                    0.0,
-                    time.perf_counter() - iter_start,
-                )
                 break
 
             candidate_tensor = torch.cat(candidate_sequences, dim=0)
@@ -569,18 +554,15 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 candidate_prompt_indices, dtype=torch.long, device=self.device
             )
 
-            eval_start = time.perf_counter()
             losses = self._test_candidates_batch(
                 candidate_tensor, candidate_prompt_indices_tensor, model_input
             )
-            eval_time = time.perf_counter() - eval_start
 
             search_width = self.gcg_batch_size
             num_active = len(active_prompt_indices)
             losses_reshaped = losses.view(num_active, search_width)
             best_indices = losses_reshaped.argmin(dim=1)
 
-            update_start = time.perf_counter()
             old_tokens = best_tokens.clone()
             for block_idx, prompt_idx in enumerate(active_prompt_indices):
                 best_candidate_idx = (
@@ -616,17 +598,6 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 improve_mask.view(-1, 1), best_tokens, old_tokens
             )
             model_input.update_suffix_tokens(best_tokens)
-            update_time = time.perf_counter() - update_start
-
-            total_time = time.perf_counter() - iter_start
-            logger.info(
-                "GCG iter %d timing: sampling=%.3fs, eval=%.3fs, update=%.3fs, total=%.3fs",
-                gcg_iter + 1,
-                sampling_time,
-                eval_time,
-                update_time,
-                total_time,
-            )
 
             gcg_iter_bar.set_postfix({"avg_ll": f"{best_lls.mean().item():.4f}"})
 
