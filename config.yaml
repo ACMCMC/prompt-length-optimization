@@ -18,8 +18,8 @@ train:
   # Training parameters per prompt
   episodes_per_prompt: 8            # Episodes to train on each prompt
   steps_per_episode: 24            # Steps per episode (increased for better RL learning)
-  init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
-  max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
+  init_len: 32                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
+  max_suffix_len: 64                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
@@ -35,7 +35,7 @@ train:
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 6                      # Prompts per batch for progress tracking
+  batch_size: 16                      # Prompts per batch for progress tracking
   rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for GRPO
   
   # Output
