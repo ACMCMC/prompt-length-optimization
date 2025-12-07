@@ -259,6 +259,7 @@ def evaluate_on_dataset(cfg, model_path):
     # Get alpha and beta for reward calculation
     alpha = train_cfg['alpha']
     beta = train_cfg['beta']
+    reward_mode = train_cfg.get('reward_mode', 'terminal')
     
     # Check if we should save plots
     save_plots = not eval_cfg['no_plots']
@@ -333,7 +334,8 @@ def evaluate_on_dataset(cfg, model_path):
                 mode=optimization_mode,
                 batch_size=len(targets),
                 max_suffix_len=max_suffix_len,
-                init_len=init_len
+                init_len=init_len,
+                reward_mode=reward_mode,
             )
 
             # Unpack batch results

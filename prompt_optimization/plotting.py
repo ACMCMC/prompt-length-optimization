@@ -46,7 +46,7 @@ def plot_training_progress(likelihood_history, length_history, action_history, o
 def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, beta=0.2):
     """
     Plot evaluation trace with step on x-axis and likelihood/length/reward on y-axes.
-    
+
     Args:
         trace_rows: List of dicts with 'step', 'likelihood', 'best_likelihood', 'length'
         out_dir: Output directory for plot
@@ -64,10 +64,12 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
     lengths = [r.get('length') for r in trace_rows]
     
     # Calculate rewards: alpha * likelihood - beta * length
-    rewards = [alpha * lik - beta * length if length is not None else None 
+    rewards = [alpha * lik - beta * length if length is not None else None
                for lik, length in zip(likelihoods, lengths)]
-    best_rewards = [alpha * best - beta * length if length is not None else None 
+    best_rewards = [alpha * best - beta * length if length is not None else None
                     for best, length in zip(bests, lengths)]
+    likelihood_contribs = [alpha * lik for lik in likelihoods]
+    length_penalties = [-beta * length if length is not None else None for length in lengths]
 
     # Create figure with 3 subplots stacked vertically
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
@@ -78,8 +80,8 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
         ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2, marker='o', markersize=8)
         ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2, marker='s', markersize=8)
     else:
-    ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
-    ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
+        ax1.plot(steps, likelihoods, label='likelihood', color='tab:blue', linewidth=2)
+        ax1.plot(steps, bests, label='best likelihood', linestyle='--', color='tab:cyan', linewidth=2)
     ax1.set_ylabel('Log Likelihood', fontsize=11)
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
@@ -97,13 +99,18 @@ def plot_eval_trace(trace_rows, out_dir="results", prefix="eval", alpha=1.0, bet
         ax2.set_title('Prompt Length Over Steps', fontsize=12, fontweight='bold')
     
     # Plot 3: Reward
-    if any(r is not None for r in rewards):
+    def _plot_series(ax, data, label, color, linestyle='-', marker='o'):
+        series = [val if val is not None else float('nan') for val in data]
         if len(steps) <= 3:
-            ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2, marker='o', markersize=8)
-            ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2, marker='s', markersize=8)
+            ax.plot(steps, series, label=label, color=color, linewidth=2, marker=marker, markersize=8, linestyle=linestyle)
         else:
-        ax3.plot(steps, rewards, label='reward', color='tab:green', linewidth=2)
-        ax3.plot(steps, best_rewards, label='best reward', linestyle='--', color='tab:olive', linewidth=2)
+            ax.plot(steps, series, label=label, color=color, linewidth=2, linestyle=linestyle)
+
+    if any(r is not None for r in rewards):
+        _plot_series(ax3, rewards, 'reward', color='tab:green')
+        _plot_series(ax3, best_rewards, 'best reward', color='tab:olive', linestyle='--', marker='s')
+        _plot_series(ax3, likelihood_contribs, 'likelihood contrib (α·L)', color='tab:blue', linestyle=':', marker='^')
+        _plot_series(ax3, length_penalties, 'length contrib (-β·len)', color='tab:red', linestyle='-.', marker='v')
         ax3.set_xlabel('Step', fontsize=11)
         ax3.set_ylabel(f'Reward (α={alpha}, β={beta})', fontsize=11)
         ax3.legend(loc='best')
