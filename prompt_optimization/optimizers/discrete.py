@@ -225,7 +225,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         mask = model_input.completion_attention_mask[idx].bool()
         tokens = model_input.completion_input_ids[idx]
         return tokens[mask]
-
+    
     def _compute_gradients(
         self,
         prompt_data: torch.Tensor,
@@ -427,10 +427,10 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 comp_mask_batch = completion_mask_all[prompt_indices[idx_slice]]
                 token_log_probs, comp_mask = (
                     self._completion_token_log_probs_from_logits(
-                        logits,
-                        comp_start_batch,
+                    logits,
+                    comp_start_batch,
                         candidate_completion_input_ids[idx_slice],
-                        comp_mask_batch,
+                    comp_mask_batch,
                     )
                 )
                 masked_log_probs = torch.where(
@@ -558,7 +558,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
                 padded_candidates = best_tokens[prompt_idx : prompt_idx + 1].repeat(
                     self.gcg_batch_size, 1
-                )
+            )
                 padded_candidates[:, :length] = candidates
 
                 candidate_sequences.append(padded_candidates)
@@ -603,7 +603,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                     if bool(accepted_mask[block_idx].item()):
                         best_candidate_idx = (
                             block_idx * search_width + best_indices[block_idx].item()
-                        )
+                )
                         best_tokens[prompt_idx] = candidate_tensor[best_candidate_idx]
 
             model_input.update_suffix_tokens(best_tokens)
@@ -651,7 +651,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         model_input.update_suffix_tokens(prompt_data)
         final_likelihoods, _, _, _ = self._compute_prompt_likelihoods(model_input)
-
+            
         return prompt_data, final_likelihoods
 
     def _compute_prompt_likelihoods(

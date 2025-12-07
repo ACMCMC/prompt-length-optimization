@@ -10,9 +10,11 @@ import argparse
 import logging
 import os
 import random
+from pathlib import Path
 from typing import List, Dict, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import yaml
 
@@ -42,10 +44,12 @@ def setup_plot_style():
     import matplotlib.pyplot as plt
     from matplotlib import font_manager
 
-    font_path = "IBMPlexSans-Regular.ttf"
+    font_path = Path(__file__).resolve().parent / "IBMPlexSans-Regular.ttf"
+    if not font_path.exists():
+        font_path = Path("IBMPlexSans-Regular.ttf")
     try:
-        font_manager.fontManager.addfont(font_path)
-        prop = font_manager.FontProperties(fname=font_path)
+        font_manager.fontManager.addfont(str(font_path))
+        prop = font_manager.FontProperties(fname=str(font_path))
         plt.rcParams["font.family"] = "sans-serif"
         plt.rcParams["font.sans-serif"] = [prop.get_name()]
         sns.set_style(
@@ -416,6 +420,8 @@ def main() -> None:
 
     initial_curve = [length_results[length][0] for length in lengths]
     final_curve = [length_results[length][1] for length in lengths]
+    initial_trend = np.poly1d(np.polyfit(lengths, initial_curve, deg=1))(lengths)
+    final_trend = np.poly1d(np.polyfit(lengths, final_curve, deg=1))(lengths)
 
     ensure_dir(args.output)
     setup_plot_style()
@@ -434,8 +440,25 @@ def main() -> None:
         marker="s",
         color=PLOT_PALETTE["color_3"],
     )
+    plt.plot(
+        lengths,
+        initial_trend,
+        label="Initial trend",
+        linestyle="--",
+        color="#4B0082",
+        linewidth=2.0,
+    )
+    plt.plot(
+        lengths,
+        final_trend,
+        label="Final trend",
+        linestyle="--",
+        color="#FF8C00",
+        linewidth=2.0,
+    )
     plt.xlabel("Suffix length (tokens)")
     plt.ylabel("Average per-token log-likelihood")
+    plt.yscale("symlog", linthresh=0.1)
     plt.title("GCG sweep over suffix lengths")
     plt.grid(True, linestyle=":", alpha=0.5)
     plt.legend()
