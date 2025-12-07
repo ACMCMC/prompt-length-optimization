@@ -164,7 +164,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         self.last_completion_grad_summary = None
 
     def initialize_prompts(
-        self, model_input: ModelBatchedInput
+        self, model_input: ModelBatchedInput, seed: int | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Initialize with BOS tokens from ModelBatchedInput."""
         lengths = torch.full(
@@ -173,7 +173,7 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
             dtype=torch.long,
             device=self.device,
         )
-        prompt_tokens = model_input.initialize_suffix_tokens()
+        prompt_tokens = model_input.initialize_suffix_tokens(seed=seed)
         return prompt_tokens, lengths
 
     def get_likelihoods(

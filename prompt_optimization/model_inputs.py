@@ -220,7 +220,7 @@ class ModelBatchedInput:
         )
         return suffix_embeds
 
-    def initialize_suffix_tokens(self) -> torch.Tensor:
+    def initialize_suffix_tokens(self, seed: int | None = None) -> torch.Tensor:
         """
         Initialize suffix tokens with BOS tokens (discrete mode).
         Returns initialized tokens [B, max_suffix_len].
@@ -236,6 +236,10 @@ class ModelBatchedInput:
             device=self.device,
         )
         if self.init_len > 0:
+            if seed is not None:
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
             num_active = self.batch_size * self.init_len
             random_tokens = self._sample_random_tokens(num_active).view(
                 self.batch_size, self.init_len
