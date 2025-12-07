@@ -685,12 +685,10 @@ class LengthPolicyOptimizer:
                         dim=1
                     ).float()  # [B]
 
-                    # Compute step-level rewards for logging/debugging (not used for policy updates)
-                    # Use last_known_likelihoods for reward computation
-                    step_rewards = (
-                        alpha * last_known_likelihoods - beta * lengths
-                    )  # [batch_B]
+                    # Compute step-level rewards for logging/debugging (aligned with terminal reward scale)
                     likelihoods_per_token = last_known_likelihoods / completion_token_counts
+                    length_ratio = (lengths / float(model_input.max_suffix_len)).clamp(max=1.0)
+                    step_rewards = alpha * likelihoods_per_token - beta * length_ratio  # [batch_B]
 
                     # Debug log: likelihoods, lengths, rewards
                     logging.debug(
