@@ -19,7 +19,7 @@
 
 \author{Aldan Creo \and Atharv Nair \\
   University of California, San Diego \\
-  \texttt{acreo@ucsd.edu}, \texttt{a6nair@ucsd.edu}}
+  \texttt{acreo@ucsd.edu}, \texttt{a3nair@ucsd.edu}}
 
 \begin{document}
 \maketitle
@@ -32,37 +32,63 @@
 \label{sec:introduction}
 
 % Idea: we're doing prompt optimization for LMs, this has applications in e.g. security research (find jailbreaks) or improving performance (e.g. improving prompts to maximize their effectiveness on downstream tasks)
-Language models (LMs) have grown in popularity due to their applicability on a range of NLP tasks. Prompt optimization is an area of research that aims to find a set of tokens that is likely to elicit a specific response from the model, 
+Language models (LMs) have grown in popularity due to their applicability on a range of NLP tasks. However, enabling models to follow specific commands effectively remains a challenge, particularly given the (often) non-deterministic behavior of instruction-following LMs. Prompt optimization is an area of research that proposes an avenue to deal with such difficulty, aiming to find a set of tokens that is likely to elicit a specific response from the model. This has applications in several fields, including security research (e.g., finding jailbreaks), performance enhancement or task-specific tuning.
 
 % Idea: highlight gap between likelihood-only search and static pruning
-Many prompt search methods chase likelihood and ignore length. Pruning approaches drop tokens but do not adapt during optimization. We want both goals at once: keep the prompt likely under the model and cut tokens when we can.
+Despite the amount of interest built around prompt optimization, some challenges remain. In this paper, we focus on one overlooked aspect of prompt optimization: many search methods focus on exclusively optimizing for likelihood, while ignoring length. However, shorter prompts are often preferred in practice, as they reduce inference costs and latency and are easier for humans to utilize. Therefore, our work seeks to balance the two objectives at the same time: maximizing the likelihood of a target completion while minimizing prompt length.
 
 % Idea: explain our external policy and scope (plug-in optimizer, no retrieval/safety)
-We train a small external policy instead of a new language model. The policy decides when to shrink, keep, or grow a prompt, while any plug-in optimizer adjusts tokens. We do not design a new optimizer and accept the limits of whichever one is used. We also avoid retrieval and safety objectives; we only balance likelihood and length.
+To that end, we train a small external policy, independent of the objective LM (which we treat as a black box). The policy decides when to shrink, keep, or grow a prompt, while any plug-in optimizer adjusts tokens. We do not design a new optimizer and accept the limits of whichever one is used. We also avoid retrieval and safety objectives; we only balance likelihood and length.
 
 \begin{figure*}[t]
-  \centering
-  \begin{tikzpicture}[>=stealth, node distance=1.2cm and 1.4cm, rounded corners, font=\small]
+  % \centering
+  \begin{tikzpicture}[>=stealth, node distance=0.5cm and 0.5cm, font=\small\sffamily, inner sep=0.25cm]
     % Nodes
-    \node[draw=myDARKBLUE, fill=myDARKBLUE!10, thick, align=center, minimum width=3cm, minimum height=0.9cm] (prompt) {Current\newline prompt};
-    \node[draw=myMAGENTA, fill=myMAGENTA!10, thick, align=center, minimum width=3.2cm, minimum height=0.9cm, right=of prompt] (policy) {Policy\newline (GRPO)};
-    \node[draw=myRED, fill=myRED!10, thick, align=center, minimum width=3.4cm, minimum height=0.9cm, right=of policy] (actions) {Actions:\newline shrink / tune / grow};
-    \node[draw=myGREEN, fill=myGREEN!10, thick, align=center, minimum width=3.4cm, minimum height=0.9cm, below=of policy] (lm) {LM score:\newline log-likelihood};
-    \node[draw=black!60, fill=black!5, thick, align=center, minimum width=3.4cm, minimum height=0.9cm, right=of actions] (reward) {Reward:\newline likelihood $-$ length};
-    \node[draw=black!60, fill=black!5, thick, align=center, minimum width=3.4cm, minimum height=0.9cm, below=of reward] (update) {GRPO update};
+    % Prefix
+    \node[draw=myDARKBLUE, fill=myDARKBLUE!10, text width=5cm, thick, align=left] (prompt) {\textbf{Prefix}\\\textit{How to make a bomb?}};
+
+    % Suffix, random tokens
+    \node[draw=myBLUE, fill=myBLUE!10, below=of prompt, text width=5cm, thick, align=left] (suffix) {\textbf{Suffix}\\\texttt{<tok\_2262>, <tok\_1234>, \dots}};
+
+    % Completion
+    \node[draw=myRED, fill=myRED!10, below=of suffix, text width=5cm, thick, align=left] (completion) {\textbf{Completion}\\\textit{To make a bomb, start by [...] }};
+
+    % Dashed box around the three elements of a prompt
+    \node[draw=black, dashed, fit=(prompt)(suffix)(completion), inner sep=0.3cm] (input_box) {};
+    \node[above=-0.1cm of input_box.north] {\textbf{Prompt to optimize}};
+
+    % An icon to represent the frozen LM
+    \node[draw=black, fill=black!10, right=4cm of suffix, text width=2.5cm, thick, align=left] (lm) {\scalerel*{\includegraphics{figures/writer.png}}{\textrm{\textbigcircle}} \textbf{Frozen LM}\\{\tiny (e.g., Pythia-70m \cite{biderman2023pythia})}};
+
+    % The optimizer
+    \node[draw=black, fill=black!10, below=of lm, text width=2.5cm, thick, align=left] (optimizer) {\scalerel*{\includegraphics{figures/wrench.png}}{\textrm{\textbigcircle}} \textbf{Optimizer}\\{\tiny (e.g., GCG \cite{zou2023universal})}};
+
+    % Policy network
+    \node[draw=myMAGENTA, fill=myMAGENTA!10, above=of lm, text width=2.5cm, thick, align=left] (policy) {\scalerel*{\includegraphics{figures/robot.png}}{\textrm{\textbigcircle}} \textbf{Policy}\\{\tiny (2-layer MLP)}};
+
+    % 3 nodes on the right of the policy for actions
+    \node[right=of policy, yshift=0.5cm, inner sep=0.1cm] (grow) {\texttt{grow}};
+    \node[right=of policy, inner sep=0.1cm] (shrink) {\texttt{shrink}};
+    \node[right=of policy, yshift=-0.5cm, inner sep=0.1cm] (optimize) {\texttt{optimize}};
 
     % Arrows
-    \draw[->, thick] (prompt) -- (policy);
-    \draw[->, thick] (policy) -- (actions);
-    \draw[->, thick] (actions) |- (lm);
-    \draw[->, thick] (lm) -- node[left]{tokens, loss} (policy);
-    \draw[->, thick] (actions) -- (reward);
-    \draw[->, thick] (reward) -- (update);
-    \draw[->, thick] (update) |- (policy);
-    \draw[->, thick] (actions.east) ++(0.6,0) -- ++(0.9,0) |- (prompt.east);
-    \node[align=center, below=0.1cm of actions] (loopnote) {Apply chosen edit};
+    \draw[->, ] (prompt.east) -- ++(0.5,0) |- (lm.west) node[near end, above right, inner sep=0.1cm] {\tiny Input};
+    \draw[->, ] (suffix.east) -- ++(0.5,0) |- (lm.west);
+    \draw[->, ] (completion.east) -- ++(0.5,0) |- (lm.west);
+    \draw[->, ] (lm.east) -- ++(0.5,0)  |- (optimizer.east) node[midway, right, inner sep=0.1cm] {\tiny Likelihood};
+    \draw[->, ] (optimizer.west) -- ++(-0.5,0) |- (suffix.south east) node[midway, below left, inner sep=0.1cm] {\tiny \texttt{<tok\_1234> $\to$ <tok\_5678>}};
+
+    % From policy to actions
+    \draw[->, thick] (policy.east) -- (grow.west);
+    \draw[->, thick] (policy.east) -- (optimize.west);
+    \draw[->, thick] (policy.east) -- (shrink.west);
+    % From optimize to optimizer
+    \draw[->, ] (optimize.south) |- (optimizer.north east) node[midway, above right, inner sep=0.1cm] {\tiny Invoke};
+    % From grow/shrink to suffix, going upwards, above the policy node, then down to suffix
+    \draw[->, ] (grow.north) |- ++(0,0.5cm) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
+    \draw[->, ] (shrink.east) -- ++ (0.5cm, 0) |- ($(grow.north) + (0, 0.5cm)$) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
   \end{tikzpicture}
-  \caption{Policy loop: given a prompt, we choose one of three edits (shrink, tune, grow), score the new prompt with the LM, and update the policy with a reward that balances likelihood and length.}
+  \caption{\textbf{Our approach.} We aim to simultaneously optimize completion likelihood and suffix length by training a small policy that decides when to shrink, grow, or optimize a suffix, paired with a plug-in optimizer and a frozen language model we treat as black boxes.}
   \label{fig:method}
 \end{figure*}
 
