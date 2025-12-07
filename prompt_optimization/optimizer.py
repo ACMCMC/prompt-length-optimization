@@ -885,22 +885,14 @@ class LengthPolicyOptimizer:
                     )  # [batch_B]
                 final_likelihoods_per_token = final_likelihoods / completion_token_counts
 
-                # Compute final reward: alpha * likelihood - beta * length
+                # Compute final reward: alpha * per-token likelihood - beta * length
                 final_lengths = model_input.suffix_attention_mask.sum(
                     dim=1
                 ).float()  # [batch_B]
-                # Use normalized per-token log-likelihoods to keep reward magnitudes stable
-                per_token_mean = final_likelihoods_per_token.mean().detach()
-                per_token_std = (
-                    final_likelihoods_per_token.std(unbiased=False).clamp(min=1.0).detach()
-                )
-                normalized_ll_per_token = (
-                    final_likelihoods_per_token - per_token_mean
-                ) / per_token_std
                 max_suffix_len = float(model_input.max_suffix_len)
                 length_ratio = (final_lengths / max_suffix_len).clamp(max=1.0)
                 final_rewards = (
-                    alpha * normalized_ll_per_token - beta * length_ratio
+                    alpha * final_likelihoods_per_token - beta * length_ratio
                 )  # [batch_B]
 
                 # Debug log: final sequences at episode end
