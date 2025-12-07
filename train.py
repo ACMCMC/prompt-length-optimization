@@ -11,6 +11,7 @@ import random
 import time
 import csv
 import logging
+import gc
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
@@ -56,6 +57,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     base_lr_policy = train_cfg['lr_policy']
     alpha = train_cfg['alpha']
     beta = train_cfg['beta']
+    reward_mode = train_cfg.get('reward_mode', 'terminal')
     optimization_mode = train_cfg['optimization_mode']
     gcg_cfg = train_cfg['gcg']
     gcg_top_k = gcg_cfg['top_k']
@@ -63,6 +65,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     gcg_max_batch_size = gcg_cfg['max_batch_size']
     gcg_steps = gcg_cfg['steps']
     save_path = train_cfg['save_path']
+    save_policy_every_episode = train_cfg.get('save_policy_every_episode', False)
     if 'grpo' not in train_cfg:
         raise ValueError("train.grpo configuration is required")
     grpo_cfg = train_cfg['grpo']
@@ -116,6 +119,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         'lr_policy': lr_policy,
                         'alpha': alpha,
                         'beta': beta,
+                        'reward_mode': reward_mode,
                         'epsilon': epsilon,
                         'epsilon_decay': epsilon_decay,
                         'epsilon_min': epsilon_min,
@@ -137,6 +141,10 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     logger.info(f"Wandb test log sent. View at: {wandb.run.url}")
                 except Exception as e:
                     logger.warning(f"Failed to send test log to wandb: {e}")
+                try:
+                    wandb.config.update(cfg, allow_val_change=True)
+                except Exception as e:
+                    logger.warning(f"Failed to push full config to wandb: {e}")
             else:
                 wandb_initialized = True  # Already initialized (e.g., by sweep)
                 logger.info("Wandb already initialized (likely by sweep)")
@@ -146,6 +154,10 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                     logger.info(f"Wandb test log sent. View at: {wandb.run.url}")
                 except Exception as e:
                     logger.warning(f"Failed to send test log to wandb: {e}")
+                try:
+                    wandb.config.update(cfg, allow_val_change=True)
+                except Exception as e:
+                    logger.warning(f"Failed to push full config to wandb: {e}")
         except Exception as e:
             logger.warning(f"Failed to initialize wandb: {e}")
             wandb_initialized = False
@@ -180,6 +192,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     print(f"Learning rates: {lr_embeddings:.3f} / {lr_policy:.6f}")
     print(f"Batch size: {batch_size}")
     print(f"Alpha: {alpha}, Beta: {beta}")
+    print(f"Reward mode: {reward_mode}")
     if fast_mode:
         print("Fast mode applies half episodes/steps and doubles learning rates relative to config values.")
     
@@ -409,6 +422,35 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     best_overall_reward = float('-inf')
     best_prompt = None
     best_prompt_text = None
+
+    def _build_checkpoint(elapsed_time: float):
+        checkpoint = {
+            'model_name': model_name,
+            'policy_state_dict': optimizer.policy_net.state_dict(),
+            'config': cfg,
+            'training_rewards': list(all_rewards),
+            'best_reward': float(best_overall_reward),
+            'best_prompt': best_prompt,
+            'best_prompt_text': best_prompt_text,
+            'training_time': elapsed_time,
+            'fast_mode': fast_mode,
+            'episodes_per_prompt': episodes_per_prompt,
+            'steps_per_episode': steps_per_episode,
+            'lr_embeddings': lr_embeddings,
+            'lr_policy': lr_policy
+        }
+        if fast_mode:
+            checkpoint['fast_mode_settings'] = {
+                'base_episodes_per_prompt': base_episodes,
+                'base_steps_per_episode': base_steps,
+                'base_lr_embeddings': base_lr_embeddings,
+                'base_lr_policy': base_lr_policy
+            }
+        return checkpoint
+
+    def _save_checkpoint(path: str, elapsed_time: float):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(_build_checkpoint(elapsed_time), path)
     
     start_time = time.time()
     
@@ -572,7 +614,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             init_len=init_len,
             wandb_log_fn=wandb_log_fn,
             global_step_offset=global_step_offset,
-            rollouts_per_prompt=rollouts_per_prompt
+            rollouts_per_prompt=rollouts_per_prompt,
+            reward_mode=reward_mode,
         )
         
         return best_results, best_rewards_batch, traces, policy_metrics
@@ -599,6 +642,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         
         # Process all batches for this episode
         for batch_start in tqdm(range(0, len(prompts), batch_size), desc=f"Batches (ep {episode_idx+1})", leave=False):
+            latest_best_rewards = None
             batch_end = min(batch_start + batch_size, len(prompts))
             batch_prompts = prompts[batch_start:batch_end]
             batch_idx = batch_start // batch_size
@@ -695,10 +739,13 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         logger.warning(f"Failed to log batch metrics to wandb: {e}")
                 
                 # Process results
+                latest_best_rewards = best_rewards_batch
                 process_batch_results(
                     best_results, best_rewards_batch, traces, batch_prompts,
                     batch_start, batch_size, metrics_path, episodes_per_prompt
                 )
+                del best_results, best_rewards_batch, traces, policy_metrics
+                gc.collect()
             else:
                 # Unknown mode - log error and skip batch
                 logger.error(
@@ -709,49 +756,43 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                 for _ in batch_prompts:
                     all_rewards.append(float('-inf'))
         
-        batch_time = time.time() - batch_start_time
-        avg_time_per_prompt = batch_time / len(batch_prompts)
+        if len(batch_prompts) > 0:
+            batch_time = time.time() - batch_start_time
+            avg_time_per_prompt = batch_time / len(batch_prompts)
+        else:
+            batch_time = 0.0
+            avg_time_per_prompt = 0.0
         
         print(f"  Batch completed in {batch_time:.1f}s ({avg_time_per_prompt:.2f}s/prompt)")
-        if best_rewards_batch:
-            print(f"  Best batch reward: {max(best_rewards_batch):.3f}")
+        if 'latest_best_rewards' in locals() and latest_best_rewards:
+            print(f"  Best batch reward: {max(latest_best_rewards):.3f}")
+            latest_best_rewards = None
         print(f"  Overall best so far: {best_overall_reward:.3f}")
-        
+
         # Progress estimate
         completed = len(all_rewards)
         remaining = len(prompts) - completed
-        estimated_time_left = remaining * avg_time_per_prompt
+        estimated_time_left = remaining * avg_time_per_prompt if avg_time_per_prompt > 0 else float('inf')
         print(f"  ETA: {estimated_time_left/60:.1f} minutes ({completed}/{len(prompts)} prompts complete)")
+
+        if save_policy_every_episode:
+            elapsed = time.time() - start_time
+            episode_path = Path(save_path)
+            checkpoint_name = f"{episode_path.stem}_ep{episode_idx+1:03d}{episode_path.suffix}"
+            episode_checkpoint_path = episode_path.with_name(checkpoint_name)
+            _save_checkpoint(str(episode_checkpoint_path), elapsed)
+            print(f"  Episode {episode_idx+1} checkpoint saved to: {episode_checkpoint_path}")
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     
     training_time = time.time() - start_time
     
-    # Save model
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    checkpoint = {
-        'model_name': model_name,
-        'policy_state_dict': optimizer.policy_net.state_dict(),
-        'config': cfg,
-        'training_rewards': all_rewards,
-        'best_reward': float(best_overall_reward),
-        'best_prompt': best_prompt,
-        'best_prompt_text': best_prompt_text,
-        'training_time': training_time,
-        'fast_mode': fast_mode,
-        'episodes_per_prompt': episodes_per_prompt,
-        'steps_per_episode': steps_per_episode,
-        'lr_embeddings': lr_embeddings,
-        'lr_policy': lr_policy
-    }
-    if fast_mode:
-        checkpoint['fast_mode_settings'] = {
-            'base_episodes_per_prompt': base_episodes,
-            'base_steps_per_episode': base_steps,
-            'base_lr_embeddings': base_lr_embeddings,
-            'base_lr_policy': base_lr_policy
-        }
-    
-    torch.save(checkpoint, save_path)
+    # Save final model
+    _save_checkpoint(save_path, training_time)
     
     # Final statistics
     if all_rewards:

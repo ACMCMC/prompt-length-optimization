@@ -197,6 +197,7 @@ class LengthPolicyOptimizer:
         wandb_log_fn=None,
         global_step_offset: int = 0,
         rollouts_per_prompt: int = 1,
+        reward_mode: str = "terminal",
     ) -> Tuple[List[torch.Tensor], List[float], List[dict], List[dict]]:
         """
         Unified batch optimization using pluggable optimizer interface.
@@ -219,7 +220,15 @@ class LengthPolicyOptimizer:
             global_step_offset: Global step offset.
             rollouts_per_prompt: Number of trajectories (rollouts) to run per prompt.
                                 Total batch size = num_prompts * rollouts_per_prompt.
+            reward_mode: 'terminal' to propagate only the final return, 'immediate' to use per-step discounted rewards.
         """
+        reward_mode = (reward_mode or "terminal").lower()
+        if reward_mode not in {"terminal", "immediate"}:
+            raise ValueError(
+                f"Unsupported reward_mode '{reward_mode}'. Expected 'terminal' or 'immediate'."
+            )
+        use_immediate_rewards = reward_mode == "immediate"
+
         device = self.agent.device
         num_prompts = len(prefixes)
         assert num_prompts == len(
@@ -386,6 +395,7 @@ class LengthPolicyOptimizer:
                 episode_actions = (
                     []
                 )  # Store actions for GRPO importance sampling computation
+                episode_step_rewards = []  # Immediate rewards per step (optional)
 
                 logging.info(
                     f"Starting optimization: Episode {episode+1}/{episodes}, Batch {batch_idx + 1}, {steps_per_episode} steps"
@@ -690,6 +700,9 @@ class LengthPolicyOptimizer:
                     length_ratio = (lengths / float(model_input.max_suffix_len)).clamp(max=1.0)
                     step_rewards = alpha * likelihoods_per_token - beta * length_ratio  # [batch_B]
 
+                    if use_immediate_rewards:
+                        episode_step_rewards.append(step_rewards.detach())
+
                     # Debug log: likelihoods, lengths, rewards
                     logging.debug(
                         f"Step {step+1}: ll={last_known_likelihoods.mean().item():.2f}, "
@@ -928,17 +941,28 @@ class LengthPolicyOptimizer:
                         )
 
                 # Assign discounted rewards to all steps in episode
-                # Reward at step t = gamma^(T-1-t) * final_reward
-                # This gives credit to all actions that led to the final outcome
+                # terminal mode: reward at step t = gamma^(T-1-t) * final_reward
+                # immediate mode: reward at step t = r_t + gamma * r_{t+1} + ...
                 T = steps_per_episode
-                episode_rewards_list = []
-                for step in range(T):
-                    discount_factor = self.grpo_gamma ** (T - 1 - step)
-                    step_rewards = discount_factor * final_rewards  # [batch_B]
-                    episode_rewards_list.append(step_rewards)
+                discounted_rewards_per_step: List[torch.Tensor] = []
+                if use_immediate_rewards:
+                    if episode_step_rewards:
+                        running_return = torch.zeros_like(episode_step_rewards[0])
+                        for step_rewards in reversed(episode_step_rewards):
+                            running_return = step_rewards + self.grpo_gamma * running_return
+                            discounted_rewards_per_step.append(running_return)
+                        discounted_rewards_per_step.reverse()
+                    else:
+                        discounted_rewards_per_step = [
+                            torch.zeros_like(final_rewards) for _ in range(T)
+                        ]
+                else:
+                    for step in range(T):
+                        discount_factor = self.grpo_gamma ** (T - 1 - step)
+                        discounted_rewards_per_step.append(discount_factor * final_rewards)
 
                 # Note: traces already have step-level rewards for debugging/logging
-                # Policy updates use final discounted rewards (episode_rewards_list), not step-level rewards
+                # Policy updates use discounted_rewards_per_step (terminal or immediate)
                 # Update best_likelihoods in traces with final values
                 for step, trace in enumerate(traces[-T:]):
                     trace["best_likelihoods"] = [float(l) for l in best_likelihoods]
@@ -947,7 +971,7 @@ class LengthPolicyOptimizer:
                 # Set to training mode for gradient computation
                 self.policy_net.train()
 
-                rewards_tensor = torch.stack(episode_rewards_list)  # [T, batch_B]
+                rewards_tensor = torch.stack(discounted_rewards_per_step)  # [T, batch_B]
                 log_probs_tensor = torch.stack(episode_log_probs)  # [T, batch_B]
                 states_tensor = torch.stack(episode_states)  # [T, batch_B, state_dim]
                 actions_tensor = torch.stack(episode_actions)  # [T, batch_B]

@@ -53,8 +53,11 @@ prompts, rewards, traces = optimizer.optimize_prompts_batch(
     max_suffix_len=train_cfg["max_suffix_len"],
     init_len=train_cfg["init_len"],
     rollouts_per_prompt=train_cfg["rollouts_per_prompt"],
+    reward_mode=train_cfg.get("reward_mode", "terminal"),
 )
 ```
+
+Set `train.reward_mode` in `config.yaml` to `"terminal"` (default) to propagate only the final reward of each episode, or to `"immediate"` to use discounted per-step rewards for policy updates.
 
 ## Running Tests
 
@@ -68,4 +71,3 @@ All 18 tests pass, covering:
 - Discrete optimizer interface
 - Policy optimizer integration
 - Interface contract compliance
-
