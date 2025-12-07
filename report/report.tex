@@ -12,7 +12,7 @@
 \usepackage{microtype}
 \usepackage{inconsolata}
 \usepackage{mathtools}
-
+\usepackage{enumitem}  
 \input{extra_setup}
 
 \title{Prompt Length Optimization with Reinforcement Learning}
@@ -87,34 +87,58 @@ Prompt optimization is a very active area of research, with many authors proposi
 \section{Problem Formulation}
 \label{sec:problem}
 
-% Idea: define the goal, objective, and constraints
-We are given a fixed prefix $x_{\text{pref}}$, a target completion $y$, and a trainable suffix $s$ of up to $L_{\max}$ tokens. We do not change model weights; we only edit $s$. At each step we pick an action that changes $|s|$ or refines its tokens, and we score the resulting prompt with the log-likelihood of $y$ under the frozen language model.
+\begin{figure*}
+    \centering
+    \includegraphics[width=0.95\linewidth]{figures/gcg_length_sweep.pdf}
+    \label{fig:gcg_length_sweep}
+    \caption{\textbf{GCG optimizes for likelihood, not for length.} Blah blah blah}
+\end{figure*}
 
-We cast this as a finite-horizon Markov decision process (MDP). A state $z$ stores the current suffix length $|s|$, the current log-likelihood $\ell = \log p_\theta(y\mid x_{\text{pref}}, s)$, a length-normalized likelihood $\ell/\ell_0$, and the fraction of episode steps used. Actions are $a\in\{\text{optimize},\text{shrink},\text{grow}\}$ and only affect the suffix.
-
-The reward trades off likelihood and length. At the end of each episode we compute
+We seek a suffix \(s\) that makes a frozen language model \(p_\theta\) assign high probability to a fixed target completion while keeping \(s\) as short as possible. Let \(x\) denote the fixed prefix (e.g., a harmful user query) and \(y\) the fixed target completion (e.g., the corresponding harmful response). The optimization problem is
 \begin{equation}
-  r = \alpha \cdot \tilde \ell\; -\; \beta \cdot \frac{|s|}{L_{\max}},
+  \min_{s} \mathcal{L}(s) = -\log p(y \mid x, s),
 \end{equation}
-where $\tilde \ell$ is a per-token log-likelihood normalized within the batch, $\alpha>0$ weighs accuracy, and $\beta>0$ penalizes length. Intermediate steps receive discounted copies of this terminal reward so that all actions that led to the final suffix share credit. Episodes last a fixed number of steps; prefix and completion tokens never change.
+with an additional preference for small \(|s|\). The model parameters are not updated; all edits act on \(s\). Each edit either changes the suffix length (adding or removing a token) or replaces suffix tokens in place.
+
+We formulate this as a finite-horizon Markov decision process (MDP). A state \(z\) encapsulates the current suffix length and likelihood statistics (e.g., log-likelihood and length ratios). Actions operate exclusively on the suffix—either invoking content optimization or performing length edits—and the reward balances two objectives: increasing the likelihood of \(y\) and reducing the suffix length.
+
+
+
 
 \subsection{State Space}
 \label{subsec:state}
 
-% Idea: simple five-dimensional state
-We use a five-dimensional state vector per rollout: (1) normalized length $|s|/|s_0|$; (2) current length $|s|$; (3) current log-likelihood $\ell$; (4) likelihood ratio $\ell/(\ell_0+\varepsilon)$; and (5) progress in the episode $t/T$. These features are cheap to compute and keep the policy lightweight.
+We maintain a compact, five-dimensional state per rollout that summarizes suffix size, model fit, and episode progress:
+\begin{enumerate}[itemsep=0pt, topsep=2pt]
+  \item normalized length \(|s|/|s_0|\), where \(|s_0|\) is the initial suffix length at the start of the episode;
+  \item current length \(|s|\);
+  \item current log-likelihood \(\ell = \log p_\theta(y \mid x_{\text{pref}}, s)\);
+  \item likelihood ratio \(\ell / (\ell_0+\varepsilon)\), where \(\ell_0\) is the log-likelihood at the episode start and \(\varepsilon\) is a small positive constant for numerical stability;
+  \item episode progress \(t/T\), with \(t\) the current step and \(T\) the episode length.
+\end{enumerate}
+These statistics are inexpensive to compute and keep the policy lightweight.
+
 
 \subsection{Action Space}
 \label{subsec:actions}
 
-% Idea: three discrete actions that only touch the suffix
-We allow three actions: \emph{optimize} (run the inner optimizer on the current suffix), \emph{shrink} (drop one active suffix token), and \emph{grow} (add one active suffix token up to $L_{\max}$). Prefix and completion stay fixed.
+Actions operate solely on the suffix \(s\): \(\{\text{optimize}, \text{shrink}, \text{grow}\}\). \emph{Optimize} runs the inner optimizer (Section~\ref{subsec:modes}) on the current suffix content without changing its length. \emph{Shrink} removes the last active suffix token (if \(|s|>0\)). \emph{Grow} adds one suffix token up to \(L_{\max}\); the new slot is initialized by the optimizer (a random non-special token in discrete mode, a BOS embedding in continuous mode). The prefix and target completion remain fixed throughout.
 
 \subsection{Reward Function}
 \label{subsec:reward}
 
-% Idea: terminal reward with likelihood--length trade-off
-The reward in \S\ref{sec:problem} combines normalized per-token log-likelihood with a linear length penalty. We discount it back over episode steps with factor $\gamma$ so earlier actions share credit. We do not add extra terms for safety or retrieval.
+At the end of each episode we assign a terminal reward as follows
+\begin{equation}
+  r \;=\; \alpha\,\tilde{\ell} \;-\; \beta\,\frac{|s|}{L_{\max}},
+\end{equation}
+where \(\tilde{\ell}\) denotes the per-token log-likelihood of the target completion \(y\) under the final suffix, \(\alpha>0\) weights accuracy, and \(\beta>0\) penalizes length. This terminal reward is propagated backward through the episode via a discount factor \(\gamma\), so every action contributing to the final suffix receives credit in proportion to its recency. Formally, for an episode of length \(T\), the return at step \(t\) is
+\begin{equation}
+  R_t \;=\; \gamma^{\,T-1-t} \, r, \quad t = 0,\dots,T-1.
+\end{equation}
+These discounted returns are then centered per prompt group to form advantages for the GRPO update. Step-level rewards computed during the rollout are used for monitoring only; the policy update uses the terminal signal exclusively.
+
+
+
 
 \section{Method}
 \label{sec:method}
@@ -149,8 +173,8 @@ Continuous\_proj adds a distance regularizer that pulls suffix embeddings toward
 \subsubsection{Discrete Optimization}
 \label{subsubsec:discrete}
 
-% Idea: gradient-guided token search (GCG)
-In discrete mode we run a Greedy Coordinate Gradient (GCG) search over tokens: rank candidate replacements by gradients, test top-$k$ candidates in batches, and keep the best. Length changes are handled by the policy actions.
+In discrete mode we run a Greedy Coordinate Gradient (GCG)  \citet{zou2023universal} update on the suffix tokens. At each GCG step: (i) compute gradients of the log-likelihood with respect to the current suffix token positions; (ii) for each position, form a small candidate pool by replacing that token with top-$k$ alternatives suggested by the gradient; (iii) batch-evaluate these candidates; and (iv) keep the best-scoring suffix. This yields a greedy, gradient-guided token search that improves log-likelihood in a few forward/backward passes while policy actions handle length changes.
+
 
 \subsection{Training Procedure}
 \label{subsec:training}
