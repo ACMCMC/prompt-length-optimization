@@ -5,11 +5,13 @@ Train the prompt compression policy on the toxic-chat dataset.
 import torch
 import argparse
 import os
+import json
 import yaml
 import random
 import time
 import csv
 import logging
+from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 from prompt_optimization import PromptRLAgent, LengthPolicyOptimizer
@@ -185,36 +187,55 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     prompts = []
     ds_cfg = cfg.get('dataset', {})
     if dataset_name.lower() == 'advbench':
-        # Load AdvBench and extract (base prompt, target completion) pairs
-        from datasets import load_dataset
-        print("Loading AdvBench dataset...")
-        raw = load_dataset("walledai/AdvBench", split='train')
-        PROMPT_KEYS = ["prompt", "instruction", "input", "question"]
-        COMPLETION_KEYS = ["target", "completion", "output", "response", "answer"]
-        for ex in raw:
-            # find prompt-like field
-            base = None
-            for k in PROMPT_KEYS:
-                if k in ex and ex[k]:
-                    base = ex[k]
-                    break
-            if base is None:
-                continue
-            # find completion-like field
-            target = None
-            for k in COMPLETION_KEYS:
-                if k in ex and ex[k] is not None:
-                    target = ex[k]
-                    break
-            if target is None:
-                target = ""
-            prompts.append({'base': base.strip(), 'target': target.strip()})
-        # deterministic sampling/shuffle
-        import random as _rand
-        _rand.seed(seed)
-        _rand.shuffle(prompts)
-        prompts = prompts[:max_prompts]
-        print(f"Loaded {len(prompts)} AdvBench examples")
+        local_advbench_path = ds_cfg.get("local_advbench_path")
+        if local_advbench_path:
+            path = Path(local_advbench_path)
+            if not path.exists():
+                raise FileNotFoundError(f"local_advbench_path does not exist: {path}")
+            print(f"Loading AdvBench subset from {path} ...")
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    base = rec.get("prefix", "").strip()
+                    target = rec.get("target", "").strip()
+                    if not base:
+                        continue
+                    prompts.append({"base": base, "target": target})
+            # deterministic shuffle + truncation
+            random.seed(seed)
+            random.shuffle(prompts)
+            prompts = prompts[:max_prompts]
+            print(f"Loaded {len(prompts)} AdvBench examples from local subset")
+        else:
+            # Load AdvBench and extract (base prompt, target completion) pairs
+            from datasets import load_dataset
+            print("Loading AdvBench dataset...")
+            raw = load_dataset("walledai/AdvBench", split='train')
+            PROMPT_KEYS = ["prompt", "instruction", "input", "question"]
+            COMPLETION_KEYS = ["target", "completion", "output", "response", "answer"]
+            for ex in raw:
+                # find prompt-like field
+                base = None
+                for k in PROMPT_KEYS:
+                    if k in ex and ex[k]:
+                        base = ex[k]
+                        break
+                if base is None:
+                    continue
+                # find completion-like field
+                target = None
+                for k in COMPLETION_KEYS:
+                    if k in ex and ex[k] is not None:
+                        target = ex[k]
+                        break
+                if target is None:
+                    target = ""
+                prompts.append({'base': base.strip(), 'target': target.strip()})
+            # deterministic sampling/shuffle
+            random.seed(seed)
+            random.shuffle(prompts)
+            prompts = prompts[:max_prompts]
+            print(f"Loaded {len(prompts)} AdvBench examples")
     else:
         # Fallback: toxic-chat using existing manager (only base prompt available)
         dataset_manager = ToxicChatDatasetManager(seed=seed)
