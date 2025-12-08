@@ -2,7 +2,6 @@
 
 We train a reinforcement learning policy to balance two goals when optimizing prompts: maximize the likelihood of a target completion while keeping the prompt short. Standard methods like GCG only optimize for likelihood and ignore length.
 
-**Paper**: See `report/report.pdf`  
 **Authors**: Aldan Creo, Atharv Nair (UC San Diego)
 
 ## The Problem
@@ -84,20 +83,3 @@ eval.py               # Evaluation script
 config.yaml           # Full configuration
 config_smoke_test.yaml # Quick test configuration
 ```
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@article{creo2024prompt,
-  title={Prompt Length Optimization with Reinforcement Learning},
-  author={Creo, Aldan and Nair, Atharv},
-  year={2024},
-  institution={UC San Diego}
-}
-```
-
-## License
-
-MIT License - see LICENSE file for details.
