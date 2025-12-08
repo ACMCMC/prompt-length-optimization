@@ -100,7 +100,7 @@ Edit `config.yaml` to adjust:### 1. RL-Based Prompt Length Optimization
 
 - **Reward**: Balances likelihood preservation (α) with length reduction (β)
 
-- **Policy modes**: Set `train.optimization_mode: ppo_parallel` to enable the batched PPO policy updates described in this repo. Tune the `train.ppo.*` hyperparameters (clip, epochs, γ, λ, etc.) to control policy stability when running parallel batches.
+- **Policy modes**: `train.optimization_mode` supports `continuous`, `continuous_proj`, or `discrete`. GRPO is the only supported policy update; there is no PPO fallback.
 
 ## Quick Examples
 
@@ -234,7 +234,7 @@ R = α * log P(completion | prompt) - β * len(prompt) + γ * stop_bonus
 1. Start with random/heuristic prompt initialization
 2. Agent takes actions to modify prompt
 3. Evaluate likelihood after each modification
-4. Update policy using PPO/DPO based on reward signal
+4. Update policy using GRPO with per-prompt baselines
 
 ### Experimental Setup
 

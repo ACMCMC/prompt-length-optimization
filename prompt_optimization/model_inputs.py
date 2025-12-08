@@ -56,6 +56,19 @@ class ModelBatchedInput:
         self.max_suffix_len = max_suffix_len
         self.init_len = init_len
         self.pad_id = getattr(tokenizer, "pad_token_id", 0)
+        self.vocab_size = len(tokenizer)
+        self.special_token_ids = {
+            tok
+            for tok in [
+                self.pad_id,
+                tokenizer.eos_token_id,
+                tokenizer.bos_token_id,
+            ]
+            if tok is not None
+        }
+        self._cached_suffix_start_pos: Optional[torch.Tensor] = None
+        self._cached_completion_start_pos: Optional[torch.Tensor] = None
+        self._cached_total_lengths: Optional[torch.Tensor] = None
 
         # Tokenize prefix and completion
         self._tokenize_prefix(prefix_texts)
@@ -72,8 +85,18 @@ class ModelBatchedInput:
             self.completion_embeddings = None
             self.suffix_embeddings = None
 
+    def _invalidate_cached_positions(self):
+        """Clear cached start/length tensors when sequence layout changes."""
+        self._cached_suffix_start_pos = None
+        self._cached_completion_start_pos = None
+        self._cached_total_lengths = None
+
     def _tokenize_prefix(self, prefix_texts: List[str]):
         """Tokenize prefix texts and create attention masks using tokenizer batching."""
+        # Save original padding side and set to left for prefix
+        original_padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        self.tokenizer.padding_side = 'left'
+        
         # Batch tokenize with padding
         tokenized = self.tokenizer(
             prefix_texts,
@@ -81,32 +104,42 @@ class ModelBatchedInput:
             padding=True,
             return_tensors="pt",
             truncation=False,
-            padding_side="left",
         )
+        
+        # Restore original padding side
+        self.tokenizer.padding_side = original_padding_side
 
         self.prefix_input_ids = tokenized["input_ids"].to(self.device)
         self.prefix_attention_mask = tokenized["attention_mask"].to(self.device)
+        self._invalidate_cached_positions()
 
     def _tokenize_completion(self, completion_texts: List[str]):
         """Tokenize completion texts and create attention masks using tokenizer batching."""
-        # Use tokenizer's batch processing with right padding (default)
+        # Save original padding side and set to right for completion
+        original_padding_side = getattr(self.tokenizer, 'padding_side', 'right')
+        self.tokenizer.padding_side = 'right'
+        
+        # Use tokenizer's batch processing with right padding
         tokenized = self.tokenizer(
             completion_texts,
             add_special_tokens=False,
             padding=True,
             return_tensors="pt",
             truncation=False,
-            padding_side="right",
         )
+        
+        # Restore original padding side
+        self.tokenizer.padding_side = original_padding_side
 
         self.completion_input_ids = tokenized["input_ids"].to(self.device)
         self.completion_attention_mask = tokenized["attention_mask"].to(self.device)
+        self._invalidate_cached_positions()
 
     def _initialize_suffix(self):
         """Initialize suffix with BOS tokens and attention mask."""
         bos_token_id = self._get_bos_token_id()
 
-        # Initialize suffix input_ids to BOS tokens
+        # Initialize suffix input_ids to BOS tokens (inactive positions stay BOS)
         self.suffix_input_ids = torch.full(
             (self.batch_size, self.max_suffix_len),
             bos_token_id,
@@ -120,6 +153,15 @@ class ModelBatchedInput:
         )
         self.suffix_attention_mask[:, : self.init_len] = 1
 
+        # Replace active positions with random tokens to avoid identical BOS initialization
+        if self.init_len > 0:
+            num_active = self.batch_size * self.init_len
+            random_tokens = self._sample_random_tokens(num_active).view(
+                self.batch_size, self.init_len
+            )
+            self.suffix_input_ids[:, : self.init_len] = random_tokens
+        self._invalidate_cached_positions()
+
     def _get_bos_token_id(self) -> int:
         """Get BOS token ID, falling back to EOS if BOS is not available."""
         bos_token_id = (
@@ -130,6 +172,26 @@ class ModelBatchedInput:
         if bos_token_id is None:
             bos_token_id = 0
         return bos_token_id
+
+    def _sample_random_tokens(self, count: int) -> torch.Tensor:
+        """Sample random token IDs excluding known special tokens."""
+        if count <= 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        random_tokens = torch.randint(
+            0, self.vocab_size, (count,), device=self.device, dtype=torch.long
+        )
+        if self.special_token_ids:
+            special_tensor = torch.tensor(
+                list(self.special_token_ids), device=self.device, dtype=torch.long
+            )
+            invalid_mask = torch.isin(random_tokens, special_tensor)
+            while invalid_mask.any():
+                num_invalid = invalid_mask.sum().item()
+                random_tokens[invalid_mask] = torch.randint(
+                    0, self.vocab_size, (num_invalid,), device=self.device, dtype=torch.long
+                )
+                invalid_mask = torch.isin(random_tokens, special_tensor)
+        return random_tokens
 
     def get_bos_embedding(self) -> torch.Tensor:
         """Get BOS token embedding for initialization (continuous mode)."""
@@ -173,6 +235,12 @@ class ModelBatchedInput:
             dtype=torch.long,
             device=self.device,
         )
+        if self.init_len > 0:
+            num_active = self.batch_size * self.init_len
+            random_tokens = self._sample_random_tokens(num_active).view(
+                self.batch_size, self.init_len
+            )
+            suffix_tokens[:, : self.init_len] = random_tokens
         return suffix_tokens
 
     def _compute_embeddings(self):
@@ -211,6 +279,7 @@ class ModelBatchedInput:
             if len(first_zero) > 0:
                 pos = first_zero[0].item()
                 self.suffix_attention_mask[idx, pos] = 1
+        self._invalidate_cached_positions()
 
     def remove_suffix_token(self, batch_indices: torch.Tensor):
         """
@@ -226,6 +295,7 @@ class ModelBatchedInput:
             if len(last_one) > 0:
                 pos = last_one[-1].item()
                 self.suffix_attention_mask[idx, pos] = 0
+        self._invalidate_cached_positions()
 
     def update_suffix_embeddings(self, suffix_embeds: torch.Tensor):
         """
@@ -261,6 +331,7 @@ class ModelBatchedInput:
         # Note: We store the reference so get_model_input_embeds_and_attention_mask can use it
         # The parameter tensor itself is fine to reuse across forward/backward passes
         self.suffix_embeddings = suffix_embeds
+        self._invalidate_cached_positions()
 
     def update_suffix_tokens(self, suffix_tokens: torch.Tensor):
         """
@@ -292,10 +363,11 @@ class ModelBatchedInput:
                     suffix_tokens[i, j] = bos_token_id
 
         self.suffix_input_ids = suffix_tokens
+        self._invalidate_cached_positions()
 
     def get_model_input_embeds_and_attention_mask(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get concatenated embeddings and attention mask for model input (continuous mode only).
 
@@ -303,8 +375,6 @@ class ModelBatchedInput:
             inputs_embeds: Concatenated embeddings [B, seq_len, D]
             attention_mask: Concatenated attention mask [B, seq_len]
             suffix_mask: Mask indicating which positions are suffix (for gradient computation) [B, seq_len]
-            suffix_start_pos: Position where suffix starts in sequence
-            completion_start_pos: Position where completion starts in sequence
         """
         assert self.mode in [
             "continuous",
@@ -317,37 +387,170 @@ class ModelBatchedInput:
             self.suffix_embeddings is not None
         ), "Suffix embeddings must be set via update_suffix_embeddings"
 
-        prefix_embeds = self.prefix_embeddings
         prefix_mask = self.prefix_attention_mask
-        completion_embeds = self.completion_embeddings
         completion_mask = self.completion_attention_mask
 
-        # Create suffix mask: 1 for suffix positions, 0 for prefix/completion
-        suffix_mask = self.get_suffix_mask_in_fully_batched_input()
+        prefix_lengths = prefix_mask.sum(dim=1)
+        suffix_lengths = self.suffix_attention_mask.sum(dim=1)
+        completion_lengths = completion_mask.sum(dim=1)
+        total_lengths = prefix_lengths + suffix_lengths + completion_lengths
+        max_len = int(total_lengths.max().item())
+        batch_size = self.batch_size
+        embed_dim = self.embedding_layer.weight.shape[1]
 
-        # Concatenate: prefix + suffix + completion
-        # Detach prefix and completion embeddings (they should not have gradients)
-        # Only suffix embeddings should have gradients
-        prefix_embeds_detached = prefix_embeds.detach()
-        completion_embeds_detached = completion_embeds.detach()
-        # Use the stored suffix_embeddings (which is a reference to the parameter tensor)
-        inputs_embeds = torch.cat(
-            [
-                prefix_embeds_detached,
-                self.suffix_embeddings,
-                completion_embeds_detached,
-            ],
-            dim=1,
+        inputs_embeds = torch.zeros(
+            (batch_size, max_len, embed_dim),
+            dtype=self.prefix_embeddings.dtype,
+            device=self.device,
         )
-        attention_mask = torch.cat(
-            [prefix_mask, self.suffix_attention_mask, completion_mask], dim=1
+        attention_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.long, device=self.device
         )
+        suffix_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.long, device=self.device
+        )
+        suffix_start_pos = torch.zeros(
+            batch_size, dtype=torch.long, device=self.device
+        )
+        completion_start_pos = torch.zeros(
+            batch_size, dtype=torch.long, device=self.device
+        )
+
+        for idx in range(batch_size):
+            pos = 0
+            prefix_len = int(prefix_lengths[idx].item())
+            if prefix_len > 0:
+                prefix_tokens = self.prefix_embeddings[idx][
+                    prefix_mask[idx].bool()
+                ].detach()
+                inputs_embeds[idx, pos : pos + prefix_len] = prefix_tokens
+                attention_mask[idx, pos : pos + prefix_len] = 1
+                pos += prefix_len
+
+            suffix_start_pos[idx] = pos
+            suffix_len = int(suffix_lengths[idx].item())
+            if suffix_len > 0:
+                suffix_embeds = self.suffix_embeddings[idx, :suffix_len]
+                inputs_embeds[idx, pos : pos + suffix_len] = suffix_embeds
+                attention_mask[idx, pos : pos + suffix_len] = 1
+                suffix_mask[idx, pos : pos + suffix_len] = 1
+                pos += suffix_len
+
+            completion_start_pos[idx] = pos
+            completion_len = int(completion_lengths[idx].item())
+            if completion_len > 0:
+                completion_tokens = self.completion_embeddings[idx][
+                    completion_mask[idx].bool()
+                ].detach()
+                inputs_embeds[idx, pos : pos + completion_len] = completion_tokens
+                attention_mask[idx, pos : pos + completion_len] = 1
+
+        self._cached_suffix_start_pos = suffix_start_pos
+        self._cached_completion_start_pos = completion_start_pos
+        self._cached_total_lengths = total_lengths
 
         return inputs_embeds, attention_mask, suffix_mask
 
+    def _build_compact_token_inputs(
+        self,
+        prefix_ids: torch.Tensor,
+        prefix_mask: torch.Tensor,
+        suffix_ids: torch.Tensor,
+        suffix_mask: torch.Tensor,
+        completion_ids: torch.Tensor,
+        completion_mask: torch.Tensor,
+        pad_value: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Pack prefix, active suffix, and completion tokens into a contiguous sequence."""
+        device = prefix_ids.device
+        batch_size = prefix_ids.size(0)
+        prefix_lengths = prefix_mask.sum(dim=1)
+        suffix_lengths = suffix_mask.sum(dim=1)
+        completion_lengths = completion_mask.sum(dim=1)
+        total_lengths = prefix_lengths + suffix_lengths + completion_lengths
+        max_len = int(total_lengths.max().item()) if batch_size > 0 else 0
+
+        if max_len == 0:
+            input_ids = torch.empty(
+                batch_size, 0, dtype=torch.long, device=device
+            )
+            attention_mask = torch.empty(
+                batch_size, 0, dtype=torch.long, device=device
+            )
+            suffix_start = torch.zeros(batch_size, dtype=torch.long, device=device)
+            completion_start = torch.zeros(
+                batch_size, dtype=torch.long, device=device
+            )
+            return (
+                input_ids,
+                attention_mask,
+                suffix_start,
+                completion_start,
+                total_lengths,
+            )
+
+        input_ids = torch.full(
+            (batch_size, max_len),
+            pad_value,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.long, device=device
+        )
+        suffix_start_pos = torch.zeros(
+            batch_size, dtype=torch.long, device=device
+        )
+        completion_start_pos = torch.zeros(
+            batch_size, dtype=torch.long, device=device
+        )
+
+        for idx in range(batch_size):
+            pos = 0
+            prefix_len = int(prefix_lengths[idx].item())
+            if prefix_len > 0:
+                prefix_tokens = prefix_ids[idx][prefix_mask[idx].bool()]
+                input_ids[idx, pos : pos + prefix_len] = prefix_tokens
+                attention_mask[idx, pos : pos + prefix_len] = 1
+                pos += prefix_len
+
+            suffix_start_pos[idx] = pos
+            suffix_len = int(suffix_lengths[idx].item())
+            if suffix_len > 0:
+                suffix_tokens = suffix_ids[idx][suffix_mask[idx].bool()]
+                input_ids[idx, pos : pos + suffix_len] = suffix_tokens
+                attention_mask[idx, pos : pos + suffix_len] = 1
+                pos += suffix_len
+
+            completion_start_pos[idx] = pos
+            completion_len = int(completion_lengths[idx].item())
+            if completion_len > 0:
+                completion_tokens = completion_ids[idx][
+                    completion_mask[idx].bool()
+                ]
+                input_ids[idx, pos : pos + completion_len] = completion_tokens
+                attention_mask[idx, pos : pos + completion_len] = 1
+
+        return (
+            input_ids,
+            attention_mask,
+            suffix_start_pos,
+            completion_start_pos,
+            total_lengths,
+        )
+
     def get_model_input_ids_and_attention_mask(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        suffix_tokens_override: Optional[torch.Tensor] = None,
+        completion_tokens_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get concatenated input IDs and attention mask for model input (discrete mode only).
         Also used by continuous_proj mode after projecting suffix embeddings to tokens.
@@ -355,25 +558,40 @@ class ModelBatchedInput:
         Returns:
             input_ids: Concatenated token IDs [B, seq_len]
             attention_mask: Concatenated attention mask [B, seq_len]
-            completion_start_pos: Position where completion starts in sequence
         """
-        assert (
-            self.mode == "discrete" or self.original_mode == "continuous_proj"
-        ), "get_model_input_ids_and_attention_mask only for discrete mode or continuous_proj (after projection)"
+        assert self.mode == "discrete" or self.original_mode == "continuous_proj"
 
-        # Concatenate: prefix + suffix + completion
-        input_ids = torch.cat(
-            [self.prefix_input_ids, self.suffix_input_ids, self.completion_input_ids],
-            dim=1,
+        suffix_ids = (
+            suffix_tokens_override
+            if suffix_tokens_override is not None
+            else self.suffix_input_ids
         )
-        attention_mask = torch.cat(
-            [
-                self.prefix_attention_mask,
-                self.suffix_attention_mask,
-                self.completion_attention_mask,
-            ],
-            dim=1,
+        completion_ids = (
+            completion_tokens_override
+            if completion_tokens_override is not None
+            else self.completion_input_ids
         )
+
+        (
+            input_ids,
+            attention_mask,
+            suffix_start,
+            completion_start,
+            total_lengths,
+        ) = self._build_compact_token_inputs(
+            self.prefix_input_ids,
+            self.prefix_attention_mask,
+            suffix_ids,
+            self.suffix_attention_mask,
+            completion_ids,
+            self.completion_attention_mask,
+            self.pad_id,
+        )
+
+        if suffix_tokens_override is None and completion_tokens_override is None:
+            self._cached_suffix_start_pos = suffix_start
+            self._cached_completion_start_pos = completion_start
+            self._cached_total_lengths = total_lengths
 
         return input_ids, attention_mask
 
@@ -391,14 +609,18 @@ class ModelBatchedInput:
             dim=1,
         )
 
-    def get_suffix_start_pos(self) -> int:
+    def get_suffix_start_pos(self) -> torch.Tensor:
         """
-        Get suffix start position in the fully batched input.
+        Get suffix start positions (per example) in the compact input.
         """
-        return self.prefix_input_ids.size(-1)
+        if self._cached_suffix_start_pos is None:
+            self.get_model_input_ids_and_attention_mask()
+        return self._cached_suffix_start_pos
 
-    def get_completion_start_pos(self) -> int:
+    def get_completion_start_pos(self) -> torch.Tensor:
         """
-        Get completion start position in the fully batched input.
+        Get completion start positions (per example) in the compact input.
         """
-        return self.get_suffix_start_pos() + self.suffix_input_ids.size(-1)
+        if self._cached_completion_start_pos is None:
+            self.get_model_input_ids_and_attention_mask()
+        return self._cached_completion_start_pos

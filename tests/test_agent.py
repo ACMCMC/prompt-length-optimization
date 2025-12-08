@@ -3,6 +3,7 @@
 import torch
 import pytest
 from prompt_optimization.agent import PromptRLAgent
+from prompt_optimization.model_inputs import ModelBatchedInput
 
 @pytest.fixture
 def agent():
@@ -25,35 +26,42 @@ def test_get_random_token(agent):
 
 def test_get_likelihoods_batch(agent):
     """Test batched likelihood computation"""
-    D = agent.model.get_input_embeddings().weight.shape[1]
-    B, L = 2, 5
-    prompt_embeds = torch.randn(B, L, D, device=agent.device)
-    
-    # Create simple completion tokens
-    completion_texts = ["hello", "world"]
-    completion_tokens_list = [agent.tokenizer.encode(t, add_special_tokens=False) for t in completion_texts]
-    max_comp = max(len(ct) for ct in completion_tokens_list)
-    pad_id = getattr(agent.tokenizer, 'pad_token_id', 0)
-    completion_tokens = torch.tensor([
-        ct + [pad_id] * (max_comp - len(ct)) for ct in completion_tokens_list
-    ], dtype=torch.long, device=agent.device)
-    completion_lengths = torch.tensor([len(ct) for ct in completion_tokens_list], dtype=torch.long, device=agent.device)
-    
-    likelihoods = agent.get_likelihoods_batch(prompt_embeds, completion_tokens, completion_lengths, requires_grad=False)
-    
-    assert likelihoods.shape == (B,)
+    prefixes = ["Question: 1+1?\nAnswer:", "Prompt: say hello\nOutput:"]
+    completions = [" 2", " hello"]
+    model_input = ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=0,
+        init_len=0,
+        mode="discrete",
+    )
+
+    likelihoods = agent.get_likelihoods_batch(model_input, requires_grad=False)
+
+    assert likelihoods.shape == (len(prefixes),)
     assert torch.all(torch.isfinite(likelihoods))
 
 def test_get_likelihoods_batch_empty_completion(agent):
     """Test likelihood computation with empty completion"""
-    D = agent.model.get_input_embeddings().weight.shape[1]
-    B, L = 1, 3
-    prompt_embeds = torch.randn(B, L, D, device=agent.device)
-    completion_tokens = torch.zeros(B, 1, dtype=torch.long, device=agent.device)
-    completion_lengths = torch.zeros(B, dtype=torch.long, device=agent.device)
-    
-    likelihoods = agent.get_likelihoods_batch(prompt_embeds, completion_tokens, completion_lengths, requires_grad=False)
-    
-    assert likelihoods.shape == (B,)
-    assert likelihoods[0].item() == 0.0
+    prefixes = ["Q: value?\nA:", "Another question:"]
+    completions = ["", ""]
+    model_input = ModelBatchedInput(
+        prefix_texts=prefixes,
+        completion_texts=completions,
+        tokenizer=agent.tokenizer,
+        device=agent.device,
+        embedding_layer=agent.model.get_input_embeddings(),
+        max_suffix_len=0,
+        init_len=0,
+        mode="discrete",
+    )
+
+    likelihoods = agent.get_likelihoods_batch(model_input, requires_grad=False)
+
+    assert likelihoods.shape == (len(prefixes),)
+    assert torch.allclose(likelihoods, torch.zeros_like(likelihoods))
+
 

@@ -1,5 +1,6 @@
 # Configuration for toxic-chat dataset training and evaluation
-model: EleutherAI/pythia-70m
+# model: EleutherAI/pythia-410m
+model: EleutherAI/pythia-160m
 seed: 2262
 
 # Dataset split ratios (must sum to 1.0)
@@ -10,32 +11,32 @@ dataset:
 
 train:
   # Dataset parameters
-  max_prompts: 600                   # Number of prompts to train on
-  min_prompt_length: 30              # Minimum prompt length (characters)
-  max_prompt_length: 150             # Maximum prompt length (characters)
+  max_prompts: 128                      # Number of prompts to train on
+  min_prompt_length: 25              # Minimum prompt length (characters)
+  max_prompt_length: 75             # Maximum prompt length (characters)
   
   # Training parameters per prompt
-  episodes_per_prompt: 3             # Episodes to train on each prompt
-  steps_per_episode: 25            # Steps per episode (increased for better RL learning)
+  episodes_per_prompt: 8            # Episodes to train on each prompt
+  steps_per_episode: 24            # Steps per episode (increased for better RL learning)
   init_len: 16                       # Initial prompt length in tokens (number of suffix positions with attention mask = 1 at start)
   max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
   
   # Optimization parameters
   lr_embeddings: 0.01
   lr_policy: 0.0003
-  epsilon: 0.1                    # Epsilon for epsilon-greedy exploration (lower = less random exploration)
-  epsilon_decay: 0.97            # Epsilon decay per episode (slightly slower decay, but from a lower starting epsilon)
+  epsilon: 0.3                    # Epsilon for epsilon-greedy exploration (lower = less random exploration)
+  epsilon_decay: 0.95            # Epsilon decay per episode (slightly slower decay, but from a lower starting epsilon)
   epsilon_min: 0.05               # Minimum epsilon value (higher = maintains more exploration)
   entropy_coef: 0.02              # Entropy bonus coefficient (encourages diverse action distributions; mostly unused if grpo.entropy_coef is set)
   temperature: 1.5                # Softmax temperature (higher = more exploration in policy)
-  alpha: 0.5                         # Likelihood weight
-  beta: 0.5                          # Length penalty (logarithmic: log(1+length), higher = more compression)
-  projection_weight: 0.5            # Weight for projection regularization (continuous_proj mode)
+  alpha: 1.0                         # Likelihood weight
+  beta: 2.0                          # Length penalty (logarithmic: log(1+length), higher = more compression)
+  projection_weight: 0.1            # Weight for projection regularization (continuous_proj mode)
   distance_metric: l2                # Distance metric for projection: 'l2' or 'dot'
   
   # Parallel processing parameters
-  batch_size: 16                      # Prompts per batch for progress tracking
-  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for PPO advantage computation
+  batch_size: 6                      # Prompts per batch for progress tracking
+  rollouts_per_prompt: 4              # Number of trajectories (rollouts) per prompt for GRPO
   
   # Output
   save_path: models/trained_policy_complex.pt
@@ -51,26 +52,22 @@ train:
   
   # GCG (Greedy Coordinate Gradient) parameters for discrete optimization
   gcg:
-    top_k: 64
-    batch_size: 64  # Number of candidates per position (reduced to avoid OOM)
-    max_batch_size: 256  # Maximum batch size for forward passes (to avoid OOM)
-    steps: 5
+    top_k: 32
+    batch_size: 32 # Number of candidates per position
+    max_batch_size: 128  # Maximum batch size for forward passes (to avoid OOM), this modifies the above batch size to limit the number of elements per forward pass
+    steps: 10
   
   # GRPO parameters (Group Relative Policy Optimization)
   grpo:
     epochs: 4                      # Number of GRPO update epochs per episode
     clip: 0.2                       # GRPO clipping epsilon
     gamma: 0.99                     # Discount factor
-    gae_lambda: 0.95                # GAE lambda parameter
-    value_coef: 2.0                 # Value loss coefficient (increased to strengthen value learning)
     entropy_coef: 0.003             # Entropy bonus coefficient (smaller = less pull toward uniform policy)
     max_grad_norm: 0.5              # Maximum gradient norm for clipping
   
   # Policy network architecture
   policy:
-    hidden_size: 128                 # Hidden layer size for policy and value networks
-    value_init_bias: 0.0        # Initial bias for value network output layer
-    value_init_gain: 0.1            # Initial weight gain for value network output layer
+    hidden_size: 128                 # Hidden layer size for policy network
 
 eval:
   # Test dataset parameters
@@ -81,8 +78,8 @@ eval:
   # Evaluation parameters
   init_len: 16                       # Initial prompt length (number of suffix positions with attention mask = 1 at start)
   max_suffix_len: 32                 # Maximum suffix length (fixed size for batched suffix embeddings)
-  max_policy_steps: 25               # Max policy steps per prompt
-  opt_steps: 5                      # Optimization steps (fewer for dataset eval)
+  max_policy_steps: 12               # Max policy steps per prompt
+  opt_steps: 12                      # Optimization steps (fewer for dataset eval)
   log_every_opt: 1                 # Reduce logging
   
   # Output
@@ -92,3 +89,5 @@ eval:
   no_plots: false                     # Don't create individual plots
   plots_prefix: eval
   plots_format: pdf                  # png|pdf (for when plots are enabled)
+  batch_size: 16                    # Batch size for evaluation
+  dataset: toxicchat                # Dataset to use during evaluation

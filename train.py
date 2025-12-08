@@ -61,14 +61,12 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     gcg_max_batch_size = gcg_cfg['max_batch_size']
     gcg_steps = gcg_cfg['steps']
     save_path = train_cfg['save_path']
-    grpo_cfg = train_cfg.get('grpo') or train_cfg.get('ppo')  # Support both 'grpo' and legacy 'ppo' keys
-    if grpo_cfg is None:
-        raise ValueError("Either 'grpo' or 'ppo' config must be provided in YAML")
+    if 'grpo' not in train_cfg:
+        raise ValueError("train.grpo configuration is required")
+    grpo_cfg = train_cfg['grpo']
     grpo_epochs = grpo_cfg['epochs']
     grpo_clip = grpo_cfg['clip']
     grpo_gamma = grpo_cfg['gamma']
-    grpo_lambda = grpo_cfg['gae_lambda']
-    grpo_value_coef = grpo_cfg['value_coef']
     grpo_entropy_coef = grpo_cfg.get('entropy_coef')  # Optional, falls back to train.entropy_coef
 
     # Default to a larger prompt-batch to better utilize a single GPU
@@ -93,9 +91,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     epsilon = train_cfg['epsilon']
     epsilon_decay = train_cfg['epsilon_decay']
     epsilon_min = train_cfg['epsilon_min']
-    entropy_coef = train_cfg.get('entropy_coef')  # Optional, can be overridden by grpo.entropy_coef
-    if entropy_coef is None:
-        entropy_coef = grpo_entropy_coef  # Fall back to GRPO entropy if not set
+    entropy_coef = train_cfg['entropy_coef']
     temperature = train_cfg['temperature']
     
     # Initialize wandb if available and requested (after variables are set)
@@ -126,8 +122,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                         'grpo_epochs': grpo_epochs,
                         'grpo_clip': grpo_clip,
                         'grpo_gamma': grpo_gamma,
-                        'grpo_gae_lambda': grpo_lambda,
-                        'grpo_value_coef': grpo_value_coef,
                         'grpo_entropy_coef': grpo_entropy_coef,
                         'dataset': dataset_name,
                         'seed': cfg['seed']
@@ -257,41 +251,31 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
     agent = PromptRLAgent(model_name=model_name)
     # Note: epsilon, epsilon_decay, epsilon_min, entropy_coef, temperature
     # are already defined above (before wandb init) for wandb config
-    grpo_cfg = train_cfg.get('grpo') or train_cfg.get('ppo')  # Support both 'grpo' and legacy 'ppo' keys
-    if grpo_cfg is None:
-        raise ValueError("Either 'grpo' or 'ppo' config must be provided in YAML")
+    if 'grpo' not in train_cfg:
+        raise ValueError("train.grpo configuration must be provided in YAML")
+    grpo_cfg = train_cfg['grpo']
     grpo_clip = grpo_cfg['clip']
     grpo_epochs = grpo_cfg['epochs']
     grpo_gamma = grpo_cfg['gamma']
-    grpo_gae_lambda = grpo_cfg['gae_lambda']
-    grpo_value_coef = grpo_cfg['value_coef']
-    grpo_entropy_coef = grpo_cfg.get('entropy_coef')  # Optional, falls back to train.entropy_coef
-    if grpo_entropy_coef is None:
-        grpo_entropy_coef = entropy_coef
+    grpo_entropy_coef = grpo_cfg['entropy_coef']
     
     # Policy network architecture parameters
     policy_cfg = train_cfg['policy']
     policy_hidden_size = policy_cfg['hidden_size']
-    value_init_bias = policy_cfg['value_init_bias']
-    value_init_gain = policy_cfg['value_init_gain']
     max_grad_norm = grpo_cfg['max_grad_norm']
     
     optimizer = LengthPolicyOptimizer(
-        agent, 
-        epsilon=epsilon, 
-        epsilon_decay=epsilon_decay, 
+        agent,
+        epsilon=epsilon,
+        epsilon_decay=epsilon_decay,
         epsilon_min=epsilon_min,
         entropy_coef=grpo_entropy_coef,
         temperature=temperature,
         grpo_clip=grpo_clip,
         grpo_epochs=grpo_epochs,
         grpo_gamma=grpo_gamma,
-        grpo_gae_lambda=grpo_gae_lambda,
-        grpo_value_coef=grpo_value_coef,
         policy_hidden_size=policy_hidden_size,
-        value_init_bias=value_init_bias,
-        value_init_gain=value_init_gain,
-        max_grad_norm=max_grad_norm
+        max_grad_norm=max_grad_norm,
     )
     
     # Set projection parameters for continuous_proj mode
@@ -326,8 +310,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
             writer = csv.writer(fh)
             writer.writerow([
                 'timestamp', 'batch_idx', 'episode', 'avg_reward', 'avg_return', 
-                'avg_advantage', 'std_advantage', 'policy_loss', 'value_loss', 'entropy', 'epsilon',
-                'avg_value_pred', 'value_pred_error'
+                'avg_advantage', 'std_advantage', 'policy_loss', 'entropy', 'epsilon'
             ])
 
     # Shared helper to extract per-prompt final and best likelihood from batched traces
@@ -595,10 +578,6 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         'discrete': 'discrete',
     }
     
-    # Handle legacy 'ppo' mode (map to continuous)
-    if 'ppo' in optimization_mode_lower:
-        mode_map['ppo'] = 'continuous'
-    
     # Calculate number of batches
     num_batches = (len(prompts) - 1) // batch_size + 1
     
@@ -655,11 +634,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 pm.get('avg_advantage', 0.0),
                                 pm.get('std_advantage', 1.0),
                                 pm.get('policy_loss', 0.0),
-                                pm.get('value_loss', 0.0),
                                 pm.get('entropy', 0.0),
                                 pm.get('epsilon', 0.0),
-                                pm.get('avg_value_pred', 0.0),
-                                pm.get('value_pred_error', 0.0)
                             ])
                     
                     # Log policy metrics to wandb at the last step of the episode
@@ -675,13 +651,8 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
                                 'batch': pm.get('batch_idx', batch_idx),
                                 'episode': episode_idx  # Use episode_idx from outer loop
                             }
-                            if pm.get('avg_advantage', 0.0) != 0.0:  # GRPO
-                                log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
-                                log_dict['policy/std_advantage'] = pm.get('std_advantage', 1.0)
-                                log_dict['policy/value_loss'] = pm.get('value_loss', 0.0)
-                                log_dict['policy/avg_value_pred'] = pm.get('avg_value_pred', 0.0)
-                                log_dict['policy/avg_return'] = pm.get('avg_return', 0.0)
-                                log_dict['policy/value_pred_error'] = pm.get('value_pred_error', 0.0)
+                            log_dict['policy/avg_advantage'] = pm.get('avg_advantage', 0.0)
+                            log_dict['policy/std_advantage'] = pm.get('std_advantage', 1.0)
                             # Log at the step after the last step-level metric to ensure monotonic ordering
                             wandb.log(log_dict, step=policy_batch_step, commit=True)
                     
@@ -814,7 +785,7 @@ def train_on_dataset(cfg, fast_mode=False, dataset_name: str = "advbench", use_w
         print(f"{'='*60}")
         
         # Generate plots if enabled (simple reward plot)
-        if not train_cfg.get('no_plots', False):
+        if not train_cfg['no_plots']:
             try:
                 # Convert all rewards to plain Python floats to avoid CUDA tensor issues
                 plot_rewards = [float(r.cpu() if hasattr(r, 'cpu') else r) for r in all_rewards]

@@ -51,7 +51,20 @@ def run_single_experiment(
         Dictionary with experiment results
     """
     train_cfg = config['train']
-    seed = config.get('seed', 2262)
+    seed = config['seed']
+    policy_cfg = train_cfg['policy']
+    gcg_cfg = train_cfg['gcg']
+    grpo_cfg = train_cfg['grpo']
+    epsilon = train_cfg['epsilon']
+    epsilon_decay = train_cfg['epsilon_decay']
+    epsilon_min = train_cfg['epsilon_min']
+    entropy_coef = grpo_cfg['entropy_coef']
+    temperature = train_cfg['temperature']
+    grpo_clip = grpo_cfg['clip']
+    grpo_epochs = grpo_cfg['epochs']
+    grpo_gamma = grpo_cfg['gamma']
+    policy_hidden_size = policy_cfg['hidden_size']
+    max_grad_norm = grpo_cfg['max_grad_norm']
     set_seed(seed)
     
     # Check if wandb.config exists (from sweep), use it to override config values
@@ -155,14 +168,27 @@ def run_single_experiment(
         raise ValueError("No valid prompts found in dataset")
     
     # Initialize agent and optimizer
-    model_name = config.get('model', 'EleutherAI/pythia-70m')
+    model_name = config['model']
     agent = PromptRLAgent(model_name=model_name)
-    optimizer = LengthPolicyOptimizer(agent)
-    
-    # Set projection parameters for continuous_proj mode
-    if mode == 'continuous_proj':
-        optimizer.projection_weight = projection_weight
-        optimizer.distance_metric = distance_metric
+    optimizer = LengthPolicyOptimizer(
+        agent,
+        epsilon=epsilon,
+        epsilon_decay=epsilon_decay,
+        epsilon_min=epsilon_min,
+        entropy_coef=entropy_coef,
+        temperature=temperature,
+        grpo_clip=grpo_clip,
+        grpo_epochs=grpo_epochs,
+        grpo_gamma=grpo_gamma,
+        policy_hidden_size=policy_hidden_size,
+        max_grad_norm=max_grad_norm,
+    )
+    optimizer.projection_weight = projection_weight
+    optimizer.distance_metric = distance_metric
+    optimizer.gcg_steps = gcg_cfg['steps']
+    optimizer.gcg_top_k = gcg_cfg['top_k']
+    optimizer.gcg_batch_size = gcg_cfg['batch_size']
+    optimizer.gcg_max_batch_size = gcg_cfg['max_batch_size']
     
     # Track metrics
     all_rewards = []

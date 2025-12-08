@@ -4,10 +4,12 @@ RL Agent for prompt optimization: handles model interactions and likelihood comp
 
 from __future__ import annotations
 
+import random
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
-from transformers import GPTNeoXForCausalLM, AutoTokenizer
-import random
+from transformers import AutoTokenizer, GPTNeoXForCausalLM
 
 
 class PromptRLAgent:
@@ -128,7 +130,8 @@ class PromptRLAgent:
 
                 # Forward pass with attention mask
                 outputs = self.model(
-                    inputs_embeds=inputs_embeds, attention_mask=attention_mask
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
                 )
                 logits = outputs.logits  # [B, seq_len, vocab]
             elif model_input.mode == "continuous" or (
@@ -141,7 +144,8 @@ class PromptRLAgent:
                 # Only suffix embeddings have gradients
                 # Forward pass with attention mask
                 outputs = self.model(
-                    inputs_embeds=inputs_embeds, attention_mask=attention_mask
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
                 )
                 logits = outputs.logits  # [B, seq_len, vocab]
             elif model_input.mode == "discrete":
@@ -151,30 +155,67 @@ class PromptRLAgent:
                 )
 
                 # Forward pass with attention mask
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
                 logits = outputs.logits  # [B, seq_len, vocab]
             else:
                 raise ValueError(f"Invalid mode: {model_input.mode}")
 
+        token_log_probs, comp_mask = self._compute_completion_token_log_probs(
+            logits, model_input
+        )
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        return masked_log_probs.sum(dim=-1)
+
+    def compute_completion_log_probs(
+        self, logits: torch.Tensor, model_input
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Public helper to expose completion token log probabilities for downstream users.
+
+        Returns:
+            token_log_probs: [B, max_completion_len_active]
+            completion_mask: boolean mask indicating valid tokens
+        """
+        return self._compute_completion_token_log_probs(logits, model_input)
+
+    def _compute_completion_token_log_probs(
+        self, logits: torch.Tensor, model_input
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather log probabilities for completion tokens given logits over the packed sequence.
+        """
+        batch_size = logits.size(0)
+        completion_mask = model_input.completion_attention_mask.bool()
+
+        completion_lengths = completion_mask.sum(dim=1)
+        max_completion_len = (
+            int(completion_lengths.max().item()) if completion_lengths.numel() > 0 else 0
+        )
+
+        token_log_probs = logits.new_zeros((batch_size, max_completion_len))
+        trimmed_mask = torch.zeros(
+            (batch_size, max_completion_len), dtype=torch.bool, device=logits.device
+        )
+        completion_tokens = model_input.completion_input_ids
         completion_start_pos = model_input.get_completion_start_pos()
 
-        # Extract logits and completion tokens and shift appropriately. We just take the last model_input.completion_token_ids for the logits and completion tokens. For example, if the completions are 12 tokens long, we take the logits and completion tokens for the last 12 tokens.
-        comp_logits = logits[:, completion_start_pos - 1 : -1, :]  # [B, number of completion tokens, vocab]
-        comp_tokens = model_input.completion_input_ids  # [B, number of completion tokens]
+        for idx in range(batch_size):
+            length = int(completion_lengths[idx].item())
+            start = int(completion_start_pos[idx].item())
+            end = start - 1 + length
+            slice_logits = logits[idx, start - 1 : end, :]
+            log_probs = F.log_softmax(slice_logits, dim=-1)
+            tokens = completion_tokens[idx][completion_mask[idx]]
+            gathered = log_probs.gather(1, tokens.unsqueeze(-1)).squeeze(-1)
+            token_log_probs[idx, :length] = gathered
+            trimmed_mask[idx, :length] = True
 
-        # Compute log probabilities
-        log_probs = F.log_softmax(comp_logits, dim=-1)
-
-        # Gather token log probs
-        token_log_probs = log_probs.gather(2, comp_tokens.unsqueeze(-1)).squeeze(
-            -1
-        )  # [B, number of completion tokens]
-
-        # Mask invalid positions by taking the attention mask of the completion tokens and masking the invalid positions.
-        comp_mask = model_input.completion_attention_mask.bool()
-        token_log_probs = torch.where(comp_mask, token_log_probs, torch.zeros_like(token_log_probs))
-
-        return token_log_probs.sum(dim=-1)  # [B]
+        return token_log_probs, trimmed_mask
 
     def get_random_token(self) -> int:
         """

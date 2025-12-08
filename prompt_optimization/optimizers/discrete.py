@@ -1,6 +1,5 @@
 """
-Discrete prompt optimization using GCG (Greedy Coordinate Gradient) algorithm.
-Based on nanoGCG implementation: https://github.com/GraySwanAI/nanoGCG
+Discrete prompt optimization using the official GCG (Greedy Coordinate Gradient) algorithm.
 """
 
 import torch
@@ -13,6 +12,102 @@ import logging
 
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def _get_embedding_layer(model):
+    """Return the model input embedding layer."""
+    return model.get_input_embeddings()
+
+
+def _get_embedding_matrix(model):
+    """Return the embedding weight matrix."""
+    return _get_embedding_layer(model).weight
+
+
+def _get_embeddings(model, input_ids):
+    """Lookup embeddings for given token ids."""
+    return _get_embedding_layer(model)(input_ids)
+
+
+def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
+    """
+    Compute gradients of the loss w.r.t. the coordinates (control tokens).
+    """
+    model_device = next(model.parameters()).device
+    embed_weights = _get_embedding_matrix(model)
+    one_hot = torch.zeros(
+        input_ids[input_slice].shape[0],
+        embed_weights.shape[0],
+        device=model_device,
+        dtype=embed_weights.dtype,
+    )
+    one_hot.scatter_(
+        1,
+        input_ids[input_slice].unsqueeze(1),
+        torch.ones(one_hot.shape[0], 1, device=model_device, dtype=embed_weights.dtype),
+    )
+    one_hot.requires_grad_()
+    input_embeds = (one_hot @ embed_weights).unsqueeze(0)
+
+    embeds = _get_embeddings(model, input_ids.unsqueeze(0)).detach()
+    full_embeds = torch.cat(
+        [
+            embeds[:, : input_slice.start, :],
+            input_embeds,
+            embeds[:, input_slice.stop :, :],
+        ],
+        dim=1,
+    )
+
+    logits = model(inputs_embeds=full_embeds).logits
+    targets = input_ids[target_slice]
+    loss = F.cross_entropy(logits[0, loss_slice, :], targets)
+
+    loss.backward()
+
+    grad = one_hot.grad.clone()
+    grad = grad / grad.norm(dim=-1, keepdim=True)
+    # Re-enabled normalization to stay aligned with vanilla GCG behavior.
+    return grad
+
+
+def sample_control(
+    control_toks,
+    grad,
+    batch_size,
+    topk=256,
+    temp=1,
+    not_allowed_tokens=None,
+    n_replace=1,
+):
+    """
+    Sample candidate control sequences following the official GCG sampling rule.
+    """
+    if not_allowed_tokens is not None:
+        grad[:, not_allowed_tokens.to(grad.device)] = float("inf")
+
+    topk = min(topk, grad.shape[1])
+    top_indices = (-grad).topk(topk, dim=1).indices  # [L, topk]
+    control_toks = control_toks.to(grad.device)
+
+    original_control_toks = control_toks.repeat(batch_size, 1)
+    rand_order = torch.argsort(
+        torch.rand(batch_size, len(control_toks), device=grad.device), dim=-1
+    )
+    sampled_pos = rand_order[:, :n_replace]
+    tok_choices = torch.randint(
+        0, topk, (batch_size, n_replace), device=grad.device
+    )
+    pos_flat = sampled_pos.reshape(-1)
+    choice_flat = tok_choices.reshape(-1)
+    selected_vals = top_indices[pos_flat, choice_flat].reshape(batch_size, n_replace)
+
+    new_control_toks = original_control_toks.clone()
+    new_control_toks.scatter_(
+        1, sampled_pos, selected_vals
+    )
+    return new_control_toks
 
 class DiscretePromptOptimizer(BasePromptOptimizer):
     """
@@ -54,6 +149,19 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         self.gcg_max_batch_size = (
             gcg_max_batch_size  # Maximum batch size for forward passes
         )
+        self.not_allowed_tokens = (
+            torch.tensor(
+                sorted(agent.special_token_ids),
+                dtype=torch.long,
+                device=self.device,
+            )
+            if agent.special_token_ids
+            else None
+        )
+        self._last_token_grads = None
+        self.last_first_token_prob = None
+        self.last_avg_token_logprob = None
+        self.last_completion_grad_summary = None
 
     def initialize_prompts(
         self, model_input: ModelBatchedInput
@@ -102,72 +210,82 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
 
         return prompt_data, updated_lengths
     
+    def _trim_prefix_tokens(
+        self, model_input: ModelBatchedInput, idx: int
+    ) -> torch.Tensor:
+        """Return prefix tokens (without padding) for a single example."""
+        mask = model_input.prefix_attention_mask[idx].bool()
+        tokens = model_input.prefix_input_ids[idx]
+        return tokens[mask]
+
+    def _trim_completion_tokens(
+        self, model_input: ModelBatchedInput, idx: int
+    ) -> torch.Tensor:
+        """Return completion tokens (without padding) for a single example."""
+        mask = model_input.completion_attention_mask[idx].bool()
+        tokens = model_input.completion_input_ids[idx]
+        return tokens[mask]
+
     def _compute_gradients(
         self,
-        best_tokens: torch.Tensor,
+        prompt_data: torch.Tensor,
         model_input: ModelBatchedInput,
+        suffix_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute gradients of loss w.r.t. token embeddings for active suffix positions.
-
-        Args:
-            best_tokens: Current suffix tokens [B, max_suffix_len]
-            model_input: ModelBatchedInput instance
-            suffix_mask: Active positions mask [B, max_suffix_len] (1=active, 0=inactive)
-
-        Returns:
-            gradients: Gradients w.r.t. embeddings [B, max_suffix_len, emb_dim]
+        Helper for tests: compute embedding gradients w.r.t. suffix tokens without diagnostics.
         """
-        # Convert tokens to embeddings with gradients enabled, we use the best tokens because we want to compute the gradients w.r.t. the best tokens.
-        suffix_embeds = self.embedding_layer(best_tokens)
-
-        suffix_embeds.requires_grad_(True)
-        suffix_embeds.retain_grad()  # Required for non-leaf tensors to retain gradients
-
-        # We need to cat prefix, suffix and completion embeddings and attention masks to be able to do a forward pass and get the logits.
-        prefix_embeds = self.embedding_layer(model_input.prefix_input_ids)
-        completion_embeds = self.embedding_layer(model_input.completion_input_ids)
-        inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, completion_embeds], dim=1)
-        prefix_attention_mask = model_input.prefix_attention_mask
-        completion_attention_mask = model_input.completion_attention_mask
-        suffix_attention_mask = model_input.suffix_attention_mask
-        attention_mask = torch.cat([prefix_attention_mask, suffix_attention_mask, completion_attention_mask], dim=1)
-
-        # The suffix mask is the mask of the suffix positions in the fully batched input. But it's not the same as the suffix attention mask. The suffix attention mask is the mask of where the model should pay attention to, while the suffix mask is the mask we use ourselves to know which positions are active and thus where we can replace tokens.
-
-        # Forward pass
-        outputs = self.agent.model(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+        batch_size = prompt_data.shape[0]
+        vocab_size = self.embedding_layer.weight.shape[0]
+        vocab_gradients = torch.zeros(
+            batch_size,
+            self.max_prompt_len,
+            vocab_size,
+            device=self.device,
+            dtype=self.embedding_layer.weight.dtype,
         )
-        logits = outputs.logits  # [B, seq_len, vocab]
-
-        # Compute loss (negative log likelihood of completion)
-        loss = -logits.sum(dim=-1).mean()
-
-        # Backward to get gradients
-        loss.backward()
-        gradients = suffix_embeds.grad.clone()  # [B, max_suffix_len, emb_dim]
-
-        # Clear gradients and intermediate tensors to free memory
-        if suffix_embeds.grad is not None:
-            suffix_embeds.grad = None
-        del (
-            loss,
-            outputs,
-            logits,
-            prefix_embeds,
-            suffix_embeds,
-            completion_embeds,
-            inputs_embeds,
-            prefix_attention_mask,
-            suffix_attention_mask,
-            completion_attention_mask,
-            attention_mask,
+        embed_gradients = torch.zeros(
+            batch_size,
+            self.max_prompt_len,
+            self.emb_dim,
+            device=self.device,
+            dtype=self.embedding_layer.weight.dtype,
         )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
-        return gradients
+        for prompt_idx in range(batch_size):
+            active_positions = torch.nonzero(
+                suffix_mask[prompt_idx] == 1, as_tuple=False
+            ).squeeze(-1)
+            length = active_positions.shape[0]
+            completion_len = int(
+                model_input.completion_attention_mask[prompt_idx].sum().item()
+            )
+
+            if length == 0 or completion_len == 0:
+                continue
+
+            prefix_tokens = self._trim_prefix_tokens(model_input, prompt_idx)
+            completion_tokens = self._trim_completion_tokens(model_input, prompt_idx)
+            control_tokens = prompt_data[prompt_idx, :length]
+
+            input_ids = torch.cat(
+                [prefix_tokens, control_tokens, completion_tokens], dim=0
+            )
+            pref_len = prefix_tokens.shape[0]
+            control_slice = slice(pref_len, pref_len + length)
+            target_slice = slice(pref_len + length, pref_len + length + completion_len)
+            loss_slice = slice(pref_len + length - 1, pref_len + length - 1 + completion_len)
+
+            self.agent.model.zero_grad(set_to_none=True)
+            grad_vocab = token_gradients(
+                self.agent.model, input_ids, control_slice, target_slice, loss_slice
+            )
+            vocab_gradients[prompt_idx, :length, :] = grad_vocab
+            grad_embed = grad_vocab @ self.embedding_layer.weight
+            embed_gradients[prompt_idx, :length, :] = grad_embed
+
+        self._last_token_grads = vocab_gradients
+        return embed_gradients
 
     def _sample_candidates_from_grad(
         self,
@@ -177,238 +295,162 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
         n_replace: int = 1,
     ) -> Tuple[torch.Tensor, list]:
         """
-        Sample candidate sequences from gradients (following nanoGCG's sample_ids_from_grad).
-
-        Generates search_width total candidate sequences (not per position).
-        Each candidate updates n_replace randomly selected positions.
-
-        Args:
-            prompt_data: Current suffix tokens [B, max_suffix_len]
-            gradients: Gradients w.r.t. embeddings [B, max_suffix_len, emb_dim]
-            suffix_mask: Active positions mask [B, max_suffix_len]
-            n_replace: Number of positions to update per candidate (default 1)
-
-        Returns:
-            candidate_sequences: Full candidate sequences [search_width * B, max_suffix_len]
-            update_info: List of (prompt_idx, candidate_idx, pos, new_token) for each update
+        Sample candidate sequences using the official sample_control helper (compatibility shim).
         """
-        embedding_weights = self.embedding_layer.weight  # [vocab_size, emb_dim]
+        del n_replace  # Not used; kept for backward compatibility with tests
 
-        # Project gradients onto vocabulary space: grad @ W^T
-        # This gives us gradient w.r.t. each possible token at each position
-        grad_proj = gradients @ embedding_weights.T  # [B, max_suffix_len, vocab_size]
+        search_width = self.gcg_batch_size
+        candidate_sequences = []
+        update_info = []
 
-        # Get top-k tokens for each position: [B, max_suffix_len, top_k]
-        topk_ids = (
-            (-grad_proj).topk(self.gcg_top_k, dim=-1).indices
-        )  # [B, max_suffix_len, top_k]
+        batch_size = prompt_data.shape[0]
+        token_grads = (
+            self._last_token_grads
+            if self._last_token_grads is not None
+            else None
+        )
 
-        search_width = (
-            self.gcg_batch_size
-        )  # Total number of candidate sequences per prompt
-
-        # For each prompt, generate search_width candidate sequences
-        all_candidate_sequences = []
-        all_update_info = []
-
-        # Use actual batch size from prompt_data (may be subset)
-        actual_batch_size = prompt_data.shape[0]
-        for prompt_idx in range(actual_batch_size):
-            # Get active positions for this prompt
+        for prompt_idx in range(batch_size):
             active_positions = torch.nonzero(
                 suffix_mask[prompt_idx] == 1, as_tuple=False
-            ).squeeze(
-                -1
-            )  # [num_active]
-
-            if len(active_positions) == 0:
+            ).squeeze(-1)
+            length = active_positions.shape[0]
+            if length == 0:
                 continue
 
-            num_active = len(active_positions)
+            if token_grads is not None:
+                grad_for_sampling = token_grads[prompt_idx, :length, :]
+            else:
+                # Fallback: approximate vocab gradients by projecting embedding grads back via pseudo-inverse
+                embed_grad = gradients[prompt_idx, :length, :]
+                embedding_weights = self.embedding_layer.weight  # [vocab, emb_dim]
+                pseudo_inverse = torch.pinverse(embedding_weights)
+                grad_for_sampling = embed_grad @ pseudo_inverse.t()
 
-            # Start with original sequence, repeat for all candidates
-            original_sequence = prompt_data[
-                prompt_idx : prompt_idx + 1
-            ]  # [1, max_suffix_len]
-            candidate_sequences = original_sequence.repeat(
-                search_width, 1
-            )  # [search_width, max_suffix_len]
-
-            # For each candidate, randomly select n_replace positions to update
-            # sampled_ids_pos: [search_width, n_replace] indices into active_positions
-            # We use argsort of random values to randomly sample without replacement
-            random_vals = torch.rand((search_width, num_active), device=self.device)
-            sampled_pos_indices = torch.argsort(random_vals, dim=-1)[
-                ..., :n_replace
-            ]  # [search_width, n_replace]
-            sampled_active_pos = active_positions[
-                sampled_pos_indices
-            ]  # [search_width, n_replace]
-
-            # For each candidate and each position to update, sample a token from top-k
-            # sampled_ids_val: [search_width, n_replace] token IDs
-            # topk_ids[prompt_idx] is [max_suffix_len, top_k]
-            # sampled_active_pos is [search_width, n_replace] - indices into max_suffix_len
-            # We need to gather from topk_ids for each position
-            topk_for_positions = topk_ids[prompt_idx][
-                sampled_active_pos
-            ]  # [search_width, n_replace, top_k]
-            random_indices = torch.randint(
-                0, self.gcg_top_k, (search_width, n_replace, 1), device=self.device
+            control_tokens = prompt_data[prompt_idx, :length]
+            candidates = sample_control(
+                control_tokens,
+                grad_for_sampling,
+                batch_size=search_width,
+                topk=self.gcg_top_k,
+                temp=1,
+                not_allowed_tokens=self.not_allowed_tokens,
+                n_replace=1,
             )
-            candidate_tokens = torch.gather(
-                topk_for_positions, 2, random_indices
-            ).squeeze(
-                2
-            )  # [search_width, n_replace]
 
-            # Update candidate sequences using scatter
-            # scatter_(dim, index, src) where index and src have same shape
-            candidate_sequences.scatter_(1, sampled_active_pos, candidate_tokens)
+            padded = prompt_data[prompt_idx : prompt_idx + 1].repeat(
+                search_width, 1
+            )
+            padded[:, :length] = candidates
+            candidate_sequences.append(padded)
 
-            all_candidate_sequences.append(candidate_sequences)
-
-            # Store update info: (prompt_idx, candidate_idx, pos, new_token)
             for cand_idx in range(search_width):
-                for replace_idx in range(n_replace):
-                    pos = sampled_active_pos[cand_idx, replace_idx].item()
-                    new_token = candidate_tokens[cand_idx, replace_idx].item()
-                    all_update_info.append((prompt_idx, cand_idx, pos, new_token))
+                diff_positions = (
+                    (control_tokens != candidates[cand_idx])
+                    .nonzero(as_tuple=False)
+                    .squeeze(-1)
+                )
+                pos = diff_positions[0].item() if diff_positions.numel() > 0 else 0
+                new_token = candidates[cand_idx, pos].item()
+                update_info.append((prompt_idx, cand_idx, pos, new_token))
 
-        if len(all_candidate_sequences) == 0:
+        if len(candidate_sequences) == 0:
             return (
                 torch.empty(
-                    0, self.max_suffix_len, dtype=torch.long, device=self.device
+                    0, self.max_prompt_len, dtype=torch.long, device=self.device
                 ),
                 [],
             )
 
-        candidate_sequences_tensor = torch.cat(
-            all_candidate_sequences, dim=0
-        )  # [search_width * B, max_suffix_len]
-        return candidate_sequences_tensor, all_update_info
+        return torch.cat(candidate_sequences, dim=0), update_info
 
     def _test_candidates_batch(
         self,
         candidate_sequences: torch.Tensor,
-        update_info: list,
+        candidate_prompt_indices: torch.Tensor,
         model_input: ModelBatchedInput,
     ) -> torch.Tensor:
         """
-        Test candidate sequences in batches and return losses.
-
-        Args:
-            candidate_sequences: Full candidate sequences [search_width * B, max_suffix_len]
-            update_info: List of (prompt_idx, candidate_idx, pos, new_token) for each update
-            model_input: ModelBatchedInput instance
-
-        Returns:
-            losses: Losses for each candidate [search_width * B] (negative log likelihood)
+        Test candidate sequences in a single batch and return losses.
         """
         total_candidates = candidate_sequences.shape[0]
         if total_candidates == 0:
             return torch.empty(0, dtype=torch.float32, device=self.device)
 
-        # Get base concatenated input_ids structure from ModelBatchedInput
-        base_input_ids, base_attention_mask  = (
-            model_input.get_model_input_ids_and_attention_mask()
-        )
+        base_input_ids, base_attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        suffix_start_all = model_input.get_suffix_start_pos()
+        suffix_lengths_all = model_input.suffix_attention_mask.sum(dim=1).long()
+        completion_start_all = model_input.get_completion_start_pos()
+        completion_mask_all = model_input.completion_attention_mask.bool()
 
-        all_losses = []
+        prompt_indices = candidate_prompt_indices.to(self.device)
+        candidate_input_ids = base_input_ids[prompt_indices].clone()
+        candidate_attention_mask = base_attention_mask[prompt_indices].clone()
 
-        # Process in chunks to respect max_batch_size
-        for chunk_start in range(0, total_candidates, self.gcg_max_batch_size):
-            chunk_end = min(chunk_start + self.gcg_max_batch_size, total_candidates)
-            chunk_sequences = candidate_sequences[
-                chunk_start:chunk_end
-            ]  # [chunk_size, max_suffix_len]
-            chunk_size = chunk_end - chunk_start
+        suffix_start_batch = suffix_start_all[prompt_indices]
+        suffix_lengths_batch = suffix_lengths_all[prompt_indices]
+        for row in range(total_candidates):
+            length = int(suffix_lengths_batch[row].item())
+            if length == 0:
+                continue
+            start = int(suffix_start_batch[row].item())
+            candidate_input_ids[row, start : start + length] = candidate_sequences[
+                row, :length
+            ]
 
-            # Get prompt indices for this chunk (each candidate corresponds to a prompt)
-            # update_info format: (prompt_idx, candidate_idx, pos, new_token)
-            # We need to map candidate_idx to the actual index in candidate_sequences
-            # candidate_sequences is organized as: [prompt0_cand0, prompt0_cand1, ..., prompt1_cand0, ...]
-            # So for candidate at index i, prompt_idx = i // search_width, candidate_idx = i % search_width
-            search_width = self.gcg_batch_size
-            prompt_indices = (
-                torch.arange(chunk_start, chunk_end, device=self.device) // search_width
-            ).long()
+        candidate_completion_input_ids = model_input.completion_input_ids[prompt_indices]
 
-            # Build candidate input_ids by replacing suffix portion
-            candidate_input_ids = base_input_ids[
-                prompt_indices
-            ].clone()  # [chunk_size, seq_len]
-            candidate_attention_mask = base_attention_mask[
-                prompt_indices
-            ].clone()  # [chunk_size, seq_len]
-
-            # Replace suffix tokens with candidate sequences
-            suffix_start_pos = model_input.get_suffix_start_pos()
-            candidate_input_ids[
-                :, suffix_start_pos : suffix_start_pos + self.max_suffix_len
-            ] = chunk_sequences
-
-            # Get completion data for each candidate
-            candidate_completion_input_ids = model_input.completion_input_ids[
-                prompt_indices
-            ]  # [chunk_size, max_completion_len]
-
-            # Forward pass
-            with torch.no_grad():
-                inputs_embeds = self.embedding_layer(candidate_input_ids)
-                outputs = self.agent.model.gpt_neox(
-                    inputs_embeds=inputs_embeds, attention_mask=candidate_attention_mask
-                )
-                hidden_states = outputs.last_hidden_state
-                logits = self.agent.model.embed_out(hidden_states)
-
-                # Compute losses (negative log likelihood)
-                completion_start_pos = model_input.get_completion_start_pos()
-                comp_logits = logits[
-                    :,
-                    completion_start_pos - 1 : -1,
-                    :,
-                ]  # [chunk_size, max_comp_len, vocab]
-                comp_tokens = candidate_completion_input_ids  # [chunk_size, max_comp_len]
-
-                log_probs = F.log_softmax(comp_logits, dim=-1)
-                token_log_probs = log_probs.gather(
-                    2, comp_tokens.unsqueeze(-1)
-                ).squeeze(
-                    -1
-                )  # [chunk_size, max_comp_len]
-
-                comp_mask = torch.arange(candidate_completion_input_ids.size(-1), device=self.device).unsqueeze(
-                    0
-                ) < candidate_completion_input_ids.size(-1)
-                masked_log_probs = torch.where(
-                    comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
-                )
-                losses = -masked_log_probs.sum(
-                    dim=-1
-                )  # [chunk_size] (negative log likelihood)
-
-            all_losses.append(losses.cpu())  # Move to CPU to free GPU memory
-
-            # Clear intermediate tensors
-            del (
-                inputs_embeds,
-                outputs,
-                hidden_states,
-                logits,
-                comp_logits,
-                comp_tokens,
-                log_probs,
-                token_log_probs,
-                masked_log_probs,
-                losses,
+        with torch.no_grad():
+            inputs_embeds = self.embedding_layer(candidate_input_ids)
+            outputs = self.agent.model.gpt_neox(
+                inputs_embeds=inputs_embeds,
+                attention_mask=candidate_attention_mask,
             )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            hidden_states = outputs.last_hidden_state
+            logits = self.agent.model.embed_out(hidden_states)
 
-        return torch.cat(all_losses, dim=0).to(
-            self.device
-        )  # [total_candidates] (move back to device)
+            comp_start_batch = completion_start_all[prompt_indices]
+            comp_mask_batch = completion_mask_all[prompt_indices]
+            token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+                logits,
+                comp_start_batch,
+                candidate_completion_input_ids,
+                comp_mask_batch,
+            )
+            masked_log_probs = torch.where(
+                comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+            )
+            token_counts = comp_mask.sum(dim=-1).clamp_min(1)
+            losses = -masked_log_probs.sum(dim=-1) / token_counts
+
+        return losses
+
+    def _compute_prompt_likelihoods(
+        self, model_input: ModelBatchedInput
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Run a forward pass and return (completion log-likelihoods, per-token log probs,
+        completion mask, overall average per-token log probability).
+        """
+        input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        with torch.no_grad():
+            logits = self.agent.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+        completion_start_pos = model_input.get_completion_start_pos()
+        completion_tokens = model_input.completion_input_ids
+        completion_mask = model_input.completion_attention_mask.bool()
+        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+            logits, completion_start_pos, completion_tokens, completion_mask
+        )
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        likelihoods = masked_log_probs.sum(dim=-1)
+        avg_log_prob = masked_log_probs.sum() / comp_mask.sum().clamp(min=1)
+        return likelihoods, token_log_probs, comp_mask, avg_log_prob
 
     def inner_optimization_step(
         self,
@@ -434,131 +476,171 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
                 model_input, requires_grad=False
             )
 
-        # Get suffix mask to identify active positions
+        batch_size = prompt_data.shape[0]
         suffix_mask = model_input.suffix_attention_mask
 
         # Track best likelihoods and tokens
         model_input.update_suffix_tokens(prompt_data)
-        best_lls = self.agent.get_likelihoods_batch(model_input, requires_grad=False)
-        initial_lls = best_lls.clone()  # For monotonicity check at the end
+        best_lls, _, _, _ = self._compute_prompt_likelihoods(model_input)
         best_tokens = prompt_data.clone()
+        self.last_first_token_prob = None
+        self.last_avg_token_logprob = None
+        self.last_completion_grad_summary = None
 
-        # GCG iterations
         gcg_iter_bar = tqdm(range(self.gcg_steps), desc="GCG", leave=False)
         for gcg_iter in gcg_iter_bar:
-            # Step 1: Compute gradients w.r.t. token embeddings
-            gradients = self._compute_gradients(
-                best_tokens, model_input
-            )  # [B, max_suffix_len, emb_dim]
+            # Ensure latest tokens are reflected in model_input before scoring candidates
+            model_input.update_suffix_tokens(best_tokens)
 
-            # Step 2: Sample candidates from gradients
-            candidate_sequences, update_info = self._sample_candidates_from_grad(
-                best_tokens, gradients, suffix_mask, n_replace=1
-            )
+            candidate_sequences = []
+            candidate_prompt_indices = []
+            active_prompt_indices = []
 
-            if candidate_sequences.shape[0] == 0:
+            for prompt_idx in range(batch_size):
+                length = int(lengths[prompt_idx].item())
+                completion_len = int(
+                    model_input.completion_attention_mask[prompt_idx].sum().item()
+                )
+                if length == 0 or completion_len == 0:
+                    continue
+
+                prefix_tokens = self._trim_prefix_tokens(model_input, prompt_idx)
+                completion_tokens = self._trim_completion_tokens(model_input, prompt_idx)
+                control_tokens = best_tokens[prompt_idx, :length].detach()
+
+                if completion_tokens.numel() == 0:
+                    continue
+
+                input_ids = torch.cat(
+                    [prefix_tokens, control_tokens, completion_tokens], dim=0
+                )
+                pref_len = prefix_tokens.shape[0]
+                control_slice = slice(pref_len, pref_len + length)
+                target_slice = slice(
+                    pref_len + length, pref_len + length + completion_tokens.shape[0]
+                )
+                loss_slice = slice(
+                    pref_len + length - 1,
+                    pref_len + length - 1 + completion_tokens.shape[0],
+                )
+
+                self.agent.model.zero_grad(set_to_none=True)
+                grad = token_gradients(
+                    self.agent.model, input_ids, control_slice, target_slice, loss_slice
+                )  # [length, vocab]
+
+                candidates = sample_control(
+                    control_tokens,
+                    grad,
+                    batch_size=self.gcg_batch_size,
+                    topk=self.gcg_top_k,
+                    temp=1,
+                    not_allowed_tokens=self.not_allowed_tokens,
+                )
+
+                padded_candidates = best_tokens[prompt_idx : prompt_idx + 1].repeat(
+                    self.gcg_batch_size, 1
+                )
+                padded_candidates[:, :length] = candidates
+
+                candidate_sequences.append(padded_candidates)
+                candidate_prompt_indices.extend([prompt_idx] * self.gcg_batch_size)
+                active_prompt_indices.append(prompt_idx)
+            if len(candidate_sequences) == 0:
                 break
 
-            # Step 3: Test candidates in batches
-            losses = self._test_candidates_batch(
-                candidate_sequences, update_info, model_input
-            )  # [search_width * B]
-
-            # Step 4: Pick best candidate per prompt
-            # candidate_sequences is organized as: [prompt0_cand0, prompt0_cand1, ..., prompt1_cand0, ...]
-            # So we reshape losses to [B, search_width] and pick best per prompt
-            search_width = self.gcg_batch_size
-            num_prompts = losses.shape[0] // search_width
-            losses_reshaped = losses.view(
-                num_prompts, search_width
-            )  # [B, search_width]
-
-            # Get best candidate index for each prompt (min loss = best)
-            best_indices = losses_reshaped.argmin(dim=1)  # [B]
-
-            # Update best tokens with best candidate sequences
-            # Store old tokens and old likelihoods to track changes for logging
-            old_tokens = best_tokens.clone()
-            old_best_lls = best_lls.clone()
-
-            for prompt_idx in range(num_prompts):
-                best_candidate_idx = (
-                    prompt_idx * search_width + best_indices[prompt_idx].item()
-                )
-                best_tokens[prompt_idx] = candidate_sequences[best_candidate_idx]
-
-            # Recompute likelihoods with updated tokens
-            model_input.update_suffix_tokens(best_tokens)
-            current_lls = self.agent.get_likelihoods_batch(
-                model_input, requires_grad=False
+            candidate_tensor = torch.cat(candidate_sequences, dim=0)
+            candidate_prompt_indices_tensor = torch.tensor(
+                candidate_prompt_indices, dtype=torch.long, device=self.device
             )
 
-            # Only keep improvements
+            losses = self._test_candidates_batch(
+                candidate_tensor, candidate_prompt_indices_tensor, model_input
+            )
+
+            search_width = self.gcg_batch_size
+            num_active = len(active_prompt_indices)
+            losses_reshaped = losses.view(num_active, search_width)
+            best_indices = losses_reshaped.argmin(dim=1)
+
+            old_tokens = best_tokens.clone()
+            for block_idx, prompt_idx in enumerate(active_prompt_indices):
+                best_candidate_idx = (
+                    block_idx * search_width + best_indices[block_idx].item()
+                )
+                best_tokens[prompt_idx] = candidate_tensor[best_candidate_idx]
+
+            model_input.update_suffix_tokens(best_tokens)
+            current_lls, token_log_probs, comp_mask, avg_log_prob = (
+                self._compute_prompt_likelihoods(model_input)
+            )
+
+            avg_first_prob = float("nan")
+            if comp_mask.shape[1] > 0:
+                first_mask = comp_mask[:, 0]
+                if first_mask.any():
+                    first_probs = token_log_probs[first_mask, 0].exp()
+                    avg_first_prob = first_probs.mean().item()
+
+            self.last_first_token_prob = avg_first_prob
+            self.last_avg_token_logprob = avg_log_prob.item()
+            logger.info(
+                "GCG iter %d: avg per-token logprob=%.4f, avg first completion prob=%.4f",
+                gcg_iter + 1,
+                self.last_avg_token_logprob,
+                avg_first_prob,
+            )
+
             improve_mask = current_lls > best_lls
-            best_lls = torch.where(improve_mask, current_lls, best_lls)
+            if improve_mask.any():
+                best_lls = torch.where(improve_mask, current_lls, best_lls)
+            best_tokens = torch.where(
+                improve_mask.view(-1, 1), best_tokens, old_tokens
+            )
+            model_input.update_suffix_tokens(best_tokens)
 
-            # Debug log: token replacements and likelihood changes (reusing computed values)
-            for prompt_idx in range(num_prompts):
-                if improve_mask[prompt_idx]:
-                    # Find which positions changed (reusing already computed tokens)
-                    changed_positions = (
-                        (old_tokens[prompt_idx] != best_tokens[prompt_idx])
-                        .nonzero(as_tuple=False)
-                        .squeeze(-1)
-                    )
-                    if len(changed_positions.shape) == 0:
-                        # Single position changed
-                        changed_positions = changed_positions.unsqueeze(0)
-                    if len(changed_positions) > 0:
-                        for pos_tensor in changed_positions:
-                            pos = (
-                                pos_tensor.item()
-                                if torch.is_tensor(pos_tensor)
-                                else pos_tensor
-                            )
-                            old_token = old_tokens[prompt_idx, pos].item()
-                            new_token = best_tokens[prompt_idx, pos].item()
-                            old_token_str = self.agent.tokenizer.decode(
-                                [old_token], skip_special_tokens=True
-                            )
-                            new_token_str = self.agent.tokenizer.decode(
-                                [new_token], skip_special_tokens=True
-                            )
-                            # Reuse computed likelihoods: change = current_lls - old_best_lls
-                            ll_change = (
-                                current_lls[prompt_idx].item()
-                                - old_best_lls[prompt_idx].item()
-                            )
-                            logging.debug(
-                                f"GCG iter {gcg_iter+1} prompt {prompt_idx+1}: pos {pos} '{old_token_str}' -> '{new_token_str}', Δll={ll_change:.4f}"
-                            )
-
-            # Update progress bar
             gcg_iter_bar.set_postfix({"avg_ll": f"{best_lls.mean().item():.4f}"})
 
         # Final update
         prompt_data = best_tokens.clone()
-        model_input.update_suffix_tokens(prompt_data)
-        final_likelihoods = self.agent.get_likelihoods_batch(
-            model_input, requires_grad=False
-        )
+        inactive_mask = (suffix_mask == 0).bool()
+        if inactive_mask.any():
+            # Ensure masked-out suffix positions always hold BOS-equivalent tokens
+            bos_token_id = self.agent.tokenizer.bos_token_id
+            if bos_token_id is None:
+                bos_token_id = self.agent.tokenizer.pad_token_id
+            if bos_token_id is None:
+                bos_token_id = 0
+            prompt_data[inactive_mask] = bos_token_id
 
-        # Monotonicity check: warn if final likelihoods are worse than initial
-        # This should not typically happen if GCG is behaving as a greedy ascent step.
-        ll_deltas = final_likelihoods - initial_lls
-        if (ll_deltas < -1e-6).any():
-            num_decreased = (ll_deltas < 0).sum().item()
-            min_delta = ll_deltas.min().item()
-            logging.warning(
-                f"Warning: GCG decreased likelihood for {num_decreased} prompts in this step (min Δll={min_delta:.4f})."
-            )
-            
-        # Sanity check: check that all the tokens in the non-active positions are BOS
-        # It's possible that after we increased length, and then decreased it, the non-active positions are not BOS. So just in case if that happens we raise a warning. But we don't fail.
-        if not (prompt_data[suffix_mask == 0] == self.agent.tokenizer.bos_token_id).all():
-            logging.warning("Warning: Tokens in non-active positions are not BOS")
+        model_input.update_suffix_tokens(prompt_data)
+        final_likelihoods, _, _, _ = self._compute_prompt_likelihoods(model_input)
 
         return prompt_data, final_likelihoods
+
+    def _compute_prompt_likelihoods(
+        self, model_input: ModelBatchedInput
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return completion log-likelihoods plus per-token log probs."""
+        input_ids, attention_mask = model_input.get_model_input_ids_and_attention_mask()
+        with torch.no_grad():
+            logits = self.agent.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+        completion_start_pos = model_input.get_completion_start_pos()
+        completion_tokens = model_input.completion_input_ids
+        completion_mask = model_input.completion_attention_mask.bool()
+        token_log_probs, comp_mask = self._completion_token_log_probs_from_logits(
+            logits, completion_start_pos, completion_tokens, completion_mask
+        )
+        masked_log_probs = torch.where(
+            comp_mask, token_log_probs, torch.zeros_like(token_log_probs)
+        )
+        likelihoods = masked_log_probs.sum(dim=-1)
+        avg_log_prob = masked_log_probs.sum() / comp_mask.sum().clamp(min=1)
+        return likelihoods, token_log_probs, comp_mask, avg_log_prob
 
     def to_tokens(
         self, prompt_data: torch.Tensor, lengths: torch.Tensor
@@ -583,3 +665,45 @@ class DiscretePromptOptimizer(BasePromptOptimizer):
     ) -> torch.Tensor:
         """Clone a single prompt's tokens."""
         return prompt_data[idx, :length].clone()
+
+    def _completion_token_log_probs_from_logits(
+        self,
+        logits: torch.Tensor,
+        completion_start_pos: torch.Tensor,
+        completion_tokens: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Gather per-token log probabilities for completion tokens given logits.
+        Returns (token_log_probs, mask).
+        """
+        batch_size = logits.size(0)
+        if batch_size == 0:
+            return logits.new_zeros((0, 0)), completion_mask[:, :0]
+
+        completion_lengths = completion_mask.sum(dim=1)
+        max_len = (
+            int(completion_lengths.max().item()) if completion_lengths.numel() > 0 else 0
+        )
+        if max_len == 0:
+            return logits.new_zeros((batch_size, 0)), completion_mask[:, :0]
+
+        token_log_probs = logits.new_zeros((batch_size, max_len))
+        trimmed_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.bool, device=logits.device
+        )
+
+        for idx in range(batch_size):
+            length = int(completion_lengths[idx].item())
+            if length == 0:
+                continue
+            start = int(completion_start_pos[idx].item())
+            end = start - 1 + length
+            slice_logits = logits[idx, start - 1 : end, :]
+            log_probs = F.log_softmax(slice_logits, dim=-1)
+            tokens = completion_tokens[idx][completion_mask[idx]]
+            gathered = log_probs.gather(1, tokens.unsqueeze(-1)).squeeze(-1)
+            token_log_probs[idx, :length] = gathered
+            trimmed_mask[idx, :length] = True
+
+        return token_log_probs, trimmed_mask
