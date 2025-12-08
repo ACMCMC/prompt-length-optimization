@@ -13,6 +13,9 @@
 \usepackage{inconsolata}
 \usepackage{mathtools}
 \usepackage{enumitem}  
+\usepackage{booktabs}
+\setlength{\intextsep}{4pt}
+\setlength{\textfloatsep}{4pt}
 \input{extra_setup}
 
 \title{Prompt Length Optimization with Reinforcement Learning}
@@ -29,20 +32,20 @@
 \end{abstract}
 
 \begin{mdframed}[linewidth=1pt, linecolor=black!30, backgroundcolor=black!5]
-  \noindent\textbf{Note:} This report follows the ACL Rolling Review (ARR) format as we plan to submit this work for publication. See \url{https://aclrollingreview.org/cfp} for details.
+  \noindent\textbf{Note:} For the report, we are following the ACL ARR (\url{https://aclrollingreview.org/cfp}) format because we plan to submit this for publication.
 \end{mdframed}
 
 \section{Introduction}
 \label{sec:introduction}
 
 % Idea: we're doing prompt optimization for LMs, this has applications in e.g. security research (find jailbreaks) or improving performance (e.g. improving prompts to maximize their effectiveness on downstream tasks)
-Language models (LMs) have grown in popularity due to their applicability on a range of NLP tasks. However, enabling models to follow specific commands effectively remains a challenge, particularly given the (often) non-deterministic behavior of instruction-following LMs. Prompt optimization is an area of research that proposes an avenue to deal with such difficulty, aiming to find a set of tokens that is likely to elicit a specific response from the model. This has applications in several fields, including security research (e.g., finding jailbreaks), performance enhancement or task-specific tuning.
+Language models (LMs) have become popular for many NLP tasks. However, making models follow specific commands well is still hard, especially because instruction-following LMs often behave in unpredictable ways. Prompt optimization tries to solve this by finding a set of tokens that makes the model produce a specific response. This work has uses in security research (finding jailbreaks), improving performance, and task-specific tuning.
 
 % Idea: highlight gap between likelihood-only search and static pruning
-Despite the amount of interest built around prompt optimization, some challenges remain. In this paper, we focus on one overlooked aspect of prompt optimization: many search methods focus on exclusively optimizing for likelihood, while ignoring length. However, shorter prompts are often preferred in practice, as they reduce inference costs and latency and are easier for humans to utilize. Therefore, our work seeks to balance the two objectives at the same time: maximizing the likelihood of a target completion while minimizing prompt length.
+There is a lot of interest in prompt optimization, but some challenges remain. In this paper we focus on one aspect that gets overlooked: many search methods only optimize for likelihood and ignore length. Shorter prompts are usually better in practice because they cost less to run, are faster, and are easier for people to use. Our work tries to balance both goals at once; we want to maximize the likelihood of a target completion while keeping the prompt short.
 
 % Idea: explain our external policy and scope (plug-in optimizer, no retrieval/safety)
-To that end, we train a small external policy, independent of the objective LM (which we treat as a black box). The policy decides when to shrink, keep, or grow a prompt, while any plug-in optimizer adjusts tokens. We do not design a new optimizer and accept the limits of whichever one is used. We also avoid retrieval and safety objectives; we only balance likelihood and length.
+We train a small external policy that is separate from the LM (we treat the LM as a black box). The policy decides when to shrink, keep, or grow a prompt; any plug-in optimizer handles the token changes. We don't design a new optimizer, we just use whatever optimizer is given. We also skip retrieval and safety goals, we only care about balancing likelihood and length.
 
 \begin{figure*}[t]
   % \centering
@@ -62,7 +65,7 @@ To that end, we train a small external policy, independent of the objective LM (
     \node[above=-0.1cm of input_box.north] {\textbf{Prompt to optimize}};
 
     % An icon to represent the frozen LM
-    \node[draw=black, fill=black!10, right=4cm of suffix, text width=2.5cm, thick, align=left] (lm) {\scalerel*{\includegraphics{figures/writer.png}}{\textrm{\textbigcircle}} \textbf{Frozen LM}\\{\tiny (e.g., \texttt{Pythia-70m} \cite{biderman2023pythia})}};
+    \node[draw=black, fill=black!10, right=4cm of suffix, text width=2.5cm, thick, align=left] (lm) {\scalerel*{\includegraphics{figures/writer.png}}{\textrm{\textbigcircle}} \textbf{Frozen LM}\\{\tiny (e.g., Pythia-70m \cite{biderman2023pythia})}};
 
     % The optimizer
     \node[draw=black, fill=black!10, below=of lm, text width=2.5cm, thick, align=left] (optimizer) {\scalerel*{\includegraphics{figures/wrench.png}}{\textrm{\textbigcircle}} \textbf{Optimizer}\\{\tiny (e.g., GCG \cite{zou2023universal})}};
@@ -76,21 +79,21 @@ To that end, we train a small external policy, independent of the objective LM (
     \node[right=of policy, yshift=-0.5cm, inner sep=0.1cm] (optimize) {\texttt{optimize}};
 
     % Arrows
-    \draw[->, ] (prompt.east) -- ++(0.5,0) |- (lm.west) node[near end, above right, inner sep=0.1cm] {\tiny Input};
-    \draw[->, ] (suffix.east) -- ++(0.5,0) |- (lm.west);
-    \draw[->, ] (completion.east) -- ++(0.5,0) |- (lm.west);
+    \draw[->, draw=myDARKBLUE!50] (prompt.east) -- ++(0.5,0) |- (lm.west) node[near end, above right, inner sep=0.1cm] {\tiny Input};
+    \draw[->, draw=myBLUE!50] (suffix.east) -- ++(0.5,0) |- (lm.west);
+    \draw[->, draw=myRED!50] (completion.east) -- ++(0.5,0) |- (lm.west);
     \draw[->, ] (lm.east) -- ++(0.5,0)  |- (optimizer.east) node[midway, right, inner sep=0.1cm] {\tiny Likelihood};
     \draw[->, ] (optimizer.west) -- ++(-0.5,0) |- (suffix.south east) node[midway, below left, inner sep=0.1cm] {\tiny \texttt{<tok\_1234> $\to$ <tok\_5678>}};
 
     % From policy to actions
-    \draw[->, thick] (policy.east) -- (grow.west);
-    \draw[->, thick] (policy.east) -- (optimize.west);
-    \draw[->, thick] (policy.east) -- (shrink.west);
+    \draw[->, thick, draw=myMAGENTA] (policy.east) -- (grow.west);
+    \draw[->, thick, draw=myMAGENTA] (policy.east) -- (optimize.west);
+    \draw[->, thick, draw=myMAGENTA] (policy.east) -- (shrink.west);
     % From optimize to optimizer
-    \draw[->, ] (optimize.south) |- (optimizer.north east) node[midway, above right, inner sep=0.1cm] {\tiny Invoke};
+    \draw[->, draw=myMAGENTA] (optimize.south) |- (optimizer.north east) node[midway, above right, inner sep=0.1cm] {\tiny Invoke};
     % From grow/shrink to suffix, going upwards, above the policy node, then down to suffix
-    \draw[->, ] (grow.north) |- ++(0,0.5cm) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
-    \draw[->, ] (shrink.east) -- ++ (0.5cm, 0) |- ($(grow.north) + (0, 0.5cm)$) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
+    \draw[->, draw=myMAGENTA] (grow.north) |- ++(0,0.5cm) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
+    \draw[->, draw=myMAGENTA] (shrink.east) -- ++ (0.5cm, 0) |- ($(grow.north) + (0, 0.5cm)$) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
   \end{tikzpicture}
   \caption{\textbf{Our approach.} We aim to simultaneously optimize completion likelihood and suffix length by training a small policy that decides when to shrink, grow, or optimize a suffix, paired with a plug-in optimizer and a frozen LM we treat as black boxes.}
   \label{fig:method}
@@ -100,20 +103,19 @@ To that end, we train a small external policy, independent of the objective LM (
 \label{sec:related}
 
 % Idea: prompt optimization is popular, many methods exist
-Prompt optimization is a very active area of research, with many authors proposing a variety of techniques. Therefore, we group prior work into four areas:
+Prompt optimization is an active research area with many different techniques. We group prior work into four areas:
 
 % Idea: gradient-based discrete prompt optimization
-\paragraph{Discrete optimization.} These methods keep prompts in the token space and use gradients to move among words. HotFlip-style edits and \citet{shin2020autoprompt} pick candidate tokens with gradient signals. \citet{wen2023hard} smooth the search with continuous helpers and then project back to tokens. Adversarial suffix work like \citet{zou2023universal} and faster probe sampling \citep{zhao2024accelerating} show that gradient-guided discrete search can find strong suffixes when we have white-box access.
+\paragraph{Discrete optimization.} These methods keep prompts in token space and use gradients to choose better words. HotFlip-style edits and \citet{shin2020autoprompt} pick candidate tokens using gradient signals. \citet{wen2023hard} smooth the search with continuous helpers and then project back to tokens. Work on adversarial suffixes like \citet{zou2023universal} and faster sampling \citep{zhao2024accelerating} show that gradient-guided discrete search works well for finding strong suffixes when we have white-box access.
 
 % Idea: continuous prompt optimization and projection
-\paragraph{Continuous optimization.} Soft prompt tuning swaps hard tokens for learned embedding vectors that we train with backpropagation \citep{lester2021power}. Later work looks at safety and robustness in the embedding space \citep{schwinn2024soft}. More recently, \citet{wang2025dpro} study direct prompt optimization with continuous representations, using stronger goals to narrow the gap between soft prompts and discrete use.
+\paragraph{Continuous optimization.} Soft prompt tuning replaces hard tokens with learned embedding vectors that we train using backpropagation \citep{lester2021power}. Later work looks at safety and robustness in embedding space \citep{schwinn2024soft}. More recently, \citet{wang2025dpro} study direct prompt optimization with continuous representations; they use stronger objectives to close the gap between soft prompts and discrete use.
 
 % Idea: prompt compression for efficiency
-\paragraph{Prompt compression.} To cut inference cost, coarse-to-fine pruning methods compress demonstrations and questions with perplexity signals from a smaller LM, as in LLMLingua \citep{jiang2023llmlingua} and its distilled follow-up \citep{pan2024llmlingua2}. Gist tokens \citep{mu2023gist} learn short continuous summaries; context-aware compression uses sentence encodings \citep{liskavets2024prompt}. TACO-RL \citep{shandilya2024taco} adds task-aware rewards to compression to keep outputs accurate under fixed length budgets.
+\paragraph{Prompt compression.} To reduce inference cost, coarse-to-fine pruning methods compress demonstrations and questions using perplexity signals from a smaller LM, as in LLMLingua \citep{jiang2023llmlingua} and its distilled version \citep{pan2024llmlingua2}. Gist tokens \citep{mu2023gist} learn short continuous summaries, and context-aware compression uses sentence encodings \citep{liskavets2024prompt}. TACO-RL \citep{shandilya2024taco} adds task-aware rewards to compression to keep outputs accurate when length is limited.
 
 % Idea: reinforcement learning for prompt editing and safety
-\paragraph{Reinforcement learning.} RL has been used to optimize prompts or policies that pick edits over sequences \citep{ramamurthy2022rlnlp}, and to align or adversarially steer LMs with discrete action spaces. Our work links to this line by viewing length control as a policy that decides when to compress versus improve likelihood, not only by tuning embeddings.
-
+\paragraph{Reinforcement learning.} RL has been used to optimize prompts or policies that choose edits over sequences \citep{ramamurthy2022rlnlp}, and to align or steer LMs with discrete action spaces. Our work connects to this line by treating length control as a policy that decides when to compress or improve likelihood, instead of just tuning embeddings.
 \section{Problem Formulation}
 \label{sec:problem}
 
@@ -121,7 +123,7 @@ Prompt optimization is a very active area of research, with many authors proposi
     \centering
     \includegraphics[width=0.95\linewidth]{figures/gcg_length_sweep.pdf}
     \label{fig:gcg_length_sweep}
-    \caption{\textbf{GCG optimizes for likelihood, not for length.} Blah blah blah}
+    \caption{\textbf{GCG optimizes for likelihood, not for length.} We run GCG with suffix lengths from 1 to 32 tokens on a single AdvBench prompt and plot the final log-likelihood (y-axis in log scale). The landscape is somewhat chaotic, which is why we show only one prompt; averaging multiple prompts would smooth out this noise and hide the true optimization challenge. As length grows GCG improves likelihood but never tries to compress. An RL agent needs to navigate this chaotic landscape to find points with good enough likelihood using much shorter suffixes.}
 \end{figure*}
 
 We seek a suffix \(s\) that makes a frozen LM \(p_\theta\) assign high probability to a fixed target completion while keeping \(s\) as short as possible. Let \(x\) denote the fixed prefix (e.g., a harmful user query) and \(y\) the fixed target completion (e.g., the corresponding harmful response). The optimization problem is
@@ -157,17 +159,15 @@ Actions operate solely on the suffix \(s\): \(\{\text{optimize}, \text{shrink}, 
 \subsection{Reward Function}
 \label{subsec:reward}
 
-At the end of each episode we assign a terminal reward as follows
+At each step we compute an immediate reward that balances likelihood and suffix length as follows:
 \begin{equation}
-  r \;=\; \alpha\,\tilde{\ell} \;-\; \beta\,\frac{|s|}{L_{\max}},
+  r_t \;=\; \alpha\,\tilde{\ell}_t \;-\; \beta\,\frac{|s_t|}{L_{\max}},
 \end{equation}
-where \(\tilde{\ell}\) denotes the per-token log-likelihood of the target completion \(y\) under the final suffix, \(\alpha>0\) weights accuracy, and \(\beta>0\) penalizes length. This terminal reward is propagated backward through the episode via a discount factor \(\gamma\), so every action contributing to the final suffix receives credit in proportion to its recency. Formally, for an episode of length \(T\), the return at step \(t\) is
+where \(\tilde{\ell}_t\) is the per-token log-likelihood of the target completion \(y\) under the current suffix and \(|s_t|/L_{\max}\) is the normalized suffix length. Returns are the discounted sum of these step rewards,
 \begin{equation}
-  R_t \;=\; \gamma^{\,T-1-t} \, r, \quad t = 0,\dots,T-1.
+  R_t \;=\; \sum_{k=t}^{T-1} \gamma^{\,k-t}\, r_k,\quad t = 0,\dots,T-1,
 \end{equation}
-These discounted returns are then centered per prompt group to form advantages for the GRPO update. Step-level rewards computed during the rollout are used for monitoring only; the policy update uses the terminal signal exclusively.
-
-
+so earlier actions receive credit proportional to their contribution over the remainder of the episode. Returns are centered per prompt group to form advantages for the GRPO update. This step-based formulation provides immediate feedback on both likelihood and length at every decision point.
 
 
 \section{Method}
@@ -192,25 +192,22 @@ We support three plug-in inner optimizers; the policy is agnostic to which one i
 \label{subsubsec:continuous}
 
 % Idea: optimize suffix embeddings directly
-In continuous mode we work with suffix embeddings instead of tokens. We keep a trainable block of shape $[B, L_{\max}, D]$ where active slots start with the BOS embedding. We run Adam to increase the log-likelihood of the target completion; prefix and completion embeddings stay frozen. When we grow the suffix, we activate one more slot (it gets initialized later), and when we shrink it we turn off the last slot. This happens through the attention mask. At the end we project active embeddings to their nearest vocabulary tokens using L2 distance for reporting.
+In continuous mode we work directly with suffix embeddings instead of tokens. The suffix is a trainable block of shape $[B, L_{\max}, D]$ where active slots start with the BOS embedding. Adam updates these embeddings to increase the log-likelihood of the target completion, while prefix and completion embeddings stay frozen. Length changes happen through the attention mask: when we grow the suffix we activate one more slot (which gets initialized on the next update), and when we shrink it we deactivate the last slot. At the end we project active embeddings to their nearest vocabulary tokens by L2 distance for reporting.
 
 \subsubsection{Continuous with Projection}
 \label{subsubsec:continuous_proj}
 
 % Idea: add distance regularization to stay near the embedding table
-Continuous\_proj extends the continuous approach by pushing suffix embeddings to stay near real tokens during training. For each active position we measure the distance to the vocabulary and add it as a penalty in the loss. The full objective is
+This optimization mode extends the continuous approach by encouraging suffix embeddings to stay near real tokens during training. For each active position we compute its distance to the vocabulary and add this distance as a penalty in the loss. The full objective is:
+
 \begin{equation}
-  \mathcal{L}_{\text{total}} = -\log p(y\mid x,s) + w_{\text{proj}}\,\mathcal{L}_{\text{proj}},
+  \mathcal{L}_{\text{total}} = -\log p(y\mid x,s) + w_{\text{proj}}\,\mathcal{L}_{\text{proj}}
   \label{eq:continuous_proj_loss}
 \end{equation}
-where $w_{\text{proj}}$ is the projection weight and $\mathcal{L}_{\text{proj}}$ is the mean distance from active suffix embeddings to their nearest vocabulary tokens. We use L2 distance in our experiments. At evaluation we project suffix embeddings to tokens before computing the reward; this makes sure the policy sees scores that match discrete prompts. We also track the average projection distance to see how easy it is to deploy the learned embeddings.
 
-\subsubsection{Discrete Optimization}
-\label{subsubsec:discrete}
+where $w_{\text{proj}}$ is the projection weight and $\mathcal{L}_{\text{proj}}$ is the mean distance from active suffix embeddings to their nearest vocabulary tokens. In our experiments we use L2 distance for this metric. During evaluation we project suffix embeddings to tokens before computing the reward, which ensures the policy sees scores that match discrete prompts. This also lets us track the average projection distance to see how deployable the learned embeddings are.
 
-In discrete mode we run a Greedy Coordinate Gradient (GCG) update on the suffix tokens~\citep{zou2023universal}. At each GCG step: (i) compute gradients of the log-likelihood with respect to the current suffix token positions; (ii) for each position, form a small candidate pool by replacing that token with top-$k$ alternatives suggested by the gradient; (iii) batch-evaluate these one-token candidates; and (iv) keep the best-scoring suffix. Each GCG step therefore changes at most one suffix token. This yields a greedy, gradient-guided token search that improves log-likelihood in a few forward/backward passes while policy actions handle length changes.
-
-
+%%% TODO: Explain that we chose to focus on discrete optimization because we needed to pick somewhere to start experimenting
 
 \subsection{Training Procedure}
 \label{subsec:training}
@@ -222,7 +219,38 @@ We run batched, fixed-horizon episodes with multiple rollouts per prompt. For ea
 
 We construct a fixed batched layout with three segments per example: an immutable prefix, a trainable suffix, and an immutable completion. Prefixes are left-padded and completions right-padded with their own attention masks. The suffix is a trainable buffer of shape \([B, L_{\max}]\) (tokens in discrete mode, embeddings in continuous mode) with an attention mask marking active positions; the first \texttt{init\_len} slots are active at initialization. Length edits toggle this mask: \textit{grow} activates the next inactive slot, \textit{shrink} deactivates the last active slot. Newly activated slots are initialized by the optimizer when the suffix is updated.
 
-For forward passes, the three segments are concatenated and a combined attention mask is built; suffix start indices are tracked so discrete optimizers can splice candidate suffixes efficiently. In continuous modes, concatenated embeddings are provided; in discrete mode, concatenated token IDs are used. Edits and gradients are confined to the suffix; prefix and completion remain fixed. All experiments use a frozen \texttt{Pythia-70M} backbone.
+For forward passes, the three segments are concatenated and a combined attention mask is built; suffix start indices are tracked so discrete optimizers can splice candidate suffixes efficiently. In continuous modes, concatenated embeddings are provided; in discrete mode, concatenated token IDs are used. Edits and gradients are confined to the suffix; prefix and completion remain fixed. All experiments use a frozen Pythia-70M backbone.
+
+\begin{figure*}[t]
+\centering
+\captionsetup[subfigure]{justification=centering}
+
+\begin{subfigure}{0.32\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/7d6v6ikh_step_avg_likelihood_per_token.pdf}
+    \caption{Avg LL/token}
+    \label{fig:train_ll}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/7d6v6ikh_step_avg_length.pdf}
+    \caption{Length}
+    \label{fig:train_length}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.32\textwidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/7d6v6ikh_step_avg_reward.pdf}
+    \caption{Reward}
+    \label{fig:train_reward}
+\end{subfigure}
+
+\caption{Training curves for likelihood, length, and reward.}
+\label{fig:training_curves}
+\end{figure*}
+
+
 
 
 
@@ -234,27 +262,59 @@ For forward passes, the three segments are concatenated and a combined attention
 \subsection{Experimental Setup}
 \label{subsec:setup}
 
-% Idea: model architecture (Pythia-70m), hyperparameters, datasets
+We evaluate our method on the AdvBench dataset \cite{zou2023universal}, using the frozen Pythia-70M model as the underlying language model. For each prefix–completion pair, the policy interacts with a fixed-horizon environment for 50 steps, modifying only the suffix while keeping the prefix and target completion fixed. Episodes are batched, and multiple rollouts per prompt are used to compute GRPO updates.
 
-\subsection{Baselines}
-\label{subsec:baselines}
+All experiments use the same batched layout described in Section 4. We primarily used the GCG optimizer. We track standard metrics such as mean terminal reward, suffix length, and likelihood preservation. Detailed hyperparameters—including training prompts, rollout counts, GRPO settings, and GCG parameters—are provided in Table 1\ref{tab:hyperparams}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llr}
+\toprule
+Category & Parameter & Value \\
+\midrule
+Model     & Backbone              & Pythia-70m \\
+Dataset   & Training prompts         & 128 \\
+          & Min/Max length (chars)& 25 / 75 \\
+Train     & Episodes / Steps per episode      & 16 / 40 \\
+          & Init / Max suffix (tok)& 16 / 32 \\
+          & Batch size / Rollouts & 8 / 4 \\
+          & $\alpha$, $\beta$, $\gamma$ & 1.0, 2.0, 0.99 \\
+          & LRs (policy)   &  0.0003 \\
+          & $\epsilon_0$/decay/floor& 0.3 / 0.95 / 0.05 \\
+          & Temp, entropy coef    & 1.5, 0.003 \\
+GRPO      & Epochs, clip, grad norm& 4, 0.2, 0.5 \\
+GCG       & Steps, top-$k$, candidates & 10, 32, 32 \\
+Eval      & Test prompts          & 8 \\
+          & Init/Max suffix (tok) & 16 / 32 \\
+          & Policy Steps/GCG      &  50/5\\
+          & Batch size            & 8 \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameters used in experiments.}
+\label{tab:hyperparams}
+\end{table}
+% \subsection{Baselines}
+% \label{subsec:baselines}
 
 % Idea: compare continuous, continuous_proj, and discrete modes
 % Idea: compare to naive baselines (no optimization, random)
 
-\subsection{Evaluation Metrics}
-\label{subsec:metrics}
+% \subsection{Evaluation Metrics}
+% \label{subsec:metrics}
 
 % Idea: mean reward, prompt length, likelihood preservation
 
 \subsection{Results}
 \label{subsec:results}
 
+Figure~\ref{fig:train_ll} shows training trajectories for per-token log-likelihood, suffix length, and reward. Likelihood improves steadily across episodes while suffix length decreases, indicating the policy learns to trade length for fit; reward tracks these trends. The GCG length sweep (Figure~\ref{fig:gcg_sweep}) confirms that a single GCG step consistently boosts per-token log-likelihood across suffix lengths, validating the inner optimizer’s effectiveness. Evaluation curves (Figure~\ref{fig:eval_curves}) mirror training behavior: average log-likelihood rises as length shrinks, and reward increases correspondingly, suggesting the learned policy generalizes its length/likelihood trade-off beyond the training rollouts.
+
 % Idea: quantitative results showing trade-offs
 % Idea: qualitative examples of discovered prompts
 
-\subsection{Ablation Studies}
-\label{subsec:ablation}
+% \subsection{Ablation Studies}
+% \label{subsec:ablation}
 
 % Idea: impact of alpha and beta on compression vs. likelihood
 % Idea: impact of GRPO parameters (clip, entropy coefficient)
@@ -267,11 +327,30 @@ For forward passes, the three segments are concatenated and a combined attention
 % Idea: different modes have different trade-offs
 % Idea: limitations and challenges
 
-\section{Conclusion}
 \label{sec:conclusion}
 
 % Idea: we demonstrated RL-based prompt length optimization
 % Idea: future work: larger models, different tasks, transfer learning
+
+
+\subsection{Additional Experiments and Insights}
+
+Beyond the core results reported in Section 5 \ref{sec:experiments}, we conducted a series of exploratory experiments to better understand the behavior of different policy objectives, reward scalings, and state representations. While these results are not included in the main paper due to space and time constraints, we summarize the most relevant observations here to document the full extent of our experimental efforts.
+
+\paragraph{Alternative RL Algorithms.}
+We implemented both REINFORCE and PPO as drop-in replacements for GRPO. REINFORCE was generally stable but showed slower convergence. PPO required training a separate value network, and we repeatedly encountered exploding value losses before stabilization. Once tuned, PPO matched (but did not exceed) GRPO performance, so we ultimately focused on GRPO for the final results.
+
+\paragraph{State Representation Variants.}
+Early experiments revealed a separate issue: we had included a layer normalization step inside the state encoder, which unintentionally collapsed several state features to be nearly identical values. This caused the policy to output a grow probability of almost 1.0 for many states, leading to uncontrolled suffix expansion at the beginning of each episode. Removing the layer norm and introducing $\epsilon$-greedy exploration mitigated this collapse and restored healthy action diversity. We also experimented with richer representations, including hidden-state vectors extracted from the frozen LM (corresponding to suffix tokens) and a deeper policy network with roughly 500K parameters. Ultimately, the richer state representations did not outperform the simpler five-dimensional state described in Section~\ref{subsec:state}, so we retained the computationally efficient variant.
+
+\paragraph{Action Imbalance Issues.}
+Early in development, the policy collapsed to always selecting \emph{grow}, causing the suffix length to increase rapidly at the start of each episode. This led to poor reward signals and hindered learning. We resolved the imbalance by normalizing length-based rewards, tuning $\beta$, and adjusting entropy and exploration schedules.
+
+\paragraph{Reward Scaling.}
+Although PPO and GRPO are theoretically scale-invariant, in practice the policy failed to learn when rewards used raw log-likelihoods and raw lengths. Reward magnitudes differed by several orders of magnitude, saturating the advantage estimates. Normalizing both likelihood and length terms significantly improved learning stability and accelerated convergence.
+
+\paragraph{Summary.}
+Overall, these exploratory experiments helped shape the final method even though they are not directly reflected in the main results. They also highlight practical considerations when applying RL to prompt optimization—particularly the importance of reward normalization, balanced action distributions, and avoiding unnecessarily complex state encodings.
 
 \section*{Limitations}
 
@@ -291,95 +370,85 @@ We used AI tools to help with developing our code and writing the paper; more sp
 \bibliography{bibliography}
 
 \appendix
+% \section{Hyperparameters}
+% \label{app:hyperparameters}
 
-\section{Hyperparameters}
-\label{app:hyperparameters}
+% All experiments use a frozen \texttt{EleutherAI/pythia-160m} model with seed 2262 unless otherwise noted.
 
-% Idea: complete list of hyperparameters used in experiments
+% \subsection{Dataset Parameters}
+% \begin{itemize}
+%   \item \textbf{Training prompts}: 128
+%   \item \textbf{Minimum prompt length}: 25 characters
+%   \item \textbf{Maximum prompt length}: 75 characters
+%   \item \textbf{Dataset split}: 70\% train, 15\% validation, 15\% test
+% \end{itemize}
 
-We present the complete set of hyperparameters used in our experiments. All experiments use the \texttt{Pythia-70m} model~\cite{biderman2023pythia} with seed 2262 for reproducibility.
+% \subsection{Training Parameters}
+% \begin{itemize}
+%   \item \textbf{Episodes per prompt}: 8
+%   \item \textbf{Steps per episode}: 24
+%   \item \textbf{Initial suffix length}: 32 tokens
+%   \item \textbf{Maximum suffix length}: 64 tokens
+%   \item \textbf{Batch size}: 8 prompts
+%   \item \textbf{Rollouts per prompt}: 4
+% \end{itemize}
 
-\subsection{Dataset Parameters}
+% \subsection{Optimization Parameters}
+% \begin{itemize}
+%   \item \textbf{Learning rate (suffix)}: $\alpha_{\text{emb}} = 0.01$
+%   \item \textbf{Learning rate (policy)}: $\alpha_{\text{policy}} = 0.0003$
+%   \item \textbf{Epsilon (initial)}: $\epsilon_0 = 0.3$
+%   \item \textbf{Epsilon decay}: $\gamma_{\epsilon} = 0.95$
+%   \item \textbf{Epsilon (minimum)}: $\epsilon_{\min} = 0.05$
+%   \item \textbf{Temperature}: $\tau = 1.5$
+%   \item \textbf{Likelihood weight}: $\alpha = 1.0$
+%   \item \textbf{Length penalty}: $\beta = 2.0$
+%   \item \textbf{Projection weight}: $w_{\text{proj}} = 0.1$ (continuous\_proj mode)
+%   \item \textbf{Distance metric}: L2 distance
+% \end{itemize}
 
-\begin{itemize}
-  \item \textbf{Training prompts}: 256
-  \item \textbf{Minimum prompt length}: 30 characters
-  \item \textbf{Maximum prompt length}: 150 characters
-  \item \textbf{Dataset split}: 70\% train, 15\% validation, 15\% test
-\end{itemize}
+% \subsection{GRPO Parameters}
+% \begin{itemize}
+%   \item \textbf{GRPO epochs}: 4
+%   \item \textbf{Clip parameter}: $\epsilon_{\text{clip}} = 0.2$
+%   \item \textbf{Discount factor}: $\gamma = 0.99$
+%   \item \textbf{Entropy coefficient}: $\beta_{\text{entropy}} = 0.003$
+%   \item \textbf{Maximum gradient norm}: 0.5
+% \end{itemize}
 
-\subsection{Training Parameters}
+% \subsection{Policy Network Architecture}
+% \begin{itemize}
+%   \item \textbf{Input dimension}: 5 (state features)
+%   \item \textbf{Hidden layer size}: 128
+%   \item \textbf{Output dimension}: 3 (actions)
+%   \item \textbf{Activation}: ReLU
+%   \item \textbf{Optimizer}: Adam
+% \end{itemize}
 
-\begin{itemize}
-  \item \textbf{Episodes per prompt}: 3
-  \item \textbf{Steps per episode}: 50
-  \item \textbf{Initial suffix length}: 16 tokens
-  \item \textbf{Maximum suffix length}: 32 tokens
-  \item \textbf{Batch size}: 16 prompts
-  \item \textbf{Rollouts per prompt}: 4
-\end{itemize}
+% \subsection{GCG Parameters (Discrete Mode)}
+% \begin{itemize}
+%   \item \textbf{GCG steps}: 10
+%   \item \textbf{Top-$k$ tokens}: 32
+%   \item \textbf{Candidate batch size}: 32
+%   \item \textbf{Maximum batch size}: 128
+% \end{itemize}
 
-\subsection{Optimization Parameters}
-
-\begin{itemize}
-  \item \textbf{Learning rate (embeddings)}: $\alpha_{\text{emb}} = 0.01$
-  \item \textbf{Learning rate (policy)}: $\alpha_{\text{policy}} = 0.001$
-  \item \textbf{Epsilon (initial)}: $\epsilon_0 = 0.3$
-  \item \textbf{Epsilon decay}: $\gamma_{\epsilon} = 0.97$
-  \item \textbf{Epsilon (minimum)}: $\epsilon_{\min} = 0.05$
-  \item \textbf{Temperature}: $\tau = 1.5$
-\end{itemize}
-
-\subsection{Reward Function Parameters}
-
-\begin{itemize}
-  \item \textbf{Likelihood weight}: $\alpha = 0.5$
-  \item \textbf{Length penalty}: $\beta = -1.5$ (logarithmic)
-  \item \textbf{Projection weight}: $w_{\text{proj}} = 0.5$ (continuous\_proj mode)
-  \item \textbf{Distance metric}: L2 distance
-\end{itemize}
-
-\subsection{GRPO Parameters}
-
-\begin{itemize}
-  \item \textbf{GRPO epochs}: 4
-  \item \textbf{Clip parameter}: $\epsilon_{\text{clip}} = 0.2$
-  \item \textbf{Discount factor}: $\gamma = 0.99$
-  \item \textbf{Entropy coefficient}: $\beta_{\text{entropy}} = 0.003$
-  \item \textbf{Maximum gradient norm}: 0.5
-\end{itemize}
-
-\subsection{Policy Network Architecture}
-
-\begin{itemize}
-  \item \textbf{Input dimension}: 5 (state features)
-  \item \textbf{Hidden layer size}: 128
-  \item \textbf{Output dimension}: 3 (actions)
-  \item \textbf{Activation}: ReLU
-  \item \textbf{Optimizer}: Adam
-\end{itemize}
-
-\subsection{GCG Parameters (Discrete Mode)}
-
-\begin{itemize}
-  \item \textbf{GCG steps}: 3
-  \item \textbf{Top-k tokens}: 16
-  \item \textbf{Candidate batch size}: 32
-  \item \textbf{Maximum batch size}: 128
-\end{itemize}
-
-\subsection{Evaluation Parameters}
-
-\begin{itemize}
-  \item \textbf{Test prompts}: 200
-  \item \textbf{Maximum policy steps}: 25
-  \item \textbf{Optimization steps}: 5
-\end{itemize}
+% \subsection{Evaluation Parameters}
+% \begin{itemize}
+%   \item \textbf{Test prompts}: 200
+%   \item \textbf{Minimum prompt length}: 30 characters
+%   \item \textbf{Maximum prompt length}: 150 characters
+%   \item \textbf{Initial suffix length}: 16 tokens
+%   \item \textbf{Maximum suffix length}: 32 tokens
+%   \item \textbf{Maximum policy steps}: 12
+%   \item \textbf{Optimization steps}: 12
+%   \item \textbf{Batch size}: 16
+% \end{itemize}
 
 \section{Code Availability}
 \label{app:code}
 
-% Idea: provide access to implementation for reproducibility
-The complete implementation of our method, including all experiments and evaluation scripts, is publicly available at \url{https://github.com/ACMCMC/prompt-length-optimization}.
+The complete implementation, including training and evaluation scripts, is publicly available.
+ at \url{https://github.com/ACMCMC/prompt-length-optimization}.
 
 \end{document}
