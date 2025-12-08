@@ -28,6 +28,10 @@
   Abstract here
 \end{abstract}
 
+\begin{mdframed}[linewidth=1pt, linecolor=black!30, backgroundcolor=black!5]
+  \noindent\textbf{Note:} This report follows the ACL Rolling Review (ARR) format as we plan to submit this work for publication. See \url{https://aclrollingreview.org/cfp} for details.
+\end{mdframed}
+
 \section{Introduction}
 \label{sec:introduction}
 
@@ -58,7 +62,7 @@ To that end, we train a small external policy, independent of the objective LM (
     \node[above=-0.1cm of input_box.north] {\textbf{Prompt to optimize}};
 
     % An icon to represent the frozen LM
-    \node[draw=black, fill=black!10, right=4cm of suffix, text width=2.5cm, thick, align=left] (lm) {\scalerel*{\includegraphics{figures/writer.png}}{\textrm{\textbigcircle}} \textbf{Frozen LM}\\{\tiny (e.g., Pythia-70m \cite{biderman2023pythia})}};
+    \node[draw=black, fill=black!10, right=4cm of suffix, text width=2.5cm, thick, align=left] (lm) {\scalerel*{\includegraphics{figures/writer.png}}{\textrm{\textbigcircle}} \textbf{Frozen LM}\\{\tiny (e.g., \texttt{Pythia-70m} \cite{biderman2023pythia})}};
 
     % The optimizer
     \node[draw=black, fill=black!10, below=of lm, text width=2.5cm, thick, align=left] (optimizer) {\scalerel*{\includegraphics{figures/wrench.png}}{\textrm{\textbigcircle}} \textbf{Optimizer}\\{\tiny (e.g., GCG \cite{zou2023universal})}};
@@ -88,7 +92,7 @@ To that end, we train a small external policy, independent of the objective LM (
     \draw[->, ] (grow.north) |- ++(0,0.5cm) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
     \draw[->, ] (shrink.east) -- ++ (0.5cm, 0) |- ($(grow.north) + (0, 0.5cm)$) -| ($(suffix.north east) + (1cm, -0.2cm)$) -- ($(suffix.north east) + (0, -0.2cm)$);
   \end{tikzpicture}
-  \caption{\textbf{Our approach.} We aim to simultaneously optimize completion likelihood and suffix length by training a small policy that decides when to shrink, grow, or optimize a suffix, paired with a plug-in optimizer and a frozen language model we treat as black boxes.}
+  \caption{\textbf{Our approach.} We aim to simultaneously optimize completion likelihood and suffix length by training a small policy that decides when to shrink, grow, or optimize a suffix, paired with a plug-in optimizer and a frozen LM we treat as black boxes.}
   \label{fig:method}
 \end{figure*}
 
@@ -120,7 +124,7 @@ Prompt optimization is a very active area of research, with many authors proposi
     \caption{\textbf{GCG optimizes for likelihood, not for length.} Blah blah blah}
 \end{figure*}
 
-We seek a suffix \(s\) that makes a frozen language model \(p_\theta\) assign high probability to a fixed target completion while keeping \(s\) as short as possible. Let \(x\) denote the fixed prefix (e.g., a harmful user query) and \(y\) the fixed target completion (e.g., the corresponding harmful response). The optimization problem is
+We seek a suffix \(s\) that makes a frozen LM \(p_\theta\) assign high probability to a fixed target completion while keeping \(s\) as short as possible. Let \(x\) denote the fixed prefix (e.g., a harmful user query) and \(y\) the fixed target completion (e.g., the corresponding harmful response). The optimization problem is
 \begin{equation}
   \min_{s} \mathcal{L}(s) = -\log p(y \mid x, s),
 \end{equation}
@@ -170,7 +174,7 @@ These discounted returns are then centered per prompt group to form advantages f
 \label{sec:method}
 
 % Idea: describe pipeline from inputs to policy and inner optimizers
-We pair a frozen language model with a small policy network. The policy decides when to shrink, grow, or call an inner optimizer; the inner optimizer improves the suffix tokens or embeddings. We train the policy with Group Relative Policy Optimization (GRPO) while leaving the language model untouched.
+We pair a frozen LM with a small policy network. The policy decides when to shrink, grow, or call an inner optimizer; the inner optimizer improves the suffix tokens or embeddings. We train the policy with Group Relative Policy Optimization (GRPO) while leaving the LM untouched.
 
 \subsection{Policy Network Architecture}
 \label{subsec:policy}
@@ -188,31 +192,39 @@ We support three plug-in inner optimizers; the policy is agnostic to which one i
 \label{subsubsec:continuous}
 
 % Idea: optimize suffix embeddings directly
-In continuous mode we treat suffix embeddings as learnable parameters, run Adam to maximize log-likelihood, and later project to the nearest tokens for reporting.
+In continuous mode we work with suffix embeddings instead of tokens. We keep a trainable block of shape $[B, L_{\max}, D]$ where active slots start with the BOS embedding. We run Adam to increase the log-likelihood of the target completion; prefix and completion embeddings stay frozen. When we grow the suffix, we activate one more slot (it gets initialized later), and when we shrink it we turn off the last slot. This happens through the attention mask. At the end we project active embeddings to their nearest vocabulary tokens using L2 distance for reporting.
 
 \subsubsection{Continuous with Projection}
 \label{subsubsec:continuous_proj}
 
 % Idea: add distance regularization to stay near the embedding table
-Continuous\_proj adds a distance regularizer that pulls suffix embeddings toward the nearest token embeddings using a chosen metric; at evaluation we project to tokens to score.
+Continuous\_proj extends the continuous approach by pushing suffix embeddings to stay near real tokens during training. For each active position we measure the distance to the vocabulary and add it as a penalty in the loss. The full objective is
+\begin{equation}
+  \mathcal{L}_{\text{total}} = -\log p(y\mid x,s) + w_{\text{proj}}\,\mathcal{L}_{\text{proj}},
+  \label{eq:continuous_proj_loss}
+\end{equation}
+where $w_{\text{proj}}$ is the projection weight and $\mathcal{L}_{\text{proj}}$ is the mean distance from active suffix embeddings to their nearest vocabulary tokens. We use L2 distance in our experiments. At evaluation we project suffix embeddings to tokens before computing the reward; this makes sure the policy sees scores that match discrete prompts. We also track the average projection distance to see how easy it is to deploy the learned embeddings.
 
 \subsubsection{Discrete Optimization}
 \label{subsubsec:discrete}
 
-In discrete mode we run a Greedy Coordinate Gradient (GCG)  \citet{zou2023universal} update on the suffix tokens. At each GCG step: (i) compute gradients of the log-likelihood with respect to the current suffix token positions; (ii) for each position, form a small candidate pool by replacing that token with top-$k$ alternatives suggested by the gradient; (iii) batch-evaluate these candidates; and (iv) keep the best-scoring suffix. This yields a greedy, gradient-guided token search that improves log-likelihood in a few forward/backward passes while policy actions handle length changes.
+In discrete mode we run a Greedy Coordinate Gradient (GCG) update on the suffix tokens~\citep{zou2023universal}. At each GCG step: (i) compute gradients of the log-likelihood with respect to the current suffix token positions; (ii) for each position, form a small candidate pool by replacing that token with top-$k$ alternatives suggested by the gradient; (iii) batch-evaluate these one-token candidates; and (iv) keep the best-scoring suffix. Each GCG step therefore changes at most one suffix token. This yields a greedy, gradient-guided token search that improves log-likelihood in a few forward/backward passes while policy actions handle length changes.
+
 
 
 \subsection{Training Procedure}
 \label{subsec:training}
 
-% Idea: batched episodes with per-prompt baselines
-We sample multiple rollouts per prompt, run fixed-length episodes, and record states, actions, and log-probs. After an episode we compute the terminal reward, discount it backward, and center advantages per prompt (GRPO) to reduce variance. We then run several GRPO epochs over the stored trajectories with ratio clipping and entropy bonus.
+We run batched, fixed-horizon episodes with multiple rollouts per prompt. For each batch we build inputs, roll out \(T\) steps, and collect states, actions, and log-probs. After each episode, compute the terminal reward, discount it backward, center advantages per prompt (GRPO), and run several GRPO epochs with clipping and entropy bonus.
 
 \subsection{Implementation Details}
 \label{subsec:implementation}
 
-% Idea: batching, immutable prefix/completion, suffix-only edits
-We build batched inputs with immutable prefix and completion tokens and a trainable suffix of fixed maximum length. ModelBatchedInput handles tokenization, attention masks, and embedding assembly for all modes. The agent uses a frozen Pythia-70m model for likelihoods and supports CPU, CUDA, or MPS devices. All edits and gradients stay in the suffix; prefixes and completions are untouched.
+We construct a fixed batched layout with three segments per example: an immutable prefix, a trainable suffix, and an immutable completion. Prefixes are left-padded and completions right-padded with their own attention masks. The suffix is a trainable buffer of shape \([B, L_{\max}]\) (tokens in discrete mode, embeddings in continuous mode) with an attention mask marking active positions; the first \texttt{init\_len} slots are active at initialization. Length edits toggle this mask: \textit{grow} activates the next inactive slot, \textit{shrink} deactivates the last active slot. Newly activated slots are initialized by the optimizer when the suffix is updated.
+
+For forward passes, the three segments are concatenated and a combined attention mask is built; suffix start indices are tracked so discrete optimizers can splice candidate suffixes efficiently. In continuous modes, concatenated embeddings are provided; in discrete mode, concatenated token IDs are used. Edits and gradients are confined to the suffix; prefix and completion remain fixed. All experiments use a frozen \texttt{Pythia-70M} backbone.
+
+
 
 \section{Experiments}
 \label{sec:experiments}
@@ -261,6 +273,21 @@ We build batched inputs with immutable prefix and completion tokens and a traina
 % Idea: we demonstrated RL-based prompt length optimization
 % Idea: future work: larger models, different tasks, transfer learning
 
+\section*{Limitations}
+
+% Idea: acknowledge scope and potential issues
+As with any work, we have our limitations, and for scientific rigor we want to be transparent about them. We only test on a small LM (\texttt{Pythia-70M}), so results might be different with larger models. The policy is trained for a fixed maximum suffix length, which makes it less flexible. We also assume white-box access to the LM for gradient computation; this is not always possible in practice. Our experiments focus on adversarial prompt discovery instead of general prompt optimization tasks. Finally, the policy might not work well across different domains or model families without retraining.
+
+\section*{Ethical Considerations}
+
+% Idea: discuss dual-use and responsible research
+This work focuses on prompt optimization techniques that can be used for both good and bad purposes. We frame our experiments using adversarial suffix generation (a common setting in the literature), but we know that these methods could be misused to create harmful content. Our goal is to better understand prompt optimization and length trade-offs, not to help malicious uses. Researchers who use these techniques should think about the ethical implications and add proper safeguards. We release our code expecting it will be used responsibly for research that helps the community.
+
+\section*{AI Usage Statement}
+
+% Idea: acknowledge AI assistance while emphasizing human authorship
+We used AI tools to help with developing our code and writing the paper; more specifically, to debug our code, improve the style of our writing, and organize our ideas. All research ideas, experimental design, implementation decisions, and core contributions are our own work.  We carefully reviewed all AI-generated suggestions to make sure they were correct and aligned with our research goals.
+
 \bibliography{bibliography}
 
 \appendix
@@ -270,7 +297,7 @@ We build batched inputs with immutable prefix and completion tokens and a traina
 
 % Idea: complete list of hyperparameters used in experiments
 
-We present the complete set of hyperparameters used in our experiments. All experiments use the Pythia-70m model~\cite{biderman2023pythia} with seed 2262 for reproducibility.
+We present the complete set of hyperparameters used in our experiments. All experiments use the \texttt{Pythia-70m} model~\cite{biderman2023pythia} with seed 2262 for reproducibility.
 
 \subsection{Dataset Parameters}
 
